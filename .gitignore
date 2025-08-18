@@ -1,0 +1,7 @@
+.idea
+.DS_Store
+logs/
+Data/
+wandb/
+.claude/
+__pycache__/
