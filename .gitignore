@@ -5,3 +5,4 @@ Data/
 wandb/
 .claude/
 __pycache__/
+Qwen/

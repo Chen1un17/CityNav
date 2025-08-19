@@ -115,6 +115,9 @@ class MultiAgentTrafficEnvironment:
         # Threading for parallel processing
         self.executor = ThreadPoolExecutor(max_workers=4)
         
+        # Async LLM calling and caching system
+        self._initialize_async_llm_system()
+        
         # Real-time monitoring state
         self.current_step = 0
         self.current_sim_time = 0.0
@@ -122,6 +125,190 @@ class MultiAgentTrafficEnvironment:
         self.att_calculation = 0.0
         self.system_throughput = 0.0
         
+    def _initialize_async_llm_system(self):
+        """Initialize asynchronous LLM calling system."""
+        from concurrent.futures import Future
+        
+        # Async LLM call management
+        self.pending_llm_calls = {}  # Future objects for ongoing LLM calls
+        self.llm_results_queue = []  # Queue for completed LLM results
+        self.temp_decisions = {}  # Temporary heuristic decisions while waiting for LLM
+        
+        # LLM call statistics
+        self.llm_call_stats = {
+            'macro_calls': 0,
+            'regional_calls': 0,
+            'async_calls': 0,
+            'total_time_saved': 0.0
+        }
+    
+    def _async_llm_call_macro_route(self, vehicle_id: str, start_region: int, dest_region: int, 
+                                  candidates: List[List[int]], current_time: float) -> Optional[List[int]]:
+        """Asynchronous macro route selection - always calls LLM for dynamic decisions."""
+        try:
+            # Check if already processing this request
+            call_key = f"macro_{vehicle_id}"
+            if call_key in self.pending_llm_calls:
+                # Return heuristic decision for now
+                heuristic_route = candidates[0] if candidates else None
+                self.temp_decisions[vehicle_id] = {
+                    'type': 'macro',
+                    'route': heuristic_route,
+                    'timestamp': current_time
+                }
+                self.logger.log_info(f"ASYNC_PENDING: Using heuristic route for {vehicle_id} while LLM processes")
+                return heuristic_route
+            
+            # Submit async LLM call
+            future = self.executor.submit(
+                self._llm_select_macro_route_sync,
+                vehicle_id, start_region, dest_region, candidates, current_time
+            )
+            
+            self.pending_llm_calls[call_key] = {
+                'future': future,
+                'vehicle_id': vehicle_id,
+                'type': 'macro',
+                'start_time': time.time(),
+                'candidates': candidates
+            }
+            
+            self.llm_call_stats['async_calls'] += 1
+            self.llm_call_stats['macro_calls'] += 1
+            
+            # Return heuristic decision for immediate use
+            heuristic_route = candidates[0] if candidates else None
+            self.temp_decisions[vehicle_id] = {
+                'type': 'macro',
+                'route': heuristic_route,
+                'timestamp': current_time
+            }
+            
+            self.logger.log_info(f"ASYNC_SUBMIT: Macro route LLM call submitted for {vehicle_id}, using heuristic temporarily")
+            return heuristic_route
+            
+        except Exception as e:
+            self.logger.log_error(f"ASYNC_MACRO_ERROR: {e}")
+            return candidates[0] if candidates else None
+    
+    def _async_llm_call_regional_route(self, vehicle_id: str, current_edge: str, 
+                                     route_candidates: List[dict], target_region: int, 
+                                     region_id: int, current_time: float) -> Optional[dict]:
+        """Asynchronous regional route selection - always calls LLM for dynamic decisions."""
+        try:
+            # Check if already processing this request
+            call_key = f"regional_{vehicle_id}"
+            if call_key in self.pending_llm_calls:
+                # Return heuristic decision for now
+                heuristic_plan = route_candidates[0] if route_candidates else None
+                self.temp_decisions[vehicle_id] = {
+                    'type': 'regional',
+                    'plan': heuristic_plan,
+                    'timestamp': current_time
+                }
+                self.logger.log_info(f"ASYNC_PENDING: Using heuristic plan for {vehicle_id} while LLM processes")
+                return heuristic_plan
+            
+            # Submit async LLM call through regional agent
+            if region_id in self.regional_agents:
+                regional_agent = self.regional_agents[region_id]
+                future = self.executor.submit(
+                    regional_agent._llm_select_regional_route,
+                    vehicle_id, current_edge, route_candidates, target_region, current_time
+                )
+                
+                self.pending_llm_calls[call_key] = {
+                    'future': future,
+                    'vehicle_id': vehicle_id,
+                    'type': 'regional',
+                    'start_time': time.time(),
+                    'candidates': route_candidates
+                }
+                
+                self.llm_call_stats['async_calls'] += 1
+                self.llm_call_stats['regional_calls'] += 1
+            
+            # Return heuristic decision for immediate use
+            heuristic_plan = route_candidates[0] if route_candidates else None
+            self.temp_decisions[vehicle_id] = {
+                'type': 'regional',
+                'plan': heuristic_plan,
+                'timestamp': current_time
+            }
+            
+            self.logger.log_info(f"ASYNC_SUBMIT: Regional route LLM call submitted for {vehicle_id}, using heuristic temporarily")
+            return heuristic_plan
+            
+        except Exception as e:
+            self.logger.log_error(f"ASYNC_REGIONAL_ERROR: {e}")
+            return route_candidates[0] if route_candidates else None
+    
+    def _process_completed_llm_calls(self, current_time: float):
+        """Process completed async LLM calls and update vehicle routes."""
+        try:
+            completed_calls = []
+            
+            for call_key, call_info in self.pending_llm_calls.items():
+                future = call_info['future']
+                
+                if future.done():
+                    completed_calls.append(call_key)
+                    
+                    try:
+                        result = future.result()
+                        vehicle_id = call_info['vehicle_id']
+                        call_type = call_info['type']
+                        elapsed_time = time.time() - call_info['start_time']
+                        
+                        # Update vehicle route with LLM result
+                        if result and vehicle_id in self.temp_decisions:
+                            self._apply_llm_result(vehicle_id, call_type, result, current_time)
+                            
+                        # Clean up temporary decision
+                        if vehicle_id in self.temp_decisions:
+                            del self.temp_decisions[vehicle_id]
+                        
+                        self.llm_call_stats['total_time_saved'] += max(0, elapsed_time - 1.0)  # Assume 1s for heuristic
+                        
+                        self.logger.log_info(f"ASYNC_COMPLETE: {call_type} LLM call for {vehicle_id} completed in {elapsed_time:.1f}s")
+                        
+                    except Exception as e:
+                        self.logger.log_error(f"ASYNC_RESULT_ERROR: Failed to process LLM result for {call_key}: {e}")
+            
+            # Remove completed calls
+            for call_key in completed_calls:
+                del self.pending_llm_calls[call_key]
+                
+        except Exception as e:
+            self.logger.log_error(f"ASYNC_PROCESS_ERROR: {e}")
+    
+    def _apply_llm_result(self, vehicle_id: str, call_type: str, result, current_time: float):
+        """Apply LLM result to vehicle routing."""
+        try:
+            if call_type == 'macro' and isinstance(result, list):
+                # Update macro route
+                if vehicle_id in self.vehicle_current_plans:
+                    self.vehicle_current_plans[vehicle_id]['macro_route'] = result
+                    self.logger.log_info(f"LLM_UPDATE: Updated macro route for {vehicle_id}: {result}")
+                    
+            elif call_type == 'regional' and isinstance(result, dict):
+                # Update regional route
+                if vehicle_id in self.vehicle_regional_plans:
+                    self.vehicle_regional_plans[vehicle_id] = result
+                    
+                    # Apply route to SUMO if vehicle is still active
+                    if vehicle_id in traci.vehicle.getIDList():
+                        route = result.get('route', [])
+                        if route and len(route) > 1:
+                            try:
+                                traci.vehicle.setRoute(vehicle_id, route)
+                                self.logger.log_info(f"LLM_UPDATE: Applied regional route for {vehicle_id}")
+                            except Exception as route_error:
+                                self.logger.log_warning(f"LLM_UPDATE: Failed to apply route for {vehicle_id}: {route_error}")
+                        
+        except Exception as e:
+            self.logger.log_error(f"LLM_APPLY_ERROR: {e}")
+    
     def _load_region_data(self):
         """Load region partition data."""
         try:
@@ -184,7 +371,7 @@ class MultiAgentTrafficEnvironment:
                 prediction_engine=self.prediction_engine
             )
             
-            # Initialize Regional Agents
+            # Initialize Regional Agents with prediction engine access
             self.regional_agents = {}
             for region_id in range(self.num_regions):
                 regional_agent = RegionalAgent(
@@ -194,7 +381,8 @@ class MultiAgentTrafficEnvironment:
                     road_info=self.road_info,
                     road_network=self.road_network,
                     llm_agent=self.llm_agent,
-                    logger=self.logger
+                    logger=self.logger,
+                    prediction_engine=self.prediction_engine
                 )
                 self.regional_agents[region_id] = regional_agent
                 self.last_regional_decision_time[region_id] = 0.0
@@ -477,6 +665,13 @@ class MultiAgentTrafficEnvironment:
             return 0.0
     
     def _llm_select_macro_route(self, vehicle_id: str, start_region: int, dest_region: int, 
+                               candidates: List[List[int]], current_time: float) -> Optional[List[int]]:
+        """
+        Async-enabled LLM macro route selection with caching.
+        """
+        return self._async_llm_call_macro_route(vehicle_id, start_region, dest_region, candidates, current_time)
+    
+    def _llm_select_macro_route_sync(self, vehicle_id: str, start_region: int, dest_region: int, 
                                candidates: List[List[int]], current_time: float) -> Optional[List[int]]:
         """
         Use LLM to select optimal macro route from candidates.
@@ -767,16 +962,24 @@ class MultiAgentTrafficEnvironment:
             self.logger.log_error(f"LOG_VEHICLE_DECISION: Failed for {vehicle_id}: {e}")
     
     def _calculate_current_att(self) -> float:
-        """Calculate current Average Travel Time (ATT)."""
+        """Calculate current Average Travel Time (ATT) using unified method."""
         try:
             if not self.vehicle_travel_metrics:
                 return 0.0
             
-            total_travel_time = sum(
-                metrics['travel_time'] for metrics in self.vehicle_travel_metrics.values()
-            )
+            # Use unified travel time calculation method
+            current_sim_time = traci.simulation.getTime()
+            total_travel_time = 0.0
+            valid_vehicles = 0
             
-            return total_travel_time / len(self.vehicle_travel_metrics)
+            for veh_id, metrics in self.vehicle_travel_metrics.items():
+                if veh_id in self.vehicle_start_times:
+                    # Unified ATT calculation: current_sim_time - actual_departure_time
+                    travel_time = current_sim_time - self.vehicle_start_times[veh_id]
+                    total_travel_time += travel_time
+                    valid_vehicles += 1
+            
+            return total_travel_time / valid_vehicles if valid_vehicles > 0 else 0.0
             
         except Exception:
             return 0.0
@@ -972,8 +1175,8 @@ class MultiAgentTrafficEnvironment:
             self.logger.log_error(f"ROAD_UPDATE_CRITICAL_ERROR: {e}")
             return
     
-    def update_vehicle_tracking(self, current_time: float):
-        """Update vehicle positions and region assignments with enhanced performance and logging."""
+    def update_vehicle_positions_and_regions(self, current_time: float):
+        """Update vehicle positions and region assignments only - no decision making."""
         tracking_start_time = time.time()
         
         try:
@@ -981,7 +1184,7 @@ class MultiAgentTrafficEnvironment:
             all_vehicle_ids = traci.vehicle.getIDList()
             autonomous_in_sim = [veh_id for veh_id in all_vehicle_ids if veh_id in self.autonomous_vehicles]
             
-            self.logger.log_info(f"VEHICLE_TRACKING_START: {len(autonomous_in_sim)}/{len(all_vehicle_ids)} autonomous vehicles active")
+            self.logger.log_info(f"VEHICLE_POSITION_UPDATE_START: {len(autonomous_in_sim)}/{len(all_vehicle_ids)} autonomous vehicles active")
             
             # Batch vehicle information gathering for efficiency
             vehicles_processed = 0
@@ -989,10 +1192,25 @@ class MultiAgentTrafficEnvironment:
             region_changes = 0
             new_vehicles = 0
             
+            # Initialize tracking for decision stage
+            if not hasattr(self, 'pending_decisions'):
+                self.pending_decisions = {
+                    'new_vehicles': [],
+                    'region_changes': [],
+                    'stuck_vehicles': []
+                }
+            else:
+                # Clear previous pending decisions
+                self.pending_decisions = {
+                    'new_vehicles': [],
+                    'region_changes': [],
+                    'stuck_vehicles': []
+                }
+            
             # Track vehicles entering and exiting the simulation
             for veh_id in autonomous_in_sim:
                 try:
-                    # Record start time for new vehicles and trigger macro planning
+                    # Record start time for new vehicles (no planning yet)
                     if veh_id not in self.vehicle_start_times:
                         # Get accurate departure time from SUMO
                         try:
@@ -1001,8 +1219,8 @@ class MultiAgentTrafficEnvironment:
                             new_vehicles += 1
                             self.logger.log_info(f"NEW_VEHICLE: {veh_id} started at time {actual_depart_time:.1f}")
                             
-                            # Event-driven LLM decision: Vehicle birth macro planning
-                            self.handle_vehicle_birth_macro_planning(veh_id, current_time)
+                            # Queue for decision making
+                            self.pending_decisions['new_vehicles'].append(veh_id)
                         except Exception as e:
                             # Fallback to current simulation time if getDeparture() fails
                             self.vehicle_start_times[veh_id] = current_time
@@ -1010,8 +1228,8 @@ class MultiAgentTrafficEnvironment:
                             self.logger.log_info(f"NEW_VEHICLE: {veh_id} started at time {current_time:.1f} (fallback)")
                             self.logger.log_warning(f"VEHICLE_DEPART_TIME: Could not get departure time for {veh_id}: {e}")
                             
-                            # Event-driven LLM decision: Vehicle birth macro planning
-                            self.handle_vehicle_birth_macro_planning(veh_id, current_time)
+                            # Queue for decision making
+                            self.pending_decisions['new_vehicles'].append(veh_id)
                     
                     # Batch TraCI calls for this vehicle
                     try:
@@ -1027,7 +1245,7 @@ class MultiAgentTrafficEnvironment:
                         vehicles_failed += 1
                         continue
                     
-                    # Update vehicle region
+                    # Update vehicle region (no planning yet)
                     if current_edge in self.edge_to_region:
                         current_region = self.edge_to_region[current_edge]
                         
@@ -1036,24 +1254,30 @@ class MultiAgentTrafficEnvironment:
                             self.vehicle_regions[veh_id] = current_region
                             self.logger.log_info(f"VEHICLE_REGION_INIT: {veh_id} assigned to region {current_region}")
                             
-                            # Trigger regional planning for new vehicle in region
-                            self.handle_vehicle_regional_planning(veh_id, current_region, current_time)
+                            # Queue for regional planning
+                            self.pending_decisions['region_changes'].append({
+                                'vehicle_id': veh_id,
+                                'type': 'init',
+                                'region': current_region
+                            })
                             
                         elif self.vehicle_regions[veh_id] != current_region:
-                            # Vehicle changed regions - EVENT-DRIVEN LLM DECISION POINT
+                            # Vehicle changed regions - record for decision making
                             old_region = self.vehicle_regions[veh_id]
                             self.vehicle_regions[veh_id] = current_region
                             region_changes += 1
                             
                             self.logger.log_info(f"VEHICLE_REGION_CHANGE: {veh_id} moved from region {old_region} to {current_region}")
                             
-                            # Event-driven LLM decision: Vehicle reached new region, replan macro route
-                            self.handle_vehicle_region_change_replanning(veh_id, old_region, current_region, current_time)
-                            
-                            # Also trigger regional planning for the new region
-                            self.handle_vehicle_regional_planning(veh_id, current_region, current_time)
+                            # Queue for region change planning
+                            self.pending_decisions['region_changes'].append({
+                                'vehicle_id': veh_id,
+                                'type': 'change',
+                                'old_region': old_region,
+                                'new_region': current_region
+                            })
                         
-                        # Real-time logging and metrics update - as required by user
+                        # Real-time logging and metrics update
                         destination = route[-1] if route else "unknown"
                         travel_time = current_time - self.vehicle_start_times[veh_id]
                         
@@ -1084,12 +1308,12 @@ class MultiAgentTrafficEnvironment:
                                 self._print_real_time_system_status(current_time)
                                 self._last_console_update = current_time
                             
-                            # Check for stuck vehicles and trigger replanning
+                            # Check for stuck vehicles (queue for decision making)
                             if vehicle_speed < 0.1 and travel_time > 300:  # Stopped for > 5 minutes
                                 self.logger.log_warning(f"VEHICLE_STUCK: {veh_id} stopped on {current_edge} for {travel_time:.1f}s")
                                 
-                                # Trigger replanning for stuck vehicles (treat as vehicle rebirth)
-                                self._handle_stuck_vehicle_replanning(veh_id, current_time)
+                                # Queue for stuck vehicle replanning
+                                self.pending_decisions['stuck_vehicles'].append(veh_id)
                             
                         except Exception as metrics_error:
                             self.logger.log_warning(f"VEHICLE_METRICS_ERROR: {veh_id} -> {metrics_error}")
@@ -1149,19 +1373,88 @@ class MultiAgentTrafficEnvironment:
             tracking_time = (time.time() - tracking_start_time) * 1000
             active_vehicles = len(self.vehicle_regions)
             
-            self.logger.log_info(f"VEHICLE_TRACKING_COMPLETE: processed:{vehicles_processed}, failed:{vehicles_failed}, "
+            self.logger.log_info(f"VEHICLE_POSITION_UPDATE_COMPLETE: processed:{vehicles_processed}, failed:{vehicles_failed}, "
                                f"new:{new_vehicles}, region_changes:{region_changes}, completed:{completed_this_step}, "
                                f"active:{active_vehicles}, time:{tracking_time:.1f}ms")
             
             # Performance warnings
             if tracking_time > 2000:  # > 2 seconds
-                self.logger.log_warning(f"VEHICLE_TRACKING_SLOW: Update took {tracking_time:.1f}ms")
+                self.logger.log_warning(f"VEHICLE_POSITION_UPDATE_SLOW: Update took {tracking_time:.1f}ms")
             
             if vehicles_failed > vehicles_processed * 0.1:  # > 10% failure rate
-                self.logger.log_warning(f"VEHICLE_TRACKING_HIGH_FAILURE: {vehicles_failed}/{vehicles_processed + vehicles_failed} vehicles failed")
+                self.logger.log_warning(f"VEHICLE_POSITION_UPDATE_HIGH_FAILURE: {vehicles_failed}/{vehicles_processed + vehicles_failed} vehicles failed")
                 
         except Exception as e:
-            self.logger.log_error(f"VEHICLE_TRACKING_CRITICAL_ERROR: {e}")
+            self.logger.log_error(f"VEHICLE_POSITION_UPDATE_CRITICAL_ERROR: {e}")
+            raise
+    
+    def process_vehicle_decisions(self, current_time: float):
+        """Process all vehicle decisions based on updated state information."""
+        decision_start_time = time.time()
+        
+        try:
+            if not hasattr(self, 'pending_decisions') or not self.pending_decisions:
+                return  # No decisions to process
+                
+            decisions_processed = 0
+            decisions_failed = 0
+            
+            # Process new vehicle births
+            for veh_id in self.pending_decisions.get('new_vehicles', []):
+                try:
+                    self.handle_vehicle_birth_macro_planning(veh_id, current_time)
+                    decisions_processed += 1
+                except Exception as e:
+                    self.logger.log_error(f"VEHICLE_DECISION_ERROR: Failed to process new vehicle {veh_id}: {e}")
+                    decisions_failed += 1
+            
+            # Process region changes
+            for region_change in self.pending_decisions.get('region_changes', []):
+                try:
+                    veh_id = region_change['vehicle_id']
+                    
+                    if region_change['type'] == 'init':
+                        # Initial regional planning
+                        self.handle_vehicle_regional_planning(veh_id, region_change['region'], current_time)
+                    elif region_change['type'] == 'change':
+                        # Region change replanning
+                        self.handle_vehicle_region_change_replanning(
+                            veh_id, region_change['old_region'], region_change['new_region'], current_time
+                        )
+                        self.handle_vehicle_regional_planning(veh_id, region_change['new_region'], current_time)
+                    
+                    decisions_processed += 1
+                except Exception as e:
+                    self.logger.log_error(f"VEHICLE_DECISION_ERROR: Failed to process region change for {veh_id}: {e}")
+                    decisions_failed += 1
+            
+            # Process stuck vehicles
+            for veh_id in self.pending_decisions.get('stuck_vehicles', []):
+                try:
+                    self._handle_stuck_vehicle_replanning(veh_id, current_time)
+                    decisions_processed += 1
+                except Exception as e:
+                    self.logger.log_error(f"VEHICLE_DECISION_ERROR: Failed to process stuck vehicle {veh_id}: {e}")
+                    decisions_failed += 1
+            
+            # Performance summary
+            decision_time = (time.time() - decision_start_time) * 1000
+            total_decisions = len(self.pending_decisions.get('new_vehicles', [])) + \
+                            len(self.pending_decisions.get('region_changes', [])) + \
+                            len(self.pending_decisions.get('stuck_vehicles', []))
+            
+            self.logger.log_info(f"VEHICLE_DECISIONS_COMPLETE: total:{total_decisions}, processed:{decisions_processed}, "
+                               f"failed:{decisions_failed}, time:{decision_time:.1f}ms")
+            
+            # Performance warnings
+            if decision_time > 5000:  # > 5 seconds
+                self.logger.log_warning(f"VEHICLE_DECISIONS_SLOW: Processing took {decision_time:.1f}ms")
+            
+            if decisions_failed > 0:
+                self.logger.log_warning(f"VEHICLE_DECISIONS_FAILURES: {decisions_failed} decisions failed")
+                
+        except Exception as e:
+            self.logger.log_error(f"VEHICLE_DECISIONS_CRITICAL_ERROR: {e}")
             raise
     
     def coordinate_regional_agents(self, current_time: float):
@@ -1228,7 +1521,7 @@ class MultiAgentTrafficEnvironment:
                 self.logger.log_error(f"Prediction Engine update failed: {e}")
     
     def log_system_performance(self, current_time: float):
-        """Log overall system performance."""
+        """Log overall system performance including ATT metrics."""
         try:
             # Collect metrics from all agents
             regional_metrics = {}
@@ -1237,6 +1530,27 @@ class MultiAgentTrafficEnvironment:
             
             traffic_metrics = self.traffic_agent.get_performance_metrics()
             prediction_metrics = self.prediction_engine.get_performance_metrics()
+            
+            # Calculate current ATT for performance logging
+            current_att = self._calculate_current_att()
+            active_vehicles = len(self.vehicle_travel_metrics)
+            completed_vehicles = self.completed_vehicles
+            total_vehicles = len(self.autonomous_vehicles)
+            
+            # Log ATT metrics to system log
+            self.logger.log_info(f"SYSTEM_ATT_METRICS: current_att={current_att:.2f}s, "
+                               f"active_vehicles={active_vehicles}, completed_vehicles={completed_vehicles}, "
+                               f"total_vehicles={total_vehicles}, completion_rate={completed_vehicles/total_vehicles*100:.1f}%")
+            
+            # Log async LLM performance
+            pending_calls = len(self.pending_llm_calls)
+            
+            self.logger.log_info(f"ASYNC_LLM_METRICS: pending_calls={pending_calls}, "
+                               f"macro_calls={self.llm_call_stats['macro_calls']}, "
+                               f"regional_calls={self.llm_call_stats['regional_calls']}, "
+                               f"async_calls={self.llm_call_stats['async_calls']}, "
+                               f"time_saved={self.llm_call_stats['total_time_saved']:.1f}s, "
+                               f"temp_decisions={len(self.temp_decisions)}")
             
             # Log comprehensive performance data
             self.logger.log_system_performance(
@@ -1424,17 +1738,23 @@ class MultiAgentTrafficEnvironment:
                 # Update road information
                 self.update_road_information(current_time)
                 
-                # Update vehicle tracking
-                self.update_vehicle_tracking(current_time)
+                # PHASE 1: Update all vehicle positions and states
+                self.update_vehicle_positions_and_regions(current_time)
                 
-                # Update prediction engine
+                # Update prediction engine based on new positions
                 self.update_prediction_engine(current_time)
                 
-                # Update traffic agent (event-driven LLM system)
+                # Update traffic agent global state based on new positions
                 self.update_traffic_agent(current_time)
                 
-                # Coordinate regional agents (event-driven LLM system)
+                # Update regional agent states before making decisions
                 self.coordinate_regional_agents(current_time)
+                
+                # PHASE 2: Make all decisions based on updated states
+                self.process_vehicle_decisions(current_time)
+                
+                # PHASE 3: Process completed async LLM calls
+                self._process_completed_llm_calls(current_time)
                 
                 # Process any pending broadcast messages
                 self._process_broadcast_messages(current_time)
@@ -1449,13 +1769,15 @@ class MultiAgentTrafficEnvironment:
                 if int(current_time) % 300 == 0:  # Every 5 minutes
                     self.log_system_performance(current_time)
             
-            # Calculate final results
+            # Calculate final results using unified method
             if self.vehicle_end_times:
                 total_travel_time = sum(
                     self.vehicle_end_times[veh_id] - self.vehicle_start_times.get(veh_id, 0)
                     for veh_id in self.vehicle_end_times
+                    if veh_id in self.vehicle_start_times
                 )
-                average_travel_time = total_travel_time / len(self.vehicle_end_times)
+                valid_completed = len([veh_id for veh_id in self.vehicle_end_times if veh_id in self.vehicle_start_times])
+                average_travel_time = total_travel_time / valid_completed if valid_completed > 0 else 0.0
             else:
                 average_travel_time = 0.0
             
@@ -1565,10 +1887,48 @@ class MultiAgentTrafficEnvironment:
                 if region_id in self.regional_agents:
                     regional_agent = self.regional_agents[region_id]
                     
-                    # Request regional planning with LLM through regional agent
-                    regional_plan = regional_agent.make_regional_route_planning(
-                        vehicle_id, next_region, current_time
-                    )
+                    # Get vehicle's current edge for planning
+                    try:
+                        current_edge = traci.vehicle.getRoadID(vehicle_id)
+                        if not current_edge or current_edge.startswith(':'):
+                            self.logger.log_warning(f"REGIONAL_PLANNING: Vehicle {vehicle_id} on invalid edge: {current_edge}")
+                            return
+                    except Exception as traci_error:
+                        self.logger.log_error(f"REGIONAL_PLANNING: TraCI error for vehicle {vehicle_id}: {traci_error}")
+                        return
+                    
+                    # Get boundary candidates and route candidates through regional agent
+                    try:
+                        boundary_candidates = regional_agent._get_boundary_candidates_to_region(next_region)
+                        if not boundary_candidates:
+                            # Fallback to any outgoing boundary
+                            boundary_candidates = regional_agent.outgoing_boundaries[:3] if regional_agent.outgoing_boundaries else []
+                        
+                        if boundary_candidates:
+                            route_candidates = regional_agent._generate_regional_route_candidates(
+                                current_edge, boundary_candidates, current_time
+                            )
+                            
+                            if route_candidates:
+                                # Use async LLM call for regional route selection
+                                regional_plan = self._async_llm_call_regional_route(
+                                    vehicle_id, current_edge, route_candidates, next_region, region_id, current_time
+                                )
+                            else:
+                                # Fallback: synchronous call
+                                regional_plan = regional_agent.make_regional_route_planning(
+                                    vehicle_id, next_region, current_time
+                                )
+                        else:
+                            self.logger.log_warning(f"REGIONAL_PLANNING: No boundary candidates for {vehicle_id}")
+                            return
+                            
+                    except Exception as planning_error:
+                        self.logger.log_warning(f"REGIONAL_PLANNING: Async planning failed for {vehicle_id}, using fallback: {planning_error}")
+                        # Fallback to synchronous call
+                        regional_plan = regional_agent.make_regional_route_planning(
+                            vehicle_id, next_region, current_time
+                        )
                     
                     if regional_plan:
                         # Validate regional plan has required keys

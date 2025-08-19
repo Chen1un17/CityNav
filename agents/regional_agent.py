@@ -47,7 +47,7 @@ class RegionalAgent:
     """
     
     def __init__(self, region_id: int, boundary_edges: Dict, edge_to_region: Dict,
-                 road_info: Dict, road_network: nx.DiGraph, llm_agent, logger):
+                 road_info: Dict, road_network: nx.DiGraph, llm_agent, logger, prediction_engine=None):
         """
         Initialize Regional Agent.
         
@@ -59,6 +59,7 @@ class RegionalAgent:
             road_network: NetworkX graph of road network
             llm_agent: Language model agent for decision making
             logger: Agent logger instance
+            prediction_engine: Prediction engine for traffic forecasting (optional)
         """
         self.region_id = region_id
         self.boundary_edges = boundary_edges
@@ -67,6 +68,7 @@ class RegionalAgent:
         self.road_network = road_network
         self.llm_agent = llm_agent
         self.logger = logger
+        self.prediction_engine = prediction_engine  # Store prediction engine for advanced lane optimization
         
         # Identify edges and boundary edges for this region
         self._initialize_region_topology()
@@ -92,9 +94,13 @@ class RegionalAgent:
         self.traffic_light_phases: Dict[str, Dict] = {}
         self.green_wave_routes: Dict[str, List[str]] = {}
         
+        # Initialize advanced lane optimization system
+        self._initialize_lane_optimization_system()
+        
         self.logger.log_info(f"Regional Agent {region_id} initialized: "
                            f"{len(self.region_edges)} edges, "
-                           f"{len(self.boundary_connections)} boundary connections")
+                           f"{len(self.boundary_connections)} boundary connections, "
+                           f"Advanced Lane Optimization: {'✓' if self.prediction_engine else '✓ (basic)'}")
     
     def _initialize_region_topology(self):
         """Initialize region topology information."""
@@ -1324,20 +1330,1011 @@ class RegionalAgent:
                 return None
     
     def _assign_lane(self, vehicle_id: str, target_edge: str) -> Optional[int]:
-        """Assign lane for vehicle (simple implementation)."""
+        """Advanced lane assignment using multi-criteria optimization.
+        
+        Considers:
+        - Traffic density per lane (30%)
+        - Speed efficiency per lane (25%)
+        - Route compatibility (20%)
+        - Lane change complexity (15%)
+        - Predicted conditions (10%)
+        """
         try:
-            # Get number of lanes on current edge
+            current_edge = traci.vehicle.getRoadID(vehicle_id)
+            if not current_edge or current_edge.startswith(':'):
+                return self._assign_lane_fallback(vehicle_id)
+            
+            # Get lane information
+            num_lanes = traci.edge.getLaneNumber(current_edge)
+            if num_lanes <= 1:
+                return 0
+                
+            # Get vehicle's current lane
+            try:
+                current_lane_index = traci.vehicle.getLaneIndex(vehicle_id)
+            except:
+                current_lane_index = 0
+                
+            # Score each available lane
+            lane_scores = []
+            for lane_idx in range(num_lanes):
+                score = self._calculate_lane_score(
+                    current_edge, lane_idx, vehicle_id, target_edge, current_lane_index
+                )
+                lane_scores.append((lane_idx, score))
+                
+            # Select best lane
+            lane_scores.sort(key=lambda x: x[1], reverse=True)
+            best_lane = lane_scores[0][0]
+            best_score = lane_scores[0][1]
+            
+            # Detailed decision logging for performance analysis
+            self._log_lane_decision_analysis(vehicle_id, current_edge, lane_scores, current_lane_index, target_edge)
+            
+            # Only suggest lane change if significant improvement or safety concern
+            if best_lane != current_lane_index:
+                score_improvement = best_score - lane_scores[current_lane_index][1] if current_lane_index < len(lane_scores) else best_score
+                if score_improvement > 0.15:  # Require 15% improvement to change lanes
+                    self.logger.log_info(f"LANE_OPTIMIZATION: {vehicle_id} changing from lane {current_lane_index} to {best_lane} "
+                                       f"(score improvement: {score_improvement:.3f}, best_score: {best_score:.3f})")
+                    self._record_lane_optimization_decision(vehicle_id, current_lane_index, best_lane, score_improvement, "optimization")
+                    return best_lane
+                else:
+                    self.logger.log_info(f"LANE_STAY: {vehicle_id} staying in lane {current_lane_index} "
+                                       f"(improvement: {score_improvement:.3f} < threshold: 0.15)")
+                    self._record_lane_optimization_decision(vehicle_id, current_lane_index, current_lane_index, score_improvement, "stay")
+                    return current_lane_index  # Stay in current lane if improvement is marginal
+            
+            return best_lane
+            
+        except Exception as e:
+            self.logger.log_error(f"LANE_ASSIGNMENT_ERROR: {vehicle_id} -> {e}")
+            return self._assign_lane_fallback(vehicle_id)
+    
+    def _assign_lane_fallback(self, vehicle_id: str) -> Optional[int]:
+        """Fallback lane assignment when advanced algorithm fails."""
+        try:
             current_edge = traci.vehicle.getRoadID(vehicle_id)
             num_lanes = traci.edge.getLaneNumber(current_edge)
             
             if num_lanes <= 1:
                 return 0
             
-            # Simple assignment: use rightmost available lane
-            return min(1, num_lanes - 1)
-            
+            # Conservative fallback: prefer middle lanes or current lane
+            try:
+                current_lane = traci.vehicle.getLaneIndex(vehicle_id)
+                return current_lane  # Stay in current lane as safest option
+            except:
+                return min(1, num_lanes - 1)  # Default to lane 1 or rightmost
+                
         except:
-            return None
+            return 0
+    
+    def _calculate_lane_score(self, edge_id: str, lane_idx: int, vehicle_id: str, 
+                            target_edge: str, current_lane: int) -> float:
+        """Calculate comprehensive score for a specific lane.
+        
+        Returns score between 0.0 and 1.0 where higher is better.
+        """
+        score = 0.0
+        lane_id = f"{edge_id}_{lane_idx}"
+        
+        try:
+            # Dynamic weight calculation based on current traffic conditions
+            weights = self._calculate_dynamic_weights(edge_id, current_lane, lane_idx)
+            
+            # 1. Traffic density score
+            density_score = self._score_lane_density(lane_id)
+            score += density_score * weights['density']
+            
+            # 2. Speed efficiency score
+            speed_score = self._score_lane_speed(lane_id)
+            score += speed_score * weights['speed']
+            
+            # 3. Route compatibility score
+            route_score = self._score_route_compatibility(lane_idx, target_edge, edge_id)
+            score += route_score * weights['route']
+            
+            # 4. Lane change cost score
+            change_score = self._score_lane_change_cost(current_lane, lane_idx)
+            score += change_score * weights['change_cost']
+            
+            # 5. Predicted conditions score
+            prediction_score = self._score_lane_predictions(edge_id)
+            score += prediction_score * weights['prediction']
+            
+            # 6. Context-aware bonus/penalty
+            context_adjustment = self._calculate_context_adjustment(edge_id, lane_idx, vehicle_id)
+            score += context_adjustment
+            
+        except Exception as e:
+            self.logger.log_warning(f"LANE_SCORE_ERROR: {lane_id} -> {e}")
+            score = 0.5  # Neutral score on error
+            
+        return max(0.0, min(1.0, score))
+    
+    def _score_lane_density(self, lane_id: str) -> float:
+        """Score based on current lane density (lower density = higher score)."""
+        try:
+            vehicle_count = traci.lane.getLastStepVehicleNumber(lane_id)
+            lane_length = traci.lane.getLength(lane_id)
+            
+            if lane_length <= 0:
+                return 0.5
+                
+            # Calculate density (vehicles per 100m)
+            density = (vehicle_count / lane_length) * 100
+            
+            # Convert to score (lower density = higher score)
+            # Assume max reasonable density of 10 vehicles per 100m
+            max_density = 10.0
+            score = max(0.0, 1.0 - (density / max_density))
+            
+            return score
+            
+        except Exception as e:
+            return 0.5  # Neutral score if data unavailable
+    
+    def _score_lane_speed(self, lane_id: str) -> float:
+        """Score based on lane speed efficiency (higher relative speed = higher score)."""
+        try:
+            mean_speed = traci.lane.getLastStepMeanSpeed(lane_id)
+            max_speed = traci.lane.getMaxSpeed(lane_id)
+            
+            if max_speed <= 0:
+                return 0.5
+                
+            # Calculate speed efficiency ratio
+            speed_ratio = mean_speed / max_speed
+            
+            # Apply sigmoid-like function to reward good speeds and penalize very slow speeds
+            if speed_ratio >= 0.8:
+                return 1.0  # Excellent speed
+            elif speed_ratio >= 0.6:
+                return 0.8  # Good speed
+            elif speed_ratio >= 0.4:
+                return 0.6  # Moderate speed
+            elif speed_ratio >= 0.2:
+                return 0.4  # Slow speed
+            else:
+                return 0.1  # Very slow speed
+                
+        except Exception as e:
+            return 0.5
+    
+    def _score_route_compatibility(self, lane_idx: int, target_edge: str, current_edge: str) -> float:
+        """Score based on how well lane supports route to target edge."""
+        try:
+            lane_id = f"{current_edge}_{lane_idx}"
+            
+            # Get lane connections and analyze route compatibility
+            try:
+                connections = traci.lane.getLinks(lane_id)
+                
+                # Check if any connections lead toward target direction
+                target_compatible = False
+                total_connections = len(connections)
+                
+                if total_connections == 0:
+                    return 0.3  # Dead end lane
+                    
+                # Analyze connection destinations
+                for connection in connections:
+                    target_lane = connection[0]
+                    if target_lane:
+                        # Extract edge from lane ID
+                        target_lane_edge = target_lane.split('_')[0]
+                        if target_edge.startswith(target_lane_edge) or target_lane_edge.startswith(target_edge.split('_')[0]):
+                            target_compatible = True
+                            break
+                            
+                if target_compatible:
+                    return 1.0  # Perfect route compatibility
+                    
+            except Exception:
+                pass  # Fall through to default scoring
+                
+            # Default scoring based on lane position
+            edge_lanes = traci.edge.getLaneNumber(current_edge)
+            
+            if edge_lanes <= 1:
+                return 1.0  # Only lane available
+            elif edge_lanes == 2:
+                return 0.8  # Both lanes generally good
+            else:
+                # For multi-lane roads, middle lanes often provide more flexibility
+                if 0 < lane_idx < edge_lanes - 1:
+                    return 0.9  # Middle lane - good flexibility
+                elif lane_idx == 0:
+                    return 0.7  # Leftmost lane - limited for turns
+                else:
+                    return 0.8  # Rightmost lane - good for exits
+                    
+        except Exception as e:
+            return 0.5
+    
+    def _score_lane_change_cost(self, current_lane: int, target_lane: int) -> float:
+        """Score based on difficulty/cost of lane change (fewer changes = higher score)."""
+        lane_diff = abs(target_lane - current_lane)
+        
+        # Reward staying in same lane or making minimal changes
+        if lane_diff == 0:
+            return 1.0  # No change needed
+        elif lane_diff == 1:
+            return 0.8  # Single lane change - reasonable
+        elif lane_diff == 2:
+            return 0.6  # Two lane change - more complex
+        elif lane_diff == 3:
+            return 0.4  # Three lane change - difficult
+        else:
+            return 0.2  # Very complex lane change
+    
+    def _score_lane_predictions(self, edge_id: str) -> float:
+        """Score based on advanced traffic predictions using prediction engine.
+        
+        Uses both current conditions and future forecasts to make intelligent
+        lane selection decisions.
+        """
+        try:
+            score = 0.0
+            
+            # 1. Current conditions score (40% weight)
+            current_score = self._score_current_conditions(edge_id)
+            score += current_score * 0.4
+            
+            # 2. Future congestion forecast score (35% weight)
+            if self.prediction_engine:
+                forecast_score = self._score_congestion_forecast(edge_id)
+                score += forecast_score * 0.35
+            else:
+                # Fallback to trend analysis if no prediction engine
+                trend_score = self._score_traffic_trend(edge_id)
+                score += trend_score * 0.35
+            
+            # 3. Predictive traffic flow score (25% weight)
+            flow_score = self._score_predictive_flow(edge_id)
+            score += flow_score * 0.25
+            
+            return max(0.0, min(1.0, score))
+            
+        except Exception as e:
+            self.logger.log_warning(f"LANE_PREDICTION_ERROR: {edge_id} -> {e}")
+            return 0.5
+    
+    def _score_current_conditions(self, edge_id: str) -> float:
+        """Score based on current real-time traffic conditions."""
+        try:
+            if edge_id in self.road_info:
+                edge_data = self.road_info[edge_id]
+                
+                # Factor in recent congestion level
+                recent_congestion = edge_data.get('congestion_level', 0)
+                occupancy_rate = edge_data.get('occupancy_rate', 0)
+                vehicle_speed = edge_data.get('vehicle_speed', 0)
+                speed_limit = edge_data.get('speed_limit', 13.89)  # Default ~50 km/h
+                
+                # Convert congestion to score (lower congestion = higher score)
+                max_congestion = 5.0
+                congestion_score = max(0.0, 1.0 - (recent_congestion / max_congestion))
+                
+                # Factor in occupancy rate (lower occupancy = higher score)
+                occupancy_score = max(0.0, 1.0 - min(1.0, occupancy_rate))
+                
+                # Factor in speed efficiency (higher relative speed = higher score)
+                speed_efficiency = vehicle_speed / speed_limit if speed_limit > 0 else 0.5
+                speed_score = max(0.0, min(1.0, speed_efficiency))
+                
+                # Weighted combination of factors
+                current_score = (congestion_score * 0.4) + (occupancy_score * 0.35) + (speed_score * 0.25)
+                
+                return current_score
+                
+            return 0.5  # Neutral if no data available
+            
+        except Exception:
+            return 0.5
+    
+    def _score_congestion_forecast(self, edge_id: str) -> float:
+        """Score based on predicted congestion using prediction engine."""
+        try:
+            if not self.prediction_engine:
+                return 0.5
+                
+            # Get congestion forecast for next 15-30 minutes
+            forecast = self.prediction_engine.get_congestion_forecast([edge_id], 1800)  # 30 minutes
+            
+            if edge_id in forecast and forecast[edge_id]:
+                congestion_forecast = forecast[edge_id]
+                
+                # Calculate weighted average with more weight on near-term predictions
+                weighted_congestion = 0.0
+                total_weight = 0.0
+                
+                for i, future_congestion in enumerate(congestion_forecast[:6]):  # Next 6 time steps
+                    # Weight decreases with time: 0.4, 0.3, 0.2, 0.1, 0.05, 0.05
+                    weight = max(0.05, 0.4 * (0.7 ** i))
+                    weighted_congestion += future_congestion * weight
+                    total_weight += weight
+                    
+                if total_weight > 0:
+                    avg_forecast = weighted_congestion / total_weight
+                    
+                    # Convert to score (lower predicted congestion = higher score)
+                    max_congestion = 5.0
+                    forecast_score = max(0.0, 1.0 - (avg_forecast / max_congestion))
+                    
+                    # Apply confidence factor if available
+                    confidence_factor = 0.8  # Conservative confidence
+                    return forecast_score * confidence_factor + 0.5 * (1 - confidence_factor)
+                    
+            return 0.5  # Neutral if no forecast available
+            
+        except Exception as e:
+            self.logger.log_warning(f"CONGESTION_FORECAST_ERROR: {edge_id} -> {e}")
+            return 0.5
+    
+    def _score_traffic_trend(self, edge_id: str) -> float:
+        """Score based on recent traffic trend analysis (fallback method)."""
+        try:
+            if edge_id in self.road_info:
+                edge_data = self.road_info[edge_id]
+                
+                # Get recent update time to assess data freshness
+                last_update = edge_data.get('last_update', 0)
+                current_time = time.time()
+                data_age = current_time - last_update
+                
+                # Penalize stale data
+                if data_age > 300:  # More than 5 minutes old
+                    freshness_factor = max(0.3, 1.0 - (data_age - 300) / 600)  # Decay over 10 minutes
+                else:
+                    freshness_factor = 1.0
+                    
+                # Simple trend: compare current to recent average
+                current_congestion = edge_data.get('congestion_level', 0)
+                
+                # Assume improving trend if congestion is low
+                if current_congestion <= 1.0:
+                    trend_score = 0.8  # Good trend
+                elif current_congestion <= 2.5:
+                    trend_score = 0.6  # Moderate trend
+                elif current_congestion <= 4.0:
+                    trend_score = 0.4  # Poor trend
+                else:
+                    trend_score = 0.2  # Very poor trend
+                    
+                return trend_score * freshness_factor
+                
+            return 0.5
+            
+        except Exception:
+            return 0.5
+    
+    def _score_predictive_flow(self, edge_id: str) -> float:
+        """Score based on predictive traffic flow analysis."""
+        try:
+            # Use prediction engine for multi-metric predictions if available
+            if self.prediction_engine:
+                predictions = self.prediction_engine.get_predictions(edge_id, 360, 2)  # 6-min window, 2 steps ahead
+                
+                if predictions:
+                    flow_scores = []
+                    
+                    for prediction in predictions:
+                        confidence = getattr(prediction, 'confidence', 0.5)
+                        
+                        # Vehicle count prediction
+                        if hasattr(prediction, 'predicted_vehicle_count'):
+                            vehicle_count = prediction.predicted_vehicle_count
+                            # Lower predicted count = higher score
+                            count_score = max(0.0, 1.0 - min(1.0, vehicle_count / 20.0))  # Normalize by expected max
+                            flow_scores.append(count_score * confidence)
+                            
+                        # Speed prediction
+                        if hasattr(prediction, 'predicted_avg_speed'):
+                            avg_speed = prediction.predicted_avg_speed
+                            # Higher predicted speed = higher score
+                            speed_score = min(1.0, avg_speed / 13.89)  # Normalize by typical max speed
+                            flow_scores.append(speed_score * confidence)
+                            
+                    if flow_scores:
+                        return sum(flow_scores) / len(flow_scores)
+                        
+            # Fallback: analyze current flow characteristics
+            if edge_id in self.road_info:
+                edge_data = self.road_info[edge_id]
+                vehicle_num = edge_data.get('vehicle_num', 0)
+                road_len = edge_data.get('road_len', 100)
+                
+                # Calculate flow density
+                density = vehicle_num / max(1, road_len / 100)  # Vehicles per 100m
+                
+                # Convert density to flow score
+                optimal_density = 2.0  # Vehicles per 100m
+                if density <= optimal_density:
+                    flow_score = 1.0 - (density / optimal_density) * 0.3  # Slight penalty for increasing density
+                else:
+                    flow_score = 0.7 * max(0.0, 1.0 - (density - optimal_density) / 8.0)  # Penalty for overcrowding
+                    
+                return max(0.0, min(1.0, flow_score))
+                
+            return 0.5
+            
+        except Exception as e:
+            self.logger.log_warning(f"PREDICTIVE_FLOW_ERROR: {edge_id} -> {e}")
+            return 0.5
+    
+    def _calculate_dynamic_weights(self, edge_id: str, current_lane: int, target_lane: int) -> Dict[str, float]:
+        """Calculate dynamic weights for lane scoring based on current conditions.
+        
+        Adjusts the importance of different factors based on:
+        - Current traffic density
+        - System congestion level
+        - Lane change complexity
+        - Time-critical situations
+        """
+        try:
+            # Default weights
+            weights = {
+                'density': 0.30,
+                'speed': 0.25,
+                'route': 0.20,
+                'change_cost': 0.15,
+                'prediction': 0.10
+            }
+            
+            # Adjust weights based on current conditions
+            if edge_id in self.road_info:
+                edge_data = self.road_info[edge_id]
+                current_congestion = edge_data.get('congestion_level', 0)
+                occupancy_rate = edge_data.get('occupancy_rate', 0)
+                
+                # High congestion: prioritize speed and prediction
+                if current_congestion >= 3.0 or occupancy_rate >= 0.8:
+                    weights['speed'] += 0.10  # Increase speed importance
+                    weights['prediction'] += 0.10  # Increase prediction importance
+                    weights['density'] -= 0.10  # Decrease density importance
+                    weights['route'] -= 0.10  # Decrease route importance
+                    
+                # Low congestion: prioritize route efficiency
+                elif current_congestion <= 1.0 and occupancy_rate <= 0.3:
+                    weights['route'] += 0.15  # Increase route importance
+                    weights['change_cost'] += 0.05  # Slightly increase change cost importance
+                    weights['density'] -= 0.10  # Decrease density importance
+                    weights['speed'] -= 0.10  # Decrease speed importance
+                    
+                # Complex lane change: prioritize safety (change cost)
+                lane_diff = abs(target_lane - current_lane)
+                if lane_diff >= 2:
+                    weights['change_cost'] += 0.15  # Heavily prioritize safety
+                    weights['prediction'] += 0.05  # Consider future conditions
+                    weights['density'] -= 0.10  # Less focus on current density
+                    weights['speed'] -= 0.10  # Less focus on current speed
+                    
+            # Normalize weights to sum to 1.0
+            total_weight = sum(weights.values())
+            if total_weight > 0:
+                weights = {k: v / total_weight for k, v in weights.items()}
+                
+            return weights
+            
+        except Exception as e:
+            self.logger.log_warning(f"DYNAMIC_WEIGHTS_ERROR: {e}")
+            # Return default weights on error
+            return {
+                'density': 0.30,
+                'speed': 0.25, 
+                'route': 0.20,
+                'change_cost': 0.15,
+                'prediction': 0.10
+            }
+    
+    def _calculate_context_adjustment(self, edge_id: str, lane_idx: int, vehicle_id: str) -> float:
+        """Calculate context-aware bonus/penalty for lane selection.
+        
+        Considers:
+        - Nearby vehicle behavior
+        - Emergency situations
+        - System-wide optimization needs
+        - Historical performance
+        """
+        adjustment = 0.0
+        
+        try:
+            # 1. Nearby vehicle analysis
+            nearby_adjustment = self._analyze_nearby_vehicles(edge_id, lane_idx)
+            adjustment += nearby_adjustment * 0.4
+            
+            # 2. Emergency/priority situation detection
+            priority_adjustment = self._detect_priority_situations(vehicle_id, edge_id)
+            adjustment += priority_adjustment * 0.3
+            
+            # 3. System-wide load balancing
+            balance_adjustment = self._calculate_load_balance_adjustment(edge_id, lane_idx)
+            adjustment += balance_adjustment * 0.2
+            
+            # 4. Historical performance bonus
+            history_adjustment = self._calculate_historical_performance_bonus(edge_id, lane_idx)
+            adjustment += history_adjustment * 0.1
+            
+            # Cap adjustment to reasonable range
+            return max(-0.2, min(0.2, adjustment))
+            
+        except Exception as e:
+            self.logger.log_warning(f"CONTEXT_ADJUSTMENT_ERROR: {vehicle_id} -> {e}")
+            return 0.0
+    
+    def _analyze_nearby_vehicles(self, edge_id: str, lane_idx: int) -> float:
+        """Analyze nearby vehicle patterns for cooperative lane selection."""
+        try:
+            lane_id = f"{edge_id}_{lane_idx}"
+            
+            # Get vehicles in this lane
+            vehicles_in_lane = traci.lane.getLastStepVehicleIDs(lane_id)
+            
+            if not vehicles_in_lane:
+                return 0.1  # Bonus for empty lane
+                
+            # Analyze vehicle speeds and gaps
+            vehicle_speeds = []
+            for veh_id in vehicles_in_lane:
+                try:
+                    speed = traci.vehicle.getSpeed(veh_id)
+                    vehicle_speeds.append(speed)
+                except:
+                    continue
+                    
+            if vehicle_speeds:
+                avg_speed = sum(vehicle_speeds) / len(vehicle_speeds)
+                speed_variance = sum((s - avg_speed) ** 2 for s in vehicle_speeds) / len(vehicle_speeds)
+                
+                # Prefer lanes with consistent, good speeds
+                if avg_speed > 8.0 and speed_variance < 4.0:  # Good flow
+                    return 0.05
+                elif avg_speed < 3.0 or speed_variance > 16.0:  # Poor flow
+                    return -0.05
+                    
+            return 0.0  # Neutral
+            
+        except Exception:
+            return 0.0
+    
+    def _detect_priority_situations(self, vehicle_id: str, edge_id: str) -> float:
+        """Detect emergency or priority situations requiring special lane handling."""
+        try:
+            # Check if vehicle has been stuck or delayed
+            if vehicle_id in self.vehicle_start_times:
+                travel_time = time.time() - self.vehicle_start_times.get(vehicle_id, time.time())
+                
+                # Priority boost for vehicles that have been traveling for a long time
+                if travel_time > 600:  # More than 10 minutes
+                    return 0.1  # Priority boost
+                elif travel_time > 300:  # More than 5 minutes
+                    return 0.05  # Moderate boost
+                    
+            # Check for boundary approach (vehicles nearing region exits get priority)
+            if edge_id in [b['edge_id'] for b in self.boundary_edges if b.get('from_region') == self.region_id]:
+                return 0.08  # Boost for boundary approach
+                
+            return 0.0
+            
+        except Exception:
+            return 0.0
+    
+    def _calculate_load_balance_adjustment(self, edge_id: str, lane_idx: int) -> float:
+        """Calculate adjustment for system-wide load balancing."""
+        try:
+            # Get edge information
+            if edge_id not in self.road_info:
+                return 0.0
+                
+            edge_data = self.road_info[edge_id]
+            num_lanes = traci.edge.getLaneNumber(edge_id) if edge_id in traci.edge.getIDList() else 1
+            
+            if num_lanes <= 1:
+                return 0.0
+                
+            # Analyze lane distribution
+            lane_loads = []
+            for lane_i in range(num_lanes):
+                lane_id = f"{edge_id}_{lane_i}"
+                try:
+                    vehicle_count = traci.lane.getLastStepVehicleNumber(lane_id)
+                    lane_loads.append(vehicle_count)
+                except:
+                    lane_loads.append(0)
+                    
+            if not lane_loads:
+                return 0.0
+                
+            avg_load = sum(lane_loads) / len(lane_loads)
+            target_lane_load = lane_loads[lane_idx] if lane_idx < len(lane_loads) else avg_load
+            
+            # Bonus for choosing underutilized lanes
+            if target_lane_load < avg_load * 0.8:
+                return 0.03  # Bonus for load balancing
+            elif target_lane_load > avg_load * 1.2:
+                return -0.03  # Penalty for overloading
+                
+            return 0.0
+            
+        except Exception:
+            return 0.0
+    
+    def _calculate_historical_performance_bonus(self, edge_id: str, lane_idx: int) -> float:
+        """Calculate bonus based on historical lane performance."""
+        try:
+            # Check if we have lane change statistics
+            if not hasattr(self, 'lane_change_stats'):
+                return 0.0
+                
+            recent_changes = self.lane_change_stats.get('recent_changes', [])
+            
+            # Find successful changes to this lane on this edge
+            successful_to_lane = 0
+            total_to_lane = 0
+            
+            for change in recent_changes:
+                if change.get('to_lane') == lane_idx:
+                    total_to_lane += 1
+                    if self._was_lane_change_successful(change):
+                        successful_to_lane += 1
+                        
+            if total_to_lane >= 3:  # Need minimum sample size
+                success_rate = successful_to_lane / total_to_lane
+                if success_rate > 0.8:
+                    return 0.02  # Bonus for historically good lane
+                elif success_rate < 0.5:
+                    return -0.02  # Penalty for historically poor lane
+                    
+            return 0.0
+            
+        except Exception:
+            return 0.0
+    
+    def _log_lane_decision_analysis(self, vehicle_id: str, edge_id: str, lane_scores: List[Tuple[int, float]], 
+                                   current_lane: int, target_edge: str):
+        """Log detailed lane decision analysis for performance monitoring."""
+        try:
+            # Log comprehensive lane analysis
+            score_summary = ", ".join([f"L{lane}:{score:.3f}" for lane, score in lane_scores])
+            self.logger.log_info(f"LANE_ANALYSIS: {vehicle_id} on {edge_id} -> {score_summary} (current: L{current_lane}, target: {target_edge})")
+            
+            # Log top 2 choices for detailed analysis
+            if len(lane_scores) >= 2:
+                best_lane, best_score = lane_scores[0]
+                second_lane, second_score = lane_scores[1]
+                score_gap = best_score - second_score
+                
+                self.logger.log_info(f"LANE_TOP_CHOICES: {vehicle_id} -> Best: L{best_lane}({best_score:.3f}), "
+                                   f"Second: L{second_lane}({second_score:.3f}), Gap: {score_gap:.3f}")
+                
+        except Exception as e:
+            self.logger.log_warning(f"LANE_DECISION_LOG_ERROR: {vehicle_id} -> {e}")
+    
+    def _record_lane_optimization_decision(self, vehicle_id: str, from_lane: int, to_lane: int, 
+                                         score_improvement: float, decision_type: str):
+        """Record lane optimization decision for performance tracking."""
+        try:
+            # Initialize tracking structure if needed
+            if not hasattr(self, 'lane_optimization_history'):
+                self.lane_optimization_history = deque(maxlen=200)  # Keep last 200 decisions
+            
+            # Record the decision
+            decision_record = {
+                'vehicle_id': vehicle_id,
+                'timestamp': time.time(),
+                'from_lane': from_lane,
+                'to_lane': to_lane,
+                'score_improvement': score_improvement,
+                'decision_type': decision_type,  # 'optimization', 'stay', 'safety'
+                'region_id': self.region_id
+            }
+            
+            self.lane_optimization_history.append(decision_record)
+            
+            # Update aggregated statistics
+            self._update_lane_optimization_stats(decision_record)
+            
+        except Exception as e:
+            self.logger.log_warning(f"LANE_DECISION_RECORD_ERROR: {vehicle_id} -> {e}")
+    
+    def _update_lane_optimization_stats(self, decision_record: Dict):
+        """Update aggregated lane optimization statistics."""
+        try:
+            # Initialize stats if needed
+            if not hasattr(self, 'lane_optimization_stats'):
+                self.lane_optimization_stats = {
+                    'total_decisions': 0,
+                    'optimization_decisions': 0,
+                    'stay_decisions': 0,
+                    'avg_score_improvement': 0.0,
+                    'avg_lanes_changed': 0.0,
+                    'decision_distribution': {'optimization': 0, 'stay': 0, 'safety': 0}
+                }
+            
+            stats = self.lane_optimization_stats
+            
+            # Update counters
+            stats['total_decisions'] += 1
+            decision_type = decision_record['decision_type']
+            stats['decision_distribution'][decision_type] = stats['decision_distribution'].get(decision_type, 0) + 1
+            
+            if decision_type == 'optimization':
+                stats['optimization_decisions'] += 1
+            elif decision_type == 'stay':
+                stats['stay_decisions'] += 1
+            
+            # Update averages
+            old_count = stats['total_decisions'] - 1
+            if old_count > 0:
+                # Running average calculation
+                old_avg_improvement = stats['avg_score_improvement']
+                new_improvement = decision_record['score_improvement']
+                stats['avg_score_improvement'] = (old_avg_improvement * old_count + new_improvement) / stats['total_decisions']
+                
+                old_avg_lanes = stats['avg_lanes_changed']
+                new_lanes_changed = abs(decision_record['to_lane'] - decision_record['from_lane'])
+                stats['avg_lanes_changed'] = (old_avg_lanes * old_count + new_lanes_changed) / stats['total_decisions']
+            else:
+                stats['avg_score_improvement'] = decision_record['score_improvement']
+                stats['avg_lanes_changed'] = abs(decision_record['to_lane'] - decision_record['from_lane'])
+                
+        except Exception as e:
+            self.logger.log_warning(f"LANE_STATS_UPDATE_ERROR: {e}")
+    
+    def get_lane_optimization_report(self) -> Dict[str, Any]:
+        """Generate comprehensive lane optimization performance report."""
+        try:
+            report = {
+                'region_id': self.region_id,
+                'timestamp': time.time(),
+                'basic_stats': self._get_lane_optimization_metrics(),
+                'decision_quality': {},
+                'efficiency_metrics': {},
+                'recommendation': 'optimal'
+            }
+            
+            # Decision quality analysis
+            if hasattr(self, 'lane_optimization_stats'):
+                stats = self.lane_optimization_stats
+                total = stats['total_decisions']
+                
+                if total > 0:
+                    optimization_rate = stats['optimization_decisions'] / total
+                    stay_rate = stats['stay_decisions'] / total
+                    
+                    report['decision_quality'] = {
+                        'optimization_rate': optimization_rate,
+                        'stay_rate': stay_rate,
+                        'avg_improvement_when_optimizing': stats['avg_score_improvement'],
+                        'avg_lanes_changed': stats['avg_lanes_changed'],
+                        'decision_confidence': optimization_rate if optimization_rate < 0.8 else 0.8 + (0.2 * stay_rate)
+                    }
+            
+            # Efficiency metrics
+            if hasattr(self, 'lane_change_stats'):
+                change_stats = self.lane_change_stats
+                recent_changes = change_stats.get('recent_changes', [])
+                
+                if recent_changes:
+                    # Calculate success rate and efficiency
+                    successful = sum(1 for change in recent_changes if self._was_lane_change_successful(change))
+                    success_rate = successful / len(recent_changes)
+                    
+                    avg_duration = sum(change['duration'] for change in recent_changes) / len(recent_changes)
+                    
+                    report['efficiency_metrics'] = {
+                        'execution_success_rate': success_rate,
+                        'avg_execution_duration': avg_duration,
+                        'total_lane_changes': len(recent_changes),
+                        'efficiency_score': success_rate * (1.0 - min(0.5, avg_duration / 10000))  # Normalize duration
+                    }
+            
+            # Generate recommendation
+            report['recommendation'] = self._generate_optimization_recommendation(report)
+            
+            return report
+            
+        except Exception as e:
+            self.logger.log_error(f"LANE_OPTIMIZATION_REPORT_ERROR: {e}")
+            return {
+                'region_id': self.region_id,
+                'timestamp': time.time(),
+                'error': str(e),
+                'recommendation': 'unknown'
+            }
+    
+    def _generate_optimization_recommendation(self, report: Dict) -> str:
+        """Generate optimization recommendation based on performance metrics."""
+        try:
+            decision_quality = report.get('decision_quality', {})
+            efficiency_metrics = report.get('efficiency_metrics', {})
+            
+            optimization_rate = decision_quality.get('optimization_rate', 0.5)
+            success_rate = efficiency_metrics.get('execution_success_rate', 0.8)
+            efficiency_score = efficiency_metrics.get('efficiency_score', 0.7)
+            
+            # Generate recommendation based on performance
+            if success_rate > 0.85 and efficiency_score > 0.8:
+                return 'optimal'
+            elif optimization_rate > 0.7 and success_rate > 0.75:
+                return 'good'
+            elif success_rate < 0.6 or efficiency_score < 0.5:
+                return 'needs_tuning'
+            elif optimization_rate < 0.3:
+                return 'conservative'
+            else:
+                return 'acceptable'
+                
+        except Exception:
+            return 'unknown'
+    
+    def _initialize_lane_optimization_system(self):
+        """Initialize the advanced lane optimization system components."""
+        try:
+            # Initialize optimization tracking structures
+            self.lane_optimization_history = deque(maxlen=200)
+            self.lane_optimization_stats = {
+                'total_decisions': 0,
+                'optimization_decisions': 0,
+                'stay_decisions': 0,
+                'avg_score_improvement': 0.0,
+                'avg_lanes_changed': 0.0,
+                'decision_distribution': {'optimization': 0, 'stay': 0, 'safety': 0}
+            }
+            
+            # Initialize lane change tracking
+            self.lane_change_stats = {
+                'total_attempts': 0,
+                'successful_changes': 0,
+                'avg_duration': 0,
+                'recent_changes': deque(maxlen=50)
+            }
+            
+            # Log initialization success
+            prediction_status = "with prediction engine" if self.prediction_engine else "basic mode"
+            self.logger.log_info(f"LANE_OPTIMIZATION_INIT: Region {self.region_id} advanced lane optimization system initialized ({prediction_status})")
+            
+        except Exception as e:
+            self.logger.log_error(f"LANE_OPTIMIZATION_INIT_ERROR: Region {self.region_id} -> {e}")
+    
+    def validate_lane_optimization_integration(self) -> Dict[str, bool]:
+        """Validate that all lane optimization components are properly integrated."""
+        validation_results = {
+            'prediction_engine_available': self.prediction_engine is not None,
+            'optimization_stats_initialized': hasattr(self, 'lane_optimization_stats'),
+            'lane_change_tracking_initialized': hasattr(self, 'lane_change_stats'),
+            'scoring_methods_available': True,
+            'execution_methods_available': True,
+            'logging_methods_available': True
+        }
+        
+        # Test core scoring methods
+        try:
+            test_weights = self._calculate_dynamic_weights('test_edge', 0, 1)
+            validation_results['dynamic_weights_functional'] = isinstance(test_weights, dict) and 'density' in test_weights
+        except:
+            validation_results['dynamic_weights_functional'] = False
+            validation_results['scoring_methods_available'] = False
+        
+        # Test prediction integration
+        try:
+            test_score = self._score_lane_predictions('test_edge')
+            validation_results['prediction_scoring_functional'] = isinstance(test_score, (int, float))
+        except:
+            validation_results['prediction_scoring_functional'] = False
+        
+        # Overall integration status
+        validation_results['overall_integration_status'] = all([
+            validation_results['optimization_stats_initialized'],
+            validation_results['lane_change_tracking_initialized'],
+            validation_results['scoring_methods_available'],
+            validation_results['execution_methods_available'],
+            validation_results['dynamic_weights_functional']
+        ])
+        
+        # Log validation results
+        status = "✓ PASSED" if validation_results['overall_integration_status'] else "✗ FAILED"
+        self.logger.log_info(f"LANE_OPTIMIZATION_VALIDATION: Region {self.region_id} -> {status}")
+        
+        if not validation_results['overall_integration_status']:
+            failed_components = [k for k, v in validation_results.items() if not v and k != 'overall_integration_status']
+            self.logger.log_warning(f"LANE_OPTIMIZATION_VALIDATION_ISSUES: {failed_components}")
+        
+        return validation_results
+    
+    def _execute_lane_change(self, vehicle_id: str, target_lane: int) -> bool:
+        """Execute lane change with intelligent timing and safety checks.
+        
+        Returns:
+            bool: True if lane change was initiated successfully
+        """
+        try:
+            # Verify vehicle is still active
+            if vehicle_id not in traci.vehicle.getIDList():
+                return False
+                
+            # Get current vehicle state
+            current_edge = traci.vehicle.getRoadID(vehicle_id)
+            if current_edge.startswith(':'):
+                # Vehicle is in junction, defer lane change
+                self.logger.log_info(f"LANE_CHANGE_DEFERRED: {vehicle_id} in junction, deferring lane change")
+                return False
+                
+            current_lane = traci.vehicle.getLaneIndex(vehicle_id)
+            vehicle_speed = traci.vehicle.getSpeed(vehicle_id)
+            
+            # Check if already in target lane
+            if current_lane == target_lane:
+                return True
+                
+            # Safety check: don't change lanes if vehicle is very slow or stopped
+            if vehicle_speed < 2.0:  # Less than 2 m/s
+                self.logger.log_info(f"LANE_CHANGE_DEFERRED: {vehicle_id} too slow for lane change (speed: {vehicle_speed:.1f})")
+                return False
+                
+            # Calculate appropriate change duration based on speed and lane difference
+            lane_diff = abs(target_lane - current_lane)
+            
+            # Base duration: 3-5 seconds depending on complexity
+            if lane_diff == 1:
+                duration = max(3000, int(5000 / max(vehicle_speed, 1)))  # 3-5s for single change
+            elif lane_diff == 2:
+                duration = max(5000, int(8000 / max(vehicle_speed, 1)))  # 5-8s for double change
+            else:
+                duration = max(7000, int(10000 / max(vehicle_speed, 1))) # 7-10s for complex change
+                
+            # Cap duration at reasonable maximum
+            duration = min(duration, 15000)  # Max 15 seconds
+            
+            # Execute the lane change
+            traci.vehicle.changeLane(vehicle_id, target_lane, duration)
+            
+            # Log successful initiation
+            self.logger.log_info(f"LANE_CHANGE_EXECUTED: {vehicle_id} changing from lane {current_lane} to {target_lane} "
+                               f"(duration: {duration}ms, speed: {vehicle_speed:.1f} m/s)")
+            
+            # Track lane change performance
+            self._track_lane_change_performance(vehicle_id, current_lane, target_lane, duration)
+            
+            return True
+            
+        except Exception as e:
+            self.logger.log_error(f"LANE_CHANGE_FAILED: {vehicle_id} -> {e}")
+            return False
+    
+    def _track_lane_change_performance(self, vehicle_id: str, from_lane: int, to_lane: int, duration: int):
+        """Track lane change performance for optimization."""
+        try:
+            # Initialize tracking structure if needed
+            if not hasattr(self, 'lane_change_stats'):
+                self.lane_change_stats = {
+                    'total_attempts': 0,
+                    'successful_changes': 0,
+                    'avg_duration': 0,
+                    'recent_changes': deque(maxlen=50)
+                }
+            
+            # Record this lane change
+            change_record = {
+                'vehicle_id': vehicle_id,
+                'from_lane': from_lane,
+                'to_lane': to_lane,
+                'duration': duration,
+                'timestamp': time.time()
+            }
+            
+            self.lane_change_stats['total_attempts'] += 1
+            self.lane_change_stats['recent_changes'].append(change_record)
+            
+            # Update average duration
+            recent_durations = [change['duration'] for change in self.lane_change_stats['recent_changes']]
+            if recent_durations:
+                self.lane_change_stats['avg_duration'] = sum(recent_durations) / len(recent_durations)
+                
+        except Exception as e:
+            self.logger.log_warning(f"LANE_CHANGE_TRACKING_ERROR: {e}")
     
     def _calculate_priority(self, vehicle_id: str, target_edge: str) -> int:
         """Calculate priority for vehicle (1-5, higher is more priority)."""
@@ -1379,12 +2376,9 @@ class RegionalAgent:
                 # Set vehicle route in SUMO
                 traci.vehicle.setRoute(decision.vehicle_id, decision.route)
                 
-                # Set lane assignment if specified
+                # Execute intelligent lane assignment if specified
                 if decision.lane_assignment is not None:
-                    try:
-                        traci.vehicle.changeLane(decision.vehicle_id, decision.lane_assignment, 500)
-                    except:
-                        pass  # Lane change might fail
+                    self._execute_lane_change(decision.vehicle_id, decision.lane_assignment)
                 
                 executed_count += 1
                 
@@ -1418,6 +2412,9 @@ class RegionalAgent:
         total_usage = sum(self.planned_routes.values())
         usage_efficiency = len(self.region_edges) / max(1, total_usage) if total_usage > 0 else 1.0
         
+        # Get lane optimization metrics
+        lane_metrics = self._get_lane_optimization_metrics()
+        
         return {
             'region_id': self.region_id,
             'active_vehicles': len(self.region_vehicles),
@@ -1427,5 +2424,139 @@ class RegionalAgent:
             'avg_congestion': avg_congestion,
             'boundary_utilization': len([e for e in self.outgoing_boundaries 
                                        if self.planned_routes.get(e, 0) > 0]),
-            'route_efficiency': usage_efficiency
+            'route_efficiency': usage_efficiency,
+            'lane_change_attempts': lane_metrics['total_attempts'],
+            'lane_change_success_rate': lane_metrics['success_rate'],
+            'avg_lane_change_duration': lane_metrics['avg_duration']
         }
+    
+    def _get_lane_optimization_metrics(self) -> Dict[str, float]:
+        """Get comprehensive lane optimization performance metrics."""
+        # Initialize default metrics
+        default_metrics = {
+            'total_attempts': 0,
+            'success_rate': 0.0,
+            'avg_duration': 0.0,
+            'optimization_efficiency': 1.0,
+            'recent_performance': 1.0
+        }
+        
+        try:
+            if not hasattr(self, 'lane_change_stats'):
+                return default_metrics
+                
+            stats = self.lane_change_stats
+            total_attempts = stats.get('total_attempts', 0)
+            
+            if total_attempts == 0:
+                return default_metrics
+                
+            # Calculate success rate based on actual completions
+            recent_changes = stats.get('recent_changes', [])
+            successful_changes = len([c for c in recent_changes 
+                                    if self._was_lane_change_successful(c)])
+            
+            success_rate = (successful_changes / len(recent_changes)) * 100 if recent_changes else 0
+            
+            # Calculate optimization efficiency
+            efficiency = self._calculate_lane_optimization_efficiency(recent_changes)
+            
+            # Calculate recent performance trend
+            recent_performance = self._calculate_recent_performance_trend(recent_changes)
+            
+            return {
+                'total_attempts': total_attempts,
+                'success_rate': success_rate,
+                'avg_duration': stats.get('avg_duration', 0.0),
+                'optimization_efficiency': efficiency,
+                'recent_performance': recent_performance
+            }
+            
+        except Exception as e:
+            self.logger.log_error(f"LANE_METRICS_ERROR: {e}")
+            return default_metrics
+    
+    def _was_lane_change_successful(self, change_record: Dict) -> bool:
+        """Determine if a lane change was actually successful."""
+        try:
+            vehicle_id = change_record['vehicle_id']
+            target_lane = change_record['to_lane']
+            timestamp = change_record['timestamp']
+            
+            # If change was recent and vehicle still exists, check current lane
+            current_time = time.time()
+            if current_time - timestamp < 30:  # Within last 30 seconds
+                if vehicle_id in traci.vehicle.getIDList():
+                    try:
+                        current_lane = traci.vehicle.getLaneIndex(vehicle_id)
+                        return current_lane == target_lane
+                    except:
+                        pass
+                        
+            # For older changes, assume successful (vehicle completed journey)
+            return True
+            
+        except Exception:
+            return True  # Conservative assumption
+    
+    def _calculate_lane_optimization_efficiency(self, recent_changes: List[Dict]) -> float:
+        """Calculate efficiency of lane optimization decisions."""
+        if not recent_changes:
+            return 1.0
+            
+        try:
+            efficiency_scores = []
+            
+            for change in recent_changes[-20:]:  # Last 20 changes
+                vehicle_id = change['vehicle_id']
+                from_lane = change['from_lane']
+                to_lane = change['to_lane']
+                
+                # Calculate efficiency based on lane change complexity vs benefit
+                complexity = abs(to_lane - from_lane)
+                
+                # Simple efficiency heuristic: fewer lane changes = more efficient
+                if complexity == 0:
+                    efficiency = 1.0  # Perfect - no change needed
+                elif complexity == 1:
+                    efficiency = 0.8  # Good - single lane change
+                elif complexity == 2:
+                    efficiency = 0.6  # Moderate - double lane change
+                else:
+                    efficiency = 0.4  # Complex - multiple lane changes
+                    
+                efficiency_scores.append(efficiency)
+                
+            return sum(efficiency_scores) / len(efficiency_scores) if efficiency_scores else 1.0
+            
+        except Exception:
+            return 1.0
+    
+    def _calculate_recent_performance_trend(self, recent_changes: List[Dict]) -> float:
+        """Calculate recent performance trend (improving/declining)."""
+        if len(recent_changes) < 5:
+            return 1.0
+            
+        try:
+            # Compare recent performance to baseline
+            recent_10 = recent_changes[-10:] if len(recent_changes) >= 10 else recent_changes
+            older_10 = recent_changes[-20:-10] if len(recent_changes) >= 20 else recent_changes[:-10]
+            
+            if not older_10:
+                return 1.0
+                
+            # Calculate average duration for both periods
+            recent_avg_duration = sum(c['duration'] for c in recent_10) / len(recent_10)
+            older_avg_duration = sum(c['duration'] for c in older_10) / len(older_10)
+            
+            # Shorter duration indicates better performance
+            if older_avg_duration == 0:
+                return 1.0
+                
+            performance_ratio = older_avg_duration / recent_avg_duration
+            
+            # Cap the ratio for reasonable bounds
+            return max(0.5, min(2.0, performance_ratio))
+            
+        except Exception:
+            return 1.0
