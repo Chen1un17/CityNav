@@ -477,7 +477,19 @@ class MultiAgentTrafficEnvironment:
             )
             
             if not macro_candidates:
-                self.logger.log_warning(f"VEHICLE_BIRTH: No macro candidates found for {vehicle_id}")
+                self.logger.log_warning(f"VEHICLE_BIRTH: No macro candidates found for {vehicle_id}, creating emergency single-region route")
+                # Create emergency single-region route as fallback
+                emergency_route = [start_region]
+                self.vehicle_current_plans[vehicle_id] = {
+                    'macro_route': emergency_route,
+                    'current_region_index': 0,
+                    'creation_time': current_time,
+                    'last_update': current_time,
+                    'emergency_route': True,
+                    'original_dest_region': dest_region
+                }
+                
+                self.logger.log_info(f"VEHICLE_BIRTH: {vehicle_id} assigned emergency route [{start_region}], will retry pathfinding later")
                 return
             
             # Use LLM to select optimal macro route
@@ -519,6 +531,17 @@ class MultiAgentTrafficEnvironment:
                 self._vehicle_replan_times = {}
             
             self.logger.log_info(f"STUCK_REPLAN: Initiating replanning for stuck vehicle {vehicle_id}")
+            
+            # Check if this is an emergency route vehicle
+            is_emergency_route = False
+            original_dest_region = None
+            if vehicle_id in self.vehicle_current_plans:
+                plan = self.vehicle_current_plans[vehicle_id]
+                is_emergency_route = plan.get('emergency_route', False)
+                original_dest_region = plan.get('original_dest_region')
+                
+                if is_emergency_route:
+                    self.logger.log_info(f"STUCK_REPLAN: {vehicle_id} is on emergency route, attempting to find path to original destination {original_dest_region}")
             
             # Clear existing plans and routes
             if vehicle_id in self.vehicle_current_plans:
@@ -578,8 +601,28 @@ class MultiAgentTrafficEnvironment:
                         candidates.append(path)
                         
             except nx.NetworkXNoPath:
-                self.logger.log_warning(f"MACRO_CANDIDATES: No path found from region {start_region} to {dest_region}")
-                return []
+                # If no path found, try to supplement region connections and retry
+                self.logger.log_warning(f"MACRO_CANDIDATES: No path found from region {start_region} to {dest_region}, attempting to supplement connections")
+                
+                # Try to supplement region connections
+                self._supplement_region_connections_emergency(start_region, dest_region)
+                
+                # Retry pathfinding
+                try:
+                    all_paths = list(nx.all_simple_paths(
+                        self.traffic_agent.region_graph, 
+                        start_region, 
+                        dest_region, 
+                        cutoff=5
+                    ))
+                    
+                    for path in all_paths[:10]:
+                        if path not in candidates:
+                            candidates.append(path)
+                            
+                except nx.NetworkXNoPath:
+                    self.logger.log_error(f"MACRO_CANDIDATES: Still no path found from region {start_region} to {dest_region} after supplementing")
+                    return []
             
             # Evaluate candidates based on multiple factors
             evaluated_candidates = []
@@ -599,6 +642,100 @@ class MultiAgentTrafficEnvironment:
         except Exception as e:
             self.logger.log_error(f"MACRO_CANDIDATES: Failed to generate candidates: {e}")
             return []
+    
+    def _supplement_region_connections_emergency(self, start_region: int, dest_region: int):
+        """Emergency supplement of region connections when pathfinding fails."""
+        try:
+            # Get all edges in the start and destination regions
+            start_edges = [edge_id for edge_id, region in self.edge_to_region.items() if region == start_region]
+            dest_edges = [edge_id for edge_id, region in self.edge_to_region.items() if region == dest_region]
+            
+            supplemented = 0
+            
+            # Check connections from start region edges using TRACI
+            for edge_id in start_edges:
+                if edge_id.startswith(':'):
+                    continue
+                    
+                try:
+                    # Get the junction at the end of this edge
+                    to_junction = traci.edge.getToJunction(edge_id)
+                    if to_junction:
+                        # Get all outgoing edges from this junction
+                        outgoing_edges = traci.junction.getOutgoingEdges(to_junction)
+                        
+                        for target_edge in outgoing_edges:
+                            if target_edge.startswith(':'):
+                                continue
+                                
+                            target_region = self.edge_to_region.get(target_edge)
+                            if target_region is None or target_region == start_region:
+                                continue
+                            
+                            # Add connection to region graph
+                            if not self.traffic_agent.region_graph.has_edge(start_region, target_region):
+                                self.traffic_agent.region_graph.add_edge(start_region, target_region, weight=1.0, edges=[])
+                                supplemented += 1
+                                self.logger.log_info(f"EMERGENCY_SUPPLEMENT: Added connection {start_region} -> {target_region}")
+                                
+                except Exception:
+                    continue
+            
+            # Also check for paths through intermediate regions
+            all_regions = list(range(self.num_regions))
+            for intermediate_region in all_regions:
+                if intermediate_region == start_region or intermediate_region == dest_region:
+                    continue
+                    
+                # Check if we can connect start -> intermediate -> dest
+                if (self.traffic_agent.region_graph.has_edge(start_region, intermediate_region) and 
+                    self.traffic_agent.region_graph.has_edge(intermediate_region, dest_region)):
+                    # Path already exists through this intermediate
+                    continue
+                    
+                # Try to find real network connections
+                intermediate_edges = [edge_id for edge_id, region in self.edge_to_region.items() if region == intermediate_region]
+                
+                # Check start -> intermediate using TRACI
+                if not self.traffic_agent.region_graph.has_edge(start_region, intermediate_region):
+                    for start_edge in start_edges:
+                        if start_edge.startswith(':'):
+                            continue
+                        try:
+                            to_junction = traci.edge.getToJunction(start_edge)
+                            if to_junction:
+                                outgoing = traci.junction.getOutgoingEdges(to_junction)
+                                for out_edge in outgoing:
+                                    if out_edge in intermediate_edges and not out_edge.startswith(':'):
+                                        self.traffic_agent.region_graph.add_edge(start_region, intermediate_region, weight=1.0, edges=[])
+                                        supplemented += 1
+                                        self.logger.log_info(f"EMERGENCY_SUPPLEMENT: Added intermediate connection {start_region} -> {intermediate_region}")
+                                        break
+                        except:
+                            continue
+                
+                # Check intermediate -> dest using TRACI
+                if not self.traffic_agent.region_graph.has_edge(intermediate_region, dest_region):
+                    for int_edge in intermediate_edges:
+                        if int_edge.startswith(':'):
+                            continue
+                        try:
+                            to_junction = traci.edge.getToJunction(int_edge)
+                            if to_junction:
+                                outgoing = traci.junction.getOutgoingEdges(to_junction)
+                                for out_edge in outgoing:
+                                    if out_edge in dest_edges and not out_edge.startswith(':'):
+                                        self.traffic_agent.region_graph.add_edge(intermediate_region, dest_region, weight=1.0, edges=[])
+                                        supplemented += 1
+                                        self.logger.log_info(f"EMERGENCY_SUPPLEMENT: Added intermediate connection {intermediate_region} -> {dest_region}")
+                                        break
+                        except:
+                            continue
+            
+            self.logger.log_info(f"EMERGENCY_SUPPLEMENT: Added {supplemented} emergency connections for {start_region} -> {dest_region}")
+            
+        except Exception as e:
+            self.logger.log_error(f"EMERGENCY_SUPPLEMENT: Failed: {e}")
     
     def _evaluate_macro_route_candidate(self, route: List[int], current_time: float) -> float:
         """
@@ -1199,13 +1336,7 @@ class MultiAgentTrafficEnvironment:
                     'region_changes': [],
                     'stuck_vehicles': []
                 }
-            else:
-                # Clear previous pending decisions
-                self.pending_decisions = {
-                    'new_vehicles': [],
-                    'region_changes': [],
-                    'stuck_vehicles': []
-                }
+            # Don't clear previous pending decisions here - they will be processed and cleared in process_vehicle_decisions
             
             # Track vehicles entering and exiting the simulation
             for veh_id in autonomous_in_sim:
@@ -1219,8 +1350,9 @@ class MultiAgentTrafficEnvironment:
                             new_vehicles += 1
                             self.logger.log_info(f"NEW_VEHICLE: {veh_id} started at time {actual_depart_time:.1f}")
                             
-                            # Queue for decision making
-                            self.pending_decisions['new_vehicles'].append(veh_id)
+                            # Queue for decision making (with deduplication)
+                            if veh_id not in self.pending_decisions['new_vehicles']:
+                                self.pending_decisions['new_vehicles'].append(veh_id)
                         except Exception as e:
                             # Fallback to current simulation time if getDeparture() fails
                             self.vehicle_start_times[veh_id] = current_time
@@ -1228,8 +1360,9 @@ class MultiAgentTrafficEnvironment:
                             self.logger.log_info(f"NEW_VEHICLE: {veh_id} started at time {current_time:.1f} (fallback)")
                             self.logger.log_warning(f"VEHICLE_DEPART_TIME: Could not get departure time for {veh_id}: {e}")
                             
-                            # Queue for decision making
-                            self.pending_decisions['new_vehicles'].append(veh_id)
+                            # Queue for decision making (with deduplication)
+                            if veh_id not in self.pending_decisions['new_vehicles']:
+                                self.pending_decisions['new_vehicles'].append(veh_id)
                     
                     # Batch TraCI calls for this vehicle
                     try:
@@ -1309,11 +1442,16 @@ class MultiAgentTrafficEnvironment:
                                 self._last_console_update = current_time
                             
                             # Check for stuck vehicles (queue for decision making)
-                            if vehicle_speed < 0.1 and travel_time > 300:  # Stopped for > 5 minutes
-                                self.logger.log_warning(f"VEHICLE_STUCK: {veh_id} stopped on {current_edge} for {travel_time:.1f}s")
+                            # Use shorter threshold for vehicles without macro plans
+                            has_macro_plan = veh_id in self.vehicle_current_plans
+                            stuck_threshold = 180 if not has_macro_plan else 300  # 3 minutes vs 5 minutes
+                            
+                            if vehicle_speed < 0.1 and travel_time > stuck_threshold:
+                                self.logger.log_warning(f"VEHICLE_STUCK: {veh_id} stopped on {current_edge} for {travel_time:.1f}s (macro_plan={has_macro_plan})")
                                 
-                                # Queue for stuck vehicle replanning
-                                self.pending_decisions['stuck_vehicles'].append(veh_id)
+                                # Queue for stuck vehicle replanning (with deduplication)
+                                if veh_id not in self.pending_decisions['stuck_vehicles']:
+                                    self.pending_decisions['stuck_vehicles'].append(veh_id)
                             
                         except Exception as metrics_error:
                             self.logger.log_warning(f"VEHICLE_METRICS_ERROR: {veh_id} -> {metrics_error}")
@@ -1395,12 +1533,29 @@ class MultiAgentTrafficEnvironment:
         try:
             if not hasattr(self, 'pending_decisions') or not self.pending_decisions:
                 return  # No decisions to process
+            
+            # Atomically extract pending decisions to avoid accumulation
+            new_vehicles = self.pending_decisions.get('new_vehicles', []).copy()
+            region_changes = self.pending_decisions.get('region_changes', []).copy()
+            stuck_vehicles = self.pending_decisions.get('stuck_vehicles', []).copy()
+            
+            # Clear pending decisions immediately to avoid accumulation
+            self.pending_decisions = {
+                'new_vehicles': [],
+                'region_changes': [],
+                'stuck_vehicles': []
+            }
+            
+            total_decisions = len(new_vehicles) + len(region_changes) + len(stuck_vehicles)
+            
+            if total_decisions == 0:
+                return
                 
             decisions_processed = 0
             decisions_failed = 0
             
             # Process new vehicle births
-            for veh_id in self.pending_decisions.get('new_vehicles', []):
+            for veh_id in new_vehicles:
                 try:
                     self.handle_vehicle_birth_macro_planning(veh_id, current_time)
                     decisions_processed += 1
@@ -1409,7 +1564,7 @@ class MultiAgentTrafficEnvironment:
                     decisions_failed += 1
             
             # Process region changes
-            for region_change in self.pending_decisions.get('region_changes', []):
+            for region_change in region_changes:
                 try:
                     veh_id = region_change['vehicle_id']
                     
@@ -1429,7 +1584,7 @@ class MultiAgentTrafficEnvironment:
                     decisions_failed += 1
             
             # Process stuck vehicles
-            for veh_id in self.pending_decisions.get('stuck_vehicles', []):
+            for veh_id in stuck_vehicles:
                 try:
                     self._handle_stuck_vehicle_replanning(veh_id, current_time)
                     decisions_processed += 1
@@ -1439,9 +1594,6 @@ class MultiAgentTrafficEnvironment:
             
             # Performance summary
             decision_time = (time.time() - decision_start_time) * 1000
-            total_decisions = len(self.pending_decisions.get('new_vehicles', [])) + \
-                            len(self.pending_decisions.get('region_changes', [])) + \
-                            len(self.pending_decisions.get('stuck_vehicles', []))
             
             self.logger.log_info(f"VEHICLE_DECISIONS_COMPLETE: total:{total_decisions}, processed:{decisions_processed}, "
                                f"failed:{decisions_failed}, time:{decision_time:.1f}ms")
@@ -1455,7 +1607,7 @@ class MultiAgentTrafficEnvironment:
                 
         except Exception as e:
             self.logger.log_error(f"VEHICLE_DECISIONS_CRITICAL_ERROR: {e}")
-            raise
+            # Don't re-raise, just log the error to prevent simulation crash
     
     def coordinate_regional_agents(self, current_time: float):
         """Coordinate regional agents with batch asynchronous regional planning."""

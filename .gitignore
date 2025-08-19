@@ -6,3 +6,4 @@ wandb/
 .claude/
 __pycache__/
 Qwen/
+*.md
