@@ -85,7 +85,7 @@ def load_static_road_data(data_dir: str = "Data/Region_1"):
     
     try:
         # 加载道路信息
-        road_info_path = os.path.join(data_dir, "Manhattan_road_info.json")
+        road_info_path = "/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_road_info.json"
         if os.path.exists(road_info_path):
             with open(road_info_path, 'r') as f:
                 _static_road_data = json.load(f)
@@ -95,7 +95,7 @@ def load_static_road_data(data_dir: str = "Data/Region_1"):
             print(f"STATIC_DATA_LOADER: Valid edges cache initialized with {len(_valid_edges_cache)} entries")
         
         # 加载邻接信息
-        adj_info_path = os.path.join(data_dir, "Manhattan_adjacency_info.json")
+        adj_info_path = "/data/zhouyuping/LLMNavigation/Data/NYC/Region_1/edge_adjacency_alpha_1.json"
         if os.path.exists(adj_info_path):
             with open(adj_info_path, 'r') as f:
                 _adjacency_data = json.load(f)

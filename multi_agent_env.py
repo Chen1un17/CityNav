@@ -30,8 +30,8 @@ class MultiAgentTrafficEnvironment:
     
     def __init__(self, location: str, sumo_config_file: str, route_file: str,
                  road_info_file: str, adjacency_file: str, region_data_dir: str,
-                 llm_agent, step_size: float = 1.0, max_steps: int = 1000,
-                 log_dir: str = "logs"):
+                 model_path: str = None, llm_agent=None, step_size: float = 1.0, max_steps: int = 1000,
+                 log_dir: str = "logs", task_info=None, use_local_llm: bool = True):
         """
         Initialize multi-agent traffic environment.
         
@@ -42,10 +42,13 @@ class MultiAgentTrafficEnvironment:
             road_info_file: Path to road information file
             adjacency_file: Path to adjacency information file
             region_data_dir: Directory containing region partition data
-            llm_agent: Language model agent for decision making
+            model_path: Path to local model (for local LLM mode)
+            llm_agent: Language model agent for decision making (legacy mode)
             step_size: Simulation step size in seconds
             max_steps: Maximum simulation steps
             log_dir: Directory for log files
+            task_info: Task information for LLM initialization
+            use_local_llm: Whether to use local shared LLM architecture
         """
         self.location = location
         self.sumo_config_file = sumo_config_file
@@ -53,13 +56,26 @@ class MultiAgentTrafficEnvironment:
         self.road_info_file = road_info_file
         self.adjacency_file = adjacency_file
         self.region_data_dir = region_data_dir
-        self.llm_agent = llm_agent
+        self.model_path = model_path
+        self.llm_agent = llm_agent  # 兼容性保留
         self.step_size = step_size
         self.max_steps = max_steps
+        self.task_info = task_info
+        self.use_local_llm = use_local_llm
+        
+        # 本地LLM管理器
+        self.llm_manager = None
+        self.traffic_llm = None
+        self.regional_llm = None
         
         # Initialize logger
         self.logger = AgentLogger(log_dir=log_dir, console_output=True)
         
+        # === 优化加载顺序：先加载模型后加载路网 ===
+        print("\n=== Step 1: 初始化LLM模型（这步最耗时） ===")
+        self._initialize_llms_first()
+        
+        print("\n=== Step 2: 加载路网数据 ===")
         # Load region and road data
         self._load_region_data()
         self._load_road_data()
@@ -87,8 +103,9 @@ class MultiAgentTrafficEnvironment:
         self.last_prediction_update_time = 0.0
         self.last_regional_decision_time = {}  # Track regional agent decision times
         
-        # Initialize agents
-        self._initialize_agents()
+        # Initialize agents (LLMs already loaded, now create agent instances)
+        print("\n=== Step 3: 初始化智能体 ===")
+        self._initialize_agents_with_existing_llms()
         
         # Simulation state
         self.autonomous_vehicles = set()
@@ -353,25 +370,59 @@ class MultiAgentTrafficEnvironment:
             self.logger.log_error(f"Failed to load road data: {e}")
             raise
     
-    def _initialize_agents(self):
-        """Initialize all agents."""
+    def _initialize_llms_first(self):
+        """优先初始化LLM模型（最耗时的步骤）"""
+        try:
+            # 初始化本地LLM管理器或使用传统模式
+            if self.use_local_llm and self.model_path:
+                print("\n=== 使用本地共享LLM架构 ===")
+                from utils.language_model import LocalLLMManager
+                
+                # 创建本地LLM管理器
+                self.llm_manager = LocalLLMManager(
+                    model_path=self.model_path,
+                    task_info=self.task_info
+                )
+                
+                # 初始化共享LLM实例（这是最耗时的步骤）
+                print("正在初始化共享LLM实例...请耐心等待")
+                self.traffic_llm, self.regional_llm = self.llm_manager.initialize_llms()
+                
+                # 打印GPU状态
+                self.llm_manager.print_gpu_status()
+                
+            elif self.llm_agent:
+                print("\n=== 使用传统单一LLM模式 ===")
+                self.traffic_llm = self.llm_agent
+                self.regional_llm = self.llm_agent
+            else:
+                raise ValueError("必须提供 model_path 或 llm_agent 参数")
+                
+            print("[SUCCESS] LLM模型初始化完成")
+            
+        except Exception as e:
+            self.logger.log_error(f"Failed to initialize LLMs: {e}")
+            raise
+    
+    def _initialize_agents_with_existing_llms(self):
+        """使用已初始化的LLM创建智能体实例"""
         try:
             # Initialize prediction engine
             edge_list = list(self.road_info.keys())
             self.prediction_engine = PredictionEngine(edge_list, self.logger)
             
-            # Initialize Traffic Agent
+            # Initialize Traffic Agent with appropriate LLM (already loaded)
             self.traffic_agent = TrafficAgent(
                 boundary_edges=self.boundary_edges,
                 edge_to_region=self.edge_to_region,
                 road_info=self.road_info,
                 num_regions=self.num_regions,
-                llm_agent=self.llm_agent,
+                llm_agent=self.traffic_llm,  # 使用已初始化的Traffic LLM
                 logger=self.logger,
                 prediction_engine=self.prediction_engine
             )
             
-            # Initialize Regional Agents with prediction engine access
+            # Initialize Regional Agents with shared Regional LLM (already loaded)
             self.regional_agents = {}
             for region_id in range(self.num_regions):
                 regional_agent = RegionalAgent(
@@ -380,15 +431,21 @@ class MultiAgentTrafficEnvironment:
                     edge_to_region=self.edge_to_region,
                     road_info=self.road_info,
                     road_network=self.road_network,
-                    llm_agent=self.llm_agent,
+                    llm_agent=self.regional_llm,  # 所有区域共享已初始化的LLM
                     logger=self.logger,
                     prediction_engine=self.prediction_engine
                 )
                 self.regional_agents[region_id] = regional_agent
                 self.last_regional_decision_time[region_id] = 0.0
             
-            self.logger.log_info(f"Initialized {len(self.regional_agents)} Regional Agents, "
-                               f"1 Traffic Agent, and 1 Prediction Engine")
+            if self.use_local_llm:
+                self.logger.log_info(f"Initialized {len(self.regional_agents)} Regional Agents "
+                                   f"(sharing 1 Local Regional LLM), "
+                                   f"1 Traffic Agent (with 1 Local Traffic LLM), "
+                                   f"and 1 Prediction Engine")
+            else:
+                self.logger.log_info(f"Initialized {len(self.regional_agents)} Regional Agents, "
+                                   f"1 Traffic Agent, and 1 Prediction Engine")
             
         except Exception as e:
             self.logger.log_error(f"Failed to initialize agents: {e}")

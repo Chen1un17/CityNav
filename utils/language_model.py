@@ -17,8 +17,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from utils.read_utils import load_json, markdown_code_pattern
 
 class LLM(object):
-    def __init__(self, llm_path, batch_size=16, top_k=50, top_p=1.0, temperature=0.1, max_tokens=8192, memory_size=3, task_info=None, use_reflection=True):
+    def __init__(self, llm_path, batch_size=16, top_k=50, top_p=1.0, temperature=0.1, max_tokens=8192, memory_size=3, task_info=None, use_reflection=True, gpu_ids=None, tensor_parallel_size=1, gpu_memory_utilization=0.7):
         self.use_reflection = use_reflection
+        self.gpu_ids = gpu_ids  # 指定使用的GPU ID列表
+        self.tensor_parallel_size = tensor_parallel_size
+        self.gpu_memory_utilization = gpu_memory_utilization
         self.tokenizer, self.model, self.generation_kwargs, self.use_api = self.initialize_llm(llm_path, top_k, top_p, temperature, max_tokens)
         
         # Handle different model path formats
@@ -69,25 +72,126 @@ class LLM(object):
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
-        if "openai" in llm_path.lower() or "siliconflow" in llm_path.lower():
+        # 判断是否为本地模型路径（优先检查）
+        if os.path.exists(llm_path):
+            # 本地模型路径存在，使用vLLM加载
+            print(f"检测到本地模型路径: {llm_path}")
+            print(f"正在使用vLLM加载本地模型: {llm_path}")
+            
+            # 配置vLLM参数以支持指定GPU
+            # 限制max_model_len以节省KV cache内存，同时保持在10000以上
+            effective_max_len = max(min(max_tokens, 12288), 10240)  # 在10240-12288之间
+            
+            vllm_kwargs = {
+                "model": llm_path,
+                "gpu_memory_utilization": self.gpu_memory_utilization,
+                "tensor_parallel_size": self.tensor_parallel_size,
+                "max_model_len": effective_max_len,  # 限制序列长度以节省KV cache
+                "enforce_eager": True,
+                "trust_remote_code": True,
+                "swap_space": 4,  # 4GB swap space
+                "disable_log_stats": True  # 减少日志开销
+            }
+            
+            print(f"调整序列长度: {max_tokens} -> {effective_max_len} (节省KV cache内存)")
+            
+            # 使用device参数而不是环境变量来指定GPU
+            if self.gpu_ids is not None:
+                if isinstance(self.gpu_ids, (list, tuple)):
+                    if len(self.gpu_ids) == 1:
+                        # 单GPU模式，直接指定设备
+                        vllm_kwargs["device"] = f"cuda:{self.gpu_ids[0]}"
+                        vllm_kwargs["tensor_parallel_size"] = 1
+                        print(f"LLM initialization: Using GPU {self.gpu_ids[0]}")
+                    else:
+                        # 多GPU模式，使用tensor parallel
+                        gpu_ids_str = ','.join(map(str, self.gpu_ids))
+                        os.environ['CUDA_VISIBLE_DEVICES'] = gpu_ids_str
+                        vllm_kwargs["tensor_parallel_size"] = len(self.gpu_ids)
+                        print(f"LLM initialization: Using GPUs {gpu_ids_str} with tensor parallel")
+                else:
+                    # 单个GPU ID
+                    vllm_kwargs["device"] = f"cuda:{self.gpu_ids}"
+                    vllm_kwargs["tensor_parallel_size"] = 1
+                    print(f"LLM initialization: Using GPU {self.gpu_ids}")
+            else:
+                # 使用默认GPU
+                vllm_kwargs["tensor_parallel_size"] = 1
+                print("LLM initialization: Using default GPU")
+            
+            print(f"vLLM配置: {vllm_kwargs}")
+            print("正在初始化vLLM引擎...这可能需要几分钟")
+            
+            try:
+                llm_model = vllm.LLM(**vllm_kwargs)
+                print(f"vLLM模型加载成功！使用GPU: {self.gpu_ids if self.gpu_ids else 'auto'}")
+                use_api = False
+            except Exception as e:
+                print(f"vLLM模型加载失败: {e}")
+                raise
+        elif "openai" in llm_path.lower() or "siliconflow" in llm_path.lower():
             llm_model = OpenAI()
             use_api = True
-        elif "qwen" in llm_path.lower() or "dashscope" in llm_path.lower():
-            # 通义千问API (OpenAI兼容模式)
+        elif "qwen-" in llm_path.lower() or "dashscope" in llm_path.lower():
+            # 通义千问API (OpenAI兼容模式) - 使用qwen-而不是qwen避免路径误判
             llm_model = OpenAI(
                 api_key=os.getenv("DASHSCOPE_API_KEY"),
                 base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
             )
             use_api = True
         else:
-            llm_model = vllm.LLM(
-                model=llm_path,
-                gpu_memory_utilization=0.7,
-                tensor_parallel_size=torch.cuda.device_count(),
-                max_seq_len_to_capture=max_tokens,
-                enforce_eager=True,
-                trust_remote_code = True
-            )
+            # 其他情况（模型名称等），尝试作为远程模型使用vLLM加载
+            print(f"尝试使用vLLM加载模型: {llm_path}")
+            # 限制max_model_len以节省KV cache内存，同时保持在10000以上
+            effective_max_len = max(min(max_tokens, 12288), 10240)  # 在10240-12288之间
+            
+            vllm_kwargs = {
+                "model": llm_path,
+                "gpu_memory_utilization": self.gpu_memory_utilization,
+                "tensor_parallel_size": self.tensor_parallel_size,
+                "max_model_len": effective_max_len,  # 限制序列长度以节省KV cache
+                "enforce_eager": True,
+                "trust_remote_code": True,
+                "swap_space": 4,  # 4GB swap space
+                "disable_log_stats": True  # 减少日志开销
+            }
+            
+            print(f"调整序列长度: {max_tokens} -> {effective_max_len} (节省KV cache内存)")
+            
+            # 使用device参数而不是环境变量来指定GPU
+            if self.gpu_ids is not None:
+                if isinstance(self.gpu_ids, (list, tuple)):
+                    if len(self.gpu_ids) == 1:
+                        # 单GPU模式，直接指定设备
+                        vllm_kwargs["device"] = f"cuda:{self.gpu_ids[0]}"
+                        vllm_kwargs["tensor_parallel_size"] = 1
+                        print(f"LLM initialization: Using GPU {self.gpu_ids[0]}")
+                    else:
+                        # 多GPU模式，使用tensor parallel
+                        gpu_ids_str = ','.join(map(str, self.gpu_ids))
+                        os.environ['CUDA_VISIBLE_DEVICES'] = gpu_ids_str
+                        vllm_kwargs["tensor_parallel_size"] = len(self.gpu_ids)
+                        print(f"LLM initialization: Using GPUs {gpu_ids_str} with tensor parallel")
+                else:
+                    # 单个GPU ID
+                    vllm_kwargs["device"] = f"cuda:{self.gpu_ids}"
+                    vllm_kwargs["tensor_parallel_size"] = 1
+                    print(f"LLM initialization: Using GPU {self.gpu_ids}")
+            else:
+                # 使用默认GPU
+                vllm_kwargs["tensor_parallel_size"] = 1
+                print("LLM initialization: Using default GPU")
+            
+            print(f"vLLM配置: {vllm_kwargs}")
+            print("正在初始化vLLM引擎...这可能需要几分钟")
+            
+            try:
+                llm_model = vllm.LLM(**vllm_kwargs)
+                print(f"vLLM模型加载成功！使用GPU: {self.gpu_ids if self.gpu_ids else 'auto'}")
+                use_api = False
+            except Exception as e:
+                print(f"vLLM模型加载失败: {e}")
+                raise
             generation_kwargs = vllm.SamplingParams(**generation_kwargs)
 
         return None, llm_model, generation_kwargs, use_api
@@ -1087,3 +1191,188 @@ class LLM(object):
                 "confidence": "LOW"
             } for _ in data_texts]
 
+
+class LocalLLMManager:
+    """
+    管理本地共享LLM实例的管理器
+    用于创建和管理两个共享LLM：traffic_llm和regional_llm
+    """
+    
+    def __init__(self, model_path: str, task_info=None):
+        self.model_path = model_path
+        self.task_info = task_info
+        self.traffic_llm = None
+        self.regional_llm = None
+        
+        print(f"\n=== 初始化本地LLM管理器 ===")
+        print(f"模型路径: {model_path}")
+        
+    def initialize_llms(self):
+        """初始化两个共享LLM实例"""
+        print("\n=== 初始化共享LLM实例 ===")
+        
+        # 初始化Traffic LLM (使用GPU 0)
+        print("正在初始化 Traffic LLM (GPU 0)...")
+        self.traffic_llm = LLM(
+            llm_path=self.model_path,
+            batch_size=16,
+            top_k=50,
+            top_p=1.0,
+            temperature=0.1,
+            max_tokens=10240,  # 保持在10k以上，但不会太高
+            memory_size=3,
+            task_info=self.task_info,
+            use_reflection=True,
+            gpu_ids=[0],  # 使用GPU 0
+            tensor_parallel_size=1,
+            gpu_memory_utilization=0.85  # 稍微增加内存利用率
+        )
+        print("[SUCCESS] Traffic LLM 初始化完成")
+        
+        # 初始化Regional LLM (使用GPU 1)
+        print("正在初始化 Regional LLM (GPU 1)...")
+        self.regional_llm = LLM(
+            llm_path=self.model_path,
+            batch_size=16,
+            top_k=50,
+            top_p=1.0,
+            temperature=0.1,
+            max_tokens=10240,  # 保持在10k以上，但不会太高
+            memory_size=3,
+            task_info=self.task_info,
+            use_reflection=True,
+            gpu_ids=[1],  # 使用GPU 1
+            tensor_parallel_size=1,
+            gpu_memory_utilization=0.85  # 稍微增加内存利用率
+        )
+        print("[SUCCESS] Regional LLM 初始化完成")
+        
+        print("\n=== 所有LLM实例初始化完成 ===")
+        print("- Traffic LLM: GPU 0")
+        print("- Regional LLM: GPU 1")
+        print("- GPU 2-3: 用于推理加速")
+        
+        return self.traffic_llm, self.regional_llm
+    
+    def get_traffic_llm(self):
+        """获取Traffic LLM实例"""
+        if self.traffic_llm is None:
+            raise ValueError("Traffic LLM 尚未初始化，请先调用 initialize_llms()")
+        return self.traffic_llm
+    
+    def get_regional_llm(self):
+        """获取Regional LLM实例"""
+        if self.regional_llm is None:
+            raise ValueError("Regional LLM 尚未初始化，请先调用 initialize_llms()")
+        return self.regional_llm
+    
+    def get_gpu_status(self):
+        """获取GPU使用状态（修复了可见性问题）"""
+        try:
+            import torch
+            import subprocess
+            
+            # 使用nvidia-smi获取真实的GPU信息
+            try:
+                result = subprocess.run(['nvidia-smi', '--query-gpu=index,name,memory.used,memory.total', 
+                                       '--format=csv,noheader,nounits'], 
+                                      capture_output=True, text=True, timeout=10)
+                if result.returncode == 0:
+                    gpu_info = {
+                        'total_gpus': 0,
+                        'gpu_status': []
+                    }
+                    
+                    for line in result.stdout.strip().split('\n'):
+                        if line.strip():
+                            parts = [p.strip() for p in line.split(',')]
+                            if len(parts) >= 4:
+                                gpu_id = int(parts[0])
+                                name = parts[1]
+                                memory_used = float(parts[2]) / 1024  # 转换为GB
+                                memory_total = float(parts[3]) / 1024  # 转换为GB
+                                
+                                status = {
+                                    'gpu_id': gpu_id,
+                                    'name': name,
+                                    'memory_allocated': f"{memory_used:.2f}GB",
+                                    'memory_total': f"{memory_total:.2f}GB",
+                                    'usage': f"{memory_used/memory_total*100:.1f}%"
+                                }
+                                
+                                # 分配标签
+                                if gpu_id == 0:
+                                    status['assignment'] = 'Traffic LLM'
+                                elif gpu_id == 1:
+                                    status['assignment'] = 'Regional LLM'
+                                else:
+                                    status['assignment'] = '推理加速'
+                                    
+                                gpu_info['gpu_status'].append(status)
+                                gpu_info['total_gpus'] += 1
+                    
+                    return gpu_info
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass
+            
+            # 如果nvidia-smi失败，使用PyTorch方法（可能不准确）
+            gpu_info = {
+                'total_gpus': torch.cuda.device_count(),
+                'gpu_status': []
+            }
+            
+            for i in range(torch.cuda.device_count()):
+                try:
+                    device = torch.cuda.get_device_properties(i)
+                    memory_allocated = torch.cuda.memory_allocated(i) / 1024**3  # GB
+                    memory_total = device.total_memory / 1024**3  # GB
+                    
+                    status = {
+                        'gpu_id': i,
+                        'name': device.name,
+                        'memory_allocated': f"{memory_allocated:.2f}GB",
+                        'memory_total': f"{memory_total:.2f}GB",
+                        'usage': f"{memory_allocated/memory_total*100:.1f}%"
+                    }
+                    
+                    if i == 0:
+                        status['assignment'] = 'Traffic LLM'
+                    elif i == 1:
+                        status['assignment'] = 'Regional LLM'
+                    else:
+                        status['assignment'] = '推理加速'
+                        
+                    gpu_info['gpu_status'].append(status)
+                except Exception:
+                    continue
+            
+            return gpu_info
+            
+        except Exception as e:
+            return {'error': f'无法获取GPU状态: {e}'}
+    
+    def print_gpu_status(self):
+        """打印GPU使用状态"""
+        status = self.get_gpu_status()
+        
+        if 'error' in status:
+            print(f"错误: {status['error']}")
+            return
+            
+        print("\n=== GPU 使用状态 (真实情况) ===")
+        print(f"总 GPU 数量: {status['total_gpus']}")
+        print("-" * 80)
+        
+        for gpu in status['gpu_status']:
+            print(f"GPU {gpu['gpu_id']}: {gpu['name']}")
+            print(f"  分配: {gpu['assignment']}")
+            print(f"  内存: {gpu['memory_allocated']} / {gpu['memory_total']} ({gpu['usage']})")
+            print()
+        
+        if status['total_gpus'] >= 2:
+            gpu0_usage = float(status['gpu_status'][0]['usage'].replace('%', ''))
+            gpu1_usage = float(status['gpu_status'][1]['usage'].replace('%', ''))
+            if gpu0_usage > 50 and gpu1_usage > 50:
+                print("[SUCCESS] 两个LLM均已正常加载到不同GPU上")
+            else:
+                print("[WARNING] GPU内存使用率较低，可能存在问题")

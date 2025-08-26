@@ -166,10 +166,10 @@ def write_trips_to_xml(trips, output_file):
 
 
 def main():
-    area = "Manhattan"
-    roadnet_file = f"../Data/Maps/{area}.net.xml"
-    area_file = f"../Data/Maps/{area}.shp"
-    pop_file = f"../Data/Maps/{area}_population.npy"
+    area = "ttan"
+    roadnet_file = f"/data/zhouyuping/LLMNavigation/Data/NYC/Maps/{area}.net.xml"
+    area_file = f"/data/zhouyuping/LLMNavigation/Data/NYC/Maps/{area}.shp"
+    pop_file = f"/data/zhouyuping/LLMNavigation/Data/NYC/Maps/{area}_population.npy"
     scaling = 0.1
 
     # Load and convert shapefile
@@ -178,11 +178,11 @@ def main():
     pops = np.load(pop_file)
 
     # Parse road network and assign edges to areas
-    if not os.path.exists(f"../Data/Maps/{area}_area2edge.json"):
+    if not os.path.exists(f"/data/zhouyuping/LLMNavigation/Data/NYC/Maps/{area}_area2edge.json"):
         edges = parse_edges(roadnet)
         assigned_edges = assign_edges_to_areas(edges, areas, roadnet)
-        dump_json(assigned_edges, f"../Data/Maps/{area}_area2edge.json")
-    assigned_edges = load_json(f"../Data/Maps/{area}_area2edge.json")
+        dump_json(assigned_edges, f"/data/zhouyuping/LLMNavigation/Data/NYC/Maps/{area}_area2edge.json")
+    assigned_edges = load_json(f"/data/zhouyuping/LLMNavigation/Data/NYC/Maps/{area}_area2edge.json")
 
     # Generate OD matrix (you can use your own OD matrix generation method here)
     gravity_generator = GravityGenerator(Lambda=0.2, Alpha=0.5, Beta=0.5, Gamma=0.5)
@@ -196,7 +196,7 @@ def main():
     trips = generate_trips(od_matrix, assigned_edges, departure_prob, agent_num=10000)
 
     # Write trips to .xml file
-    output_file = f"../Data/traffic/{area}_od_{scaling}.trips.xml"
+    output_file = f"/data/zhouyuping/LLMNavigation/Data/NYC/traffic/{area}_od_{scaling}.trips.xml"
     write_trips_to_xml(trips, output_file)
 
 
