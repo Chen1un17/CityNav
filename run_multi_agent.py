@@ -17,6 +17,7 @@ import os
 import sys
 from datetime import datetime
 os.environ["WANDB_MODE"] = "offline"
+os.environ["VLLM_USE_V1"] = "0"
 from main import main
 
 
@@ -78,14 +79,15 @@ def run_quick_test():
     
     # Quick test parameters - 使用本地模型
     llm_path = "/data/zhouyuping/Qwen/"
-    batch_size = 4
+    batch_size = 8
     location = "NewYork"
     step_size = 60.0  # Faster steps for testing
     max_steps = 1800  # 30 minutes simulation
     use_local_llm = True  # 启用本地LLM模式
+    enable_training = False  # 快速测试默认不启用训练
     
     main(llm_path, batch_size, location, use_reflection=True, 
-         step_size=step_size, max_steps=max_steps, multi_agent=True, use_local_llm=use_local_llm)
+         step_size=step_size, max_steps=max_steps, multi_agent=True, use_local_llm=use_local_llm, enable_training=enable_training)
 
 
 def run_full_simulation():
@@ -104,9 +106,10 @@ def run_full_simulation():
     step_size = 180.0  # 3-minute decision intervals
     max_steps = 43200  # 12 hours simulation
     use_local_llm = True  # 启用本地LLM模式
+    enable_training = False  # 完整仿真默认不启用训练
     
     main(llm_path, batch_size, location, use_reflection=True, 
-         step_size=step_size, max_steps=max_steps, multi_agent=True, use_local_llm=use_local_llm)
+         step_size=step_size, max_steps=max_steps, multi_agent=True, use_local_llm=use_local_llm, enable_training=enable_training)
 
 
 def run_comparison():
@@ -120,7 +123,7 @@ def run_comparison():
     
     # Common parameters - 使用本地模型
     llm_path = "/data/zhouyuping/Qwen/"
-    batch_size = 6
+    batch_size = 8
     location = "NewYork"
     step_size = 180.0
     max_steps = 21600  # 6 hours simulation
@@ -131,14 +134,14 @@ def run_comparison():
     print("="*40)
     
     main(llm_path, batch_size, location, use_reflection=True, 
-         step_size=step_size, max_steps=max_steps, multi_agent=False, use_local_llm=use_local_llm)
+         step_size=step_size, max_steps=max_steps, multi_agent=False, use_local_llm=use_local_llm, enable_training=False)
     
     print("\n" + "="*40)
     print("RUNNING MULTI-AGENT SYSTEM (LOCAL LLM)")
     print("="*40)
     
     main(llm_path, batch_size, location, use_reflection=True, 
-         step_size=step_size, max_steps=max_steps, multi_agent=True, use_local_llm=use_local_llm)
+         step_size=step_size, max_steps=max_steps, multi_agent=True, use_local_llm=use_local_llm, enable_training=False)
 
 
 def run_benchmark():
@@ -169,7 +172,47 @@ def run_benchmark():
         print(f"{'='*50}")
         
         main(llm_path, batch_size, location, use_reflection=reflection, 
-             step_size=step_size, max_steps=max_steps, multi_agent=True, use_local_llm=use_local_llm)
+             step_size=step_size, max_steps=max_steps, multi_agent=True, use_local_llm=use_local_llm, enable_training=False)
+
+
+def run_with_training():
+    """Run multi-agent system with MAGRPO online training enabled."""
+    print("Running Multi-Agent Traffic Control with MAGRPO Online Training")
+    print("="*60)
+    
+    if not check_local_model():
+        print("本地模型不可用，请检查模型路径和GPU状态")
+        sys.exit(1)
+    
+    # Training parameters
+    llm_path = "/data/zhouyuping/Qwen/"
+    batch_size = 8  # Smaller batch for training mode
+    location = "Manhattan"
+    step_size = 180.0  # 3-minute decision intervals
+    max_steps = 43200  # 6 hours simulation (sufficient for training data collection)
+    use_local_llm = True  # 必须使用本地LLM
+    enable_training = True  # 启用训练
+    
+    print(f"MAGRPO训练配置:")
+    print(f"  - 模型路径: {llm_path}")
+    print(f"  - 批处理大小: {batch_size} (为训练优化)")
+    print(f"  - 仿真步长: {step_size}s")
+    print(f"  - 最大步数: {max_steps} (6小时)")
+    print(f"  - Traffic LLM训练GPU: cuda:2")
+    print(f"  - Regional LLM训练GPU: cuda:3")
+    print(f"  - 训练组大小: Traffic=8, Regional=12")
+    print()
+    
+    print("注意:")
+    print("- 训练进程将在独立进程中运行，使用GPU 2和3")
+    print("- 推理仍使用GPU 0和1")
+    print("- 训练数据通过队列实时传输")
+    print("- 训练日志将保存在 logs/training_NewYork/ 目录")
+    print("- 模型检查点将每100步保存一次")
+    print()
+    
+    main(llm_path, batch_size, location, use_reflection=True, 
+         step_size=step_size, max_steps=max_steps, multi_agent=True, use_local_llm=use_local_llm, enable_training=enable_training)
 
 
 def check_requirements():
@@ -178,17 +221,17 @@ def check_requirements():
     
     required_files = [
         "/data/zhouyuping/LLMNavigation/Data/task_info.json",
-        "/data/zhouyuping/LLMNavigation/Data/NYC//NewYork_sumo_config.sumocfg",
-        "/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_od_0.1.rou.alt.xml",
-        "/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_road_info.json",
-        "/data/zhouyuping/LLMNavigation/Data/NYC/Region_1/edge_adjacency_alpha_1.json",
-        "/data/zhouyuping/LLMNavigation/Data/NYC/Region_1/boundary_edges_alpha_1.json",
-        "/data/zhouyuping/LLMNavigation/Data/NYC/Region_1/edge_to_region_alpha_1.json",
+        "/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_sumo_config.sumocfg",
+        "/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_od_0.01.rou.alt.xml",
+        "/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_road_info.json",
+        "/data/zhouyuping/LLMNavigation/Data/Region_1/edge_adjacency_alpha_1.json",
+        "/data/zhouyuping/LLMNavigation/Data/Region_1/boundary_edges_alpha_1.json",
+        "/data/zhouyuping/LLMNavigation/Data/Region_1/edge_to_region_alpha_1.json",
     ]
     
     required_dirs = [
         "./Data",
-        "/data/zhouyuping/LLMNavigation/Data/NYC/Region_1",
+        "/data/zhouyuping/LLMNavigation/Data/Region_1",
         "./agents",
         "./utils",
     ]
@@ -240,6 +283,9 @@ def main_runner():
     # Benchmark command
     bench_parser = subparsers.add_parser('benchmark', help='Run benchmark suite')
     
+    # Training command
+    training_parser = subparsers.add_parser('train', help='Run with MAGRPO online training')
+    
     # Check requirements command
     check_parser = subparsers.add_parser('check', help='Check system requirements')
     
@@ -249,7 +295,7 @@ def main_runner():
                               help='LLM model path or name (default: /data/zhouyuping/Qwen/)')
     custom_parser.add_argument('--batch-size', type=int, default=16,
                               help='Batch size for LLM (default: 16)')
-    custom_parser.add_argument('--location', type=str, default="NewYork",
+    custom_parser.add_argument('--location', type=str, default="Manhattan",
                               help='Simulation location (default: NewYork)')
     custom_parser.add_argument('--step-size', type=float, default=180.0,
                               help='Simulation step size in seconds (default: 180.0)')
@@ -261,6 +307,8 @@ def main_runner():
                               help='Use single-agent mode')
     custom_parser.add_argument('--use-api-llm', action='store_true',
                               help='Use API LLM instead of local LLM (requires API key)')
+    custom_parser.add_argument('--enable-training', action='store_true',
+                              help='Enable MAGRPO online training (requires local LLM)')
     
     args = parser.parse_args()
     
@@ -281,10 +329,22 @@ def main_runner():
         run_comparison()
     elif args.command == 'benchmark':
         run_benchmark()
+    elif args.command == 'train':
+        run_with_training()
     elif args.command == 'check':
         check_requirements()
     elif args.command == 'custom':
         use_local_llm = not args.use_api_llm
+        enable_training = args.enable_training
+        
+        # Validate training configuration
+        if enable_training and not use_local_llm:
+            print("[ERROR] 强化学习训练需要本地LLM模式，请不要同时使用 --enable-training 和 --use-api-llm")
+            sys.exit(1)
+        
+        if enable_training and args.single_agent:
+            print("[ERROR] 强化学习训练需要多智能体模式，请不要同时使用 --enable-training 和 --single-agent")
+            sys.exit(1)
         
         # Check requirements based on LLM mode
         if use_local_llm:
@@ -311,10 +371,15 @@ def main_runner():
         print(f"  - Max Steps: {args.max_steps}")
         print(f"  - Reflection: {'Enabled' if use_reflection else 'Disabled'}")
         print(f"  - Architecture: {'Multi-Agent' if use_multi_agent else 'Single-Agent'}")
+        print(f"  - MAGRPO Training: {'ENABLED' if enable_training else 'Disabled'}")
+        if enable_training:
+            print(f"    * Traffic LLM Training GPU: cuda:2")
+            print(f"    * Regional LLM Training GPU: cuda:3")
+            print(f"    * Training Group Sizes: Traffic=8, Regional=12")
         print()
         
         main(args.llm, args.batch_size, args.location, use_reflection,
-             args.step_size, args.max_steps, use_multi_agent, use_local_llm)
+             args.step_size, args.max_steps, use_multi_agent, use_local_llm, enable_training)
 
 
 if __name__ == "__main__":

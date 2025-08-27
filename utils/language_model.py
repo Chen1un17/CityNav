@@ -126,6 +126,8 @@ class LLM(object):
                 llm_model = vllm.LLM(**vllm_kwargs)
                 print(f"vLLM模型加载成功！使用GPU: {self.gpu_ids if self.gpu_ids else 'auto'}")
                 use_api = False
+                # Create SamplingParams object for local model - THIS FIXES THE ERROR
+                generation_kwargs = vllm.SamplingParams(**generation_kwargs)
             except Exception as e:
                 print(f"vLLM模型加载失败: {e}")
                 raise
@@ -189,10 +191,11 @@ class LLM(object):
                 llm_model = vllm.LLM(**vllm_kwargs)
                 print(f"vLLM模型加载成功！使用GPU: {self.gpu_ids if self.gpu_ids else 'auto'}")
                 use_api = False
+                # Create SamplingParams object for remote/fallback model - THIS FIXES THE ERROR
+                generation_kwargs = vllm.SamplingParams(**generation_kwargs)
             except Exception as e:
                 print(f"vLLM模型加载失败: {e}")
                 raise
-            generation_kwargs = vllm.SamplingParams(**generation_kwargs)
 
         return None, llm_model, generation_kwargs, use_api
 

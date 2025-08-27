@@ -934,31 +934,31 @@ class RegionalAgent:
         observation_parts.append(f"Current edge: {current_edge}")
         observation_parts.append("")
         
+        # Target boundary edges (compressed format: edge_id:cong|veh|usage)
         if candidate_boundaries:
-            observation_parts.append("Target boundary edges (to exit region):")
+            boundary_list = []
             for boundary in candidate_boundaries:
                 if boundary in candidates:
                     info = candidates[boundary]
-                    observation_parts.append(f"  {boundary}: congestion={info['congestion_level']}, "
-                                           f"vehicles={info['vehicle_count']}, "
-                                           f"planned_usage={info['planned_usage']}")
+                    boundary_compact = f"{boundary}:{info['congestion_level']:.1f}|{info['vehicle_count']}|{info['planned_usage']}"
+                    boundary_list.append(boundary_compact)
+            observation_parts.append("Target_Boundaries: " + " | ".join(boundary_list))
             observation_parts.append("")
         
-        # Add alternative edges
+        # Alternative edges (compressed format: edge_id:cong|veh)
         non_boundary_candidates = [edge for edge, info in candidates.items() 
                                  if not info.get('is_boundary', False)]
         if non_boundary_candidates:
-            observation_parts.append("Alternative edges within region:")
+            alt_list = []
             for edge in non_boundary_candidates[:3]:
                 info = candidates[edge]
-                observation_parts.append(f"  {edge}: congestion={info['congestion_level']}, "
-                                       f"vehicles={info['vehicle_count']}")
+                alt_compact = f"{edge}:{info['congestion_level']:.1f}|{info['vehicle_count']}"
+                alt_list.append(alt_compact)
+            observation_parts.append("Alt_Edges: " + " | ".join(alt_list))
             observation_parts.append("")
         
-        # Add regional context
-        observation_parts.append(f"Region {self.region_id} status:")
-        observation_parts.append(f"  Active vehicles: {len(self.region_vehicles)}")
-        observation_parts.append(f"  Total boundary edges: {len(self.outgoing_boundaries)}")
+        # Regional context (compressed format: R[id]_status:vehicles|boundaries)
+        observation_parts.append(f"R{self.region_id}_Status: {len(self.region_vehicles)}veh|{len(self.outgoing_boundaries)}bdry")
         
         # Create answer options
         answer_options = "/".join(list(candidates.keys())[:5])

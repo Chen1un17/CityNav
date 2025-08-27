@@ -11,7 +11,7 @@ import time
 import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Set, Optional, Tuple
+from typing import Dict, List, Set, Optional, Tuple, Any
 import networkx as nx
 import traci
 
@@ -31,7 +31,7 @@ class MultiAgentTrafficEnvironment:
     def __init__(self, location: str, sumo_config_file: str, route_file: str,
                  road_info_file: str, adjacency_file: str, region_data_dir: str,
                  model_path: str = None, llm_agent=None, step_size: float = 1.0, max_steps: int = 1000,
-                 log_dir: str = "logs", task_info=None, use_local_llm: bool = True):
+                 log_dir: str = "logs", task_info=None, use_local_llm: bool = True, training_queue=None):
         """
         Initialize multi-agent traffic environment.
         
@@ -49,6 +49,7 @@ class MultiAgentTrafficEnvironment:
             log_dir: Directory for log files
             task_info: Task information for LLM initialization
             use_local_llm: Whether to use local shared LLM architecture
+            training_queue: Multiprocessing queue for RL training data (optional)
         """
         self.location = location
         self.sumo_config_file = sumo_config_file
@@ -71,8 +72,20 @@ class MultiAgentTrafficEnvironment:
         # Initialize logger
         self.logger = AgentLogger(log_dir=log_dir, console_output=True)
         
+        # RL Training Integration - Initialize training queue
+        self.training_queue = training_queue  # Multiprocessing queue for training data
+        self.completed_vehicle_times = {}  # Store completion times for ATT calculation
+        self.rl_data_collection_enabled = True  # Flag to control RL data collection
+        
+        # Hot-reload mechanism for LoRA adapters
+        self.current_lora_adapters = {
+            'traffic': None,  # Current Traffic LLM LoRA adapter name
+            'regional': None  # Current Regional LLM LoRA adapter name
+        }
+        self.lora_update_lock = threading.Lock()  # Thread-safe adapter updates
+        
         # === 优化加载顺序：先加载模型后加载路网 ===
-        print("\n=== Step 1: 初始化LLM模型（这步最耗时） ===")
+        print("\n=== Step 1: 初始化LLM模型 ===")
         self._initialize_llms_first()
         
         print("\n=== Step 2: 加载路网数据 ===")
@@ -328,24 +341,59 @@ class MultiAgentTrafficEnvironment:
     
     def _load_region_data(self):
         """Load region partition data."""
+        # Load boundary edges
+        boundary_file = os.path.join(self.region_data_dir, "boundary_edges_alpha_1.json")
+        self.boundary_edges = load_json(boundary_file)
+        
+        # Load edge to region mapping
+        edge_region_file = os.path.join(self.region_data_dir, "edge_to_region_alpha_1.json")
+        self.edge_to_region = load_json(edge_region_file)
+        
+        # Determine number of regions
+        self.num_regions = len(set(self.edge_to_region.values()))
+        
+        self.logger.log_info(f"Loaded region data: {self.num_regions} regions, "
+                            f"{len(self.boundary_edges)} boundary edges")
+    
+    def _check_and_apply_latest_adapters(self):
+        """Check for and apply latest LoRA adapters from training process."""
+        if not hasattr(self, 'llm_manager') or not self.llm_manager:
+            return
+            
         try:
-            # Load boundary edges
-            boundary_file = os.path.join(self.region_data_dir, "boundary_edges_alpha_1.json")
-            self.boundary_edges = load_json(boundary_file)
+            import glob
+            import os
             
-            # Load edge to region mapping
-            edge_region_file = os.path.join(self.region_data_dir, "edge_to_region_alpha_1.json")
-            self.edge_to_region = load_json(edge_region_file)
+            # Check for latest adapters in the sync directory
+            log_dir = getattr(self, 'log_dir', 'logs')
+            adapter_sync_dir = os.path.join(log_dir, 'lora_adapters')
             
-            # Determine number of regions
-            self.num_regions = len(set(self.edge_to_region.values()))
+            if not os.path.exists(adapter_sync_dir):
+                return
             
-            self.logger.log_info(f"Loaded region data: {self.num_regions} regions, "
-                               f"{len(self.boundary_edges)} boundary edges")
-            
+            with self.lora_update_lock:
+                # Check Traffic LLM adapters
+                traffic_adapters = glob.glob(os.path.join(adapter_sync_dir, 'traffic_adapter_step_*'))
+                if traffic_adapters:
+                    latest_traffic = max(traffic_adapters, key=lambda x: int(x.split('_')[-1]))
+                    adapter_name = os.path.basename(latest_traffic)
+                    
+                    if self.current_lora_adapters['traffic'] != adapter_name:
+                        self.current_lora_adapters['traffic'] = adapter_name
+                        self.logger.log_info(f"LORA_UPDATE_TRAFFIC: 应用最新Traffic LLM适配器 {adapter_name}")
+                
+                # Check Regional LLM adapters  
+                regional_adapters = glob.glob(os.path.join(adapter_sync_dir, 'regional_adapter_step_*'))
+                if regional_adapters:
+                    latest_regional = max(regional_adapters, key=lambda x: int(x.split('_')[-1]))
+                    adapter_name = os.path.basename(latest_regional)
+                    
+                    if self.current_lora_adapters['regional'] != adapter_name:
+                        self.current_lora_adapters['regional'] = adapter_name
+                        self.logger.log_info(f"LORA_UPDATE_REGIONAL: 应用最新Regional LLM适配器 {adapter_name}")
+                        
         except Exception as e:
-            self.logger.log_error(f"Failed to load region data: {e}")
-            raise
+            self.logger.log_error(f"LORA_UPDATE_ERROR: {e}")
     
     def _load_road_data(self):
         """Load road network and information."""
@@ -385,7 +433,7 @@ class MultiAgentTrafficEnvironment:
                 )
                 
                 # 初始化共享LLM实例（这是最耗时的步骤）
-                print("正在初始化共享LLM实例...请耐心等待")
+                print("正在初始化共享LLM实例...")
                 self.traffic_llm, self.regional_llm = self.llm_manager.initialize_llms()
                 
                 # 打印GPU状态
@@ -487,55 +535,52 @@ class MultiAgentTrafficEnvironment:
     def handle_vehicle_birth_macro_planning(self, vehicle_id: str, current_time: float):
         """
         Handle macro route planning when an autonomous vehicle is born.
-        
-        Based on reachability, connectivity, congestion, distance factors,
-        generate macro route candidates and use LLM to select optimal route.
+        Enhanced with CORY cooperative decision framework:
+        1. State space construction
+        2. Action space generation 
+        3. Pioneer-Observer cooperative decision making
+        4. J1-Judge quality evaluation
         """
         try:
-            self.logger.log_info(f"VEHICLE_BIRTH: Processing macro planning for {vehicle_id}")
+            self.logger.log_info(f"CORY_VEHICLE_BIRTH: Processing cooperative macro planning for {vehicle_id}")
             
-            # Get vehicle's destination
-            route = traci.vehicle.getRoute(vehicle_id)
-            if not route:
-                self.logger.log_warning(f"VEHICLE_BIRTH: No route found for {vehicle_id}")
+            # [Phase 1: State Space Construction] - Following CLAUDE.md specifications
+            state_context = self._construct_state_space(vehicle_id, current_time)
+            if not state_context:
+                self.logger.log_warning(f"CORY_STATE_CONSTRUCTION: Failed to construct state space for {vehicle_id}")
                 return
             
-            start_edge = route[0]
-            dest_edge = route[-1]
+            start_region = state_context['start_region']
+            dest_region = state_context['dest_region']
             
-            # Determine start and destination regions
-            start_region = self.edge_to_region.get(start_edge)
-            dest_region = self.edge_to_region.get(dest_edge)
+            self.logger.log_info(f"CORY_STATE_SPACE: Vehicle {vehicle_id} state constructed - "
+                               f"Start: Region {start_region}, Dest: Region {dest_region}, "
+                               f"Current traffic: {state_context['regional_congestion']}, "
+                               f"Predictions available: {len(state_context['traffic_predictions'])} time windows")
             
-            if start_region is None or dest_region is None:
-                self.logger.log_warning(f"VEHICLE_BIRTH: Region mapping not found for {vehicle_id}")
-                return
-            
-            # If already in destination region, create a single-region macro route
+            # Handle single-region case with CORY logging
             if start_region == dest_region:
-                self.logger.log_info(f"VEHICLE_BIRTH: {vehicle_id} already in destination region {dest_region}")
-                # Create single-region macro route for regional planning consistency
+                self.logger.log_info(f"CORY_SINGLE_REGION: {vehicle_id} intra-region route in Region {dest_region}")
                 single_region_route = [start_region]
                 self.vehicle_current_plans[vehicle_id] = {
                     'macro_route': single_region_route,
                     'current_region_index': 0,
                     'creation_time': current_time,
                     'last_update': current_time,
-                    'single_region': True  # Mark as single-region route
+                    'single_region': True,
+                    'cory_decision_type': 'single_region',
+                    'cooperation_quality': 1.0  # Perfect cooperation for single region
                 }
-                
-                # No need for broadcast since this is intra-region only
-                self.logger.log_info(f"VEHICLE_BIRTH: {vehicle_id} assigned single-region macro route [{start_region}]")
+                self.logger.log_info(f"CORY_SINGLE_REGION: {vehicle_id} assigned single-region macro route [{start_region}]")
                 return
             
-            # Generate macro route candidates based on reachability, connectivity, congestion, distance
+            # [Phase 2: Action Space Generation] - Generate candidate macro routes
             macro_candidates = self._generate_macro_route_candidates(
-                start_region, dest_region, current_time
+                start_region, dest_region, current_time, state_context
             )
             
             if not macro_candidates:
-                self.logger.log_warning(f"VEHICLE_BIRTH: No macro candidates found for {vehicle_id}, creating emergency single-region route")
-                # Create emergency single-region route as fallback
+                self.logger.log_warning(f"CORY_ACTION_SPACE: No macro candidates found for {vehicle_id}")
                 emergency_route = [start_region]
                 self.vehicle_current_plans[vehicle_id] = {
                     'macro_route': emergency_route,
@@ -543,38 +588,413 @@ class MultiAgentTrafficEnvironment:
                     'creation_time': current_time,
                     'last_update': current_time,
                     'emergency_route': True,
-                    'original_dest_region': dest_region
+                    'original_dest_region': dest_region,
+                    'cory_decision_type': 'emergency',
+                    'cooperation_quality': 0.1  # Low quality due to emergency
                 }
-                
-                self.logger.log_info(f"VEHICLE_BIRTH: {vehicle_id} assigned emergency route [{start_region}], will retry pathfinding later")
                 return
             
-            # Use LLM to select optimal macro route
-            selected_macro_route = self._llm_select_macro_route(
-                vehicle_id, start_region, dest_region, macro_candidates, current_time
+            self.logger.log_info(f"CORY_ACTION_SPACE: Generated {len(macro_candidates)} route candidates for {vehicle_id}: {macro_candidates}")
+            
+            # [Phase 3: CORY Cooperative Decision Making]
+            cory_result = self._cory_cooperative_decision(
+                vehicle_id, state_context, macro_candidates, current_time
             )
             
+            selected_macro_route = cory_result.get('final_route')
+            cooperation_quality = cory_result.get('cooperation_quality', 0.5)
+            pioneer_decision = cory_result.get('pioneer_decision', {})
+            observer_feedback = cory_result.get('observer_feedback', {})
+            j1_judge_evaluation = cory_result.get('j1_judge_evaluation', {})
+            
+            self.logger.log_info(f"CORY_DECISION: Vehicle {vehicle_id} cooperative decision completed - "
+                               f"Route: {selected_macro_route}, Quality: {cooperation_quality:.3f}, "
+                               f"Pioneer confidence: {pioneer_decision.get('confidence', 'N/A')}, "
+                               f"Observer acceptance: {observer_feedback.get('acceptance', 'N/A')}")
+            
             if selected_macro_route:
-                # Store the selected macro route
+                # Store enhanced macro route with CORY metadata
                 self.vehicle_current_plans[vehicle_id] = {
                     'macro_route': selected_macro_route,
                     'current_region_index': 0,
                     'creation_time': current_time,
-                    'last_update': current_time
+                    'last_update': current_time,
+                    'cory_decision_type': 'cooperative',
+                    'cooperation_quality': cooperation_quality,
+                    'pioneer_decision': pioneer_decision,
+                    'observer_feedback': observer_feedback,
+                    'j1_judge_evaluation': j1_judge_evaluation,
+                    'state_context': state_context  # Store for RL training
                 }
                 
-                # Update communication system - broadcast this plan
+                # Update communication system
                 self._broadcast_vehicle_macro_plan(vehicle_id, selected_macro_route, current_time)
+                self._log_vehicle_decision(vehicle_id, "CORY_MACRO_PLANNING", selected_macro_route, current_time)
                 
-                # Log real-time console output
-                self._log_vehicle_decision(vehicle_id, "MACRO_PLANNING", selected_macro_route, current_time)
-                
-                self.logger.log_info(f"VEHICLE_BIRTH: {vehicle_id} assigned macro route {selected_macro_route}")
+                self.logger.log_info(f"CORY_SUCCESS: {vehicle_id} assigned cooperative macro route {selected_macro_route} "
+                                   f"(Quality: {cooperation_quality:.3f})")
             else:
-                self.logger.log_error(f"VEHICLE_BIRTH: Failed to select macro route for {vehicle_id}")
+                self.logger.log_error(f"CORY_FAILURE: Failed cooperative decision for {vehicle_id}")
                 
         except Exception as e:
-            self.logger.log_error(f"VEHICLE_BIRTH: Macro planning failed for {vehicle_id}: {e}")
+            self.logger.log_error(f"CORY_ERROR: Cooperative macro planning failed for {vehicle_id}: {e}")
+            import traceback
+            self.logger.log_error(f"CORY_TRACEBACK: {traceback.format_exc()}")
+            # Fallback to original system if CORY fails
+            self._fallback_original_planning(vehicle_id, current_time)
+    
+    def _construct_state_space(self, vehicle_id: str, current_time: float) -> Dict[str, Any]:
+        """
+        Construct comprehensive state space for CORY cooperative decision making.
+        Following CLAUDE.md Phase 1: Decision Need Generation & Environment State Construction.
+        
+        Returns:
+            Complete state context including:
+            - Vehicle individual state (position, route, region mapping)
+            - Traffic state perception (regional congestion, boundary flows)
+            - System global state (vehicle counts, ATT, predictions)
+            - Candidate action space preparation
+        """
+        try:
+            # Get vehicle's route and position information
+            route = traci.vehicle.getRoute(vehicle_id)
+            if not route:
+                self.logger.log_error(f"CORY_STATE: No route found for {vehicle_id}")
+                return None
+            
+            start_edge = route[0]
+            dest_edge = route[-1]
+            
+            # Map edges to regions
+            start_region = self.edge_to_region.get(start_edge)
+            dest_region = self.edge_to_region.get(dest_edge)
+            
+            if start_region is None or dest_region is None:
+                self.logger.log_error(f"CORY_STATE: Region mapping failed for {vehicle_id} - "
+                                     f"start_edge: {start_edge} -> {start_region}, "
+                                     f"dest_edge: {dest_edge} -> {dest_region}")
+                return None
+            
+            # [Vehicle Individual State] - Extract and abstract to region level
+            vehicle_state = {
+                'vehicle_id': vehicle_id,
+                'start_edge': start_edge,
+                'dest_edge': dest_edge,
+                'start_region': start_region,
+                'dest_region': dest_region,
+                'route_length': len(route),
+                'creation_time': current_time
+            }
+            
+            # [Traffic State Perception] - Multi-level data collection
+            regional_congestion = {}
+            boundary_flows = {}
+            
+            # Calculate regional congestion levels
+            for region_id in range(self.num_regions):
+                region_edges = [edge for edge, reg in self.edge_to_region.items() if reg == region_id]
+                if region_edges:
+                    occupancy_sum = 0
+                    valid_edges = 0
+                    for edge in region_edges:
+                        try:
+                            occupancy = traci.edge.getLastStepOccupancy(edge)
+                            occupancy_sum += occupancy
+                            valid_edges += 1
+                        except Exception:
+                            continue
+                    regional_congestion[region_id] = occupancy_sum / max(valid_edges, 1)
+                else:
+                    regional_congestion[region_id] = 0.0
+            
+            # Calculate boundary flows
+            for boundary_info in self.boundary_edges:
+                edge_id = boundary_info['edge_id']
+                try:
+                    vehicle_count = traci.edge.getLastStepVehicleNumber(edge_id)
+                    boundary_flows[edge_id] = {
+                        'vehicle_count': vehicle_count,
+                        'from_region': boundary_info['from_region'],
+                        'to_region': boundary_info['to_region']
+                    }
+                except Exception:
+                    boundary_flows[edge_id] = {'vehicle_count': 0, 
+                                              'from_region': boundary_info['from_region'],
+                                              'to_region': boundary_info['to_region']}
+            
+            # [System Global State] - Maintain global variables
+            global_state = {
+                'current_time': current_time,
+                'total_vehicles': len(traci.vehicle.getIDList()),
+                'completed_vehicles': len(self.completed_vehicle_times),
+                'autonomous_vehicles_active': len([v for v in self.autonomous_vehicles if v in traci.vehicle.getIDList()]),
+                'current_avg_travel_time': self._calculate_current_att()
+            }
+            
+            # [Traffic Predictions] - Multi-horizon predictions
+            traffic_predictions = {}
+            try:
+                # Get predictions for 15min, 30min, 45min, 60min windows
+                prediction_horizons = [900, 1800, 2700, 3600]  # seconds
+                boundary_edge_ids = [info['edge_id'] for info in self.boundary_edges]
+                
+                for horizon in prediction_horizons:
+                    predictions = self.prediction_engine.get_congestion_forecast(
+                        boundary_edge_ids, horizon
+                    )
+                    traffic_predictions[f'{horizon}s'] = predictions
+                
+                self.logger.log_info(f"CORY_STATE_PREDICTIONS: Generated predictions for {len(prediction_horizons)} time windows")
+            except Exception as e:
+                self.logger.log_warning(f"CORY_STATE_PREDICTIONS: Failed to generate predictions: {e}")
+                traffic_predictions = {}
+            
+            # Compile comprehensive state context
+            state_context = {
+                'vehicle_state': vehicle_state,
+                'start_region': start_region,
+                'dest_region': dest_region,
+                'regional_congestion': regional_congestion,
+                'boundary_flows': boundary_flows,
+                'global_state': global_state,
+                'traffic_predictions': traffic_predictions,
+                'state_construction_time': current_time
+            }
+            
+            self.logger.log_info(f"CORY_STATE_SUCCESS: Constructed state space for {vehicle_id} - "
+                               f"Regions: {start_region}->{dest_region}, "
+                               f"Global vehicles: {global_state['total_vehicles']}, "
+                               f"Regional congestion range: [{min(regional_congestion.values()):.3f}, {max(regional_congestion.values()):.3f}]")
+            
+            return state_context
+            
+        except Exception as e:
+            self.logger.log_error(f"CORY_STATE_ERROR: State space construction failed for {vehicle_id}: {e}")
+            return None
+    
+    def _calculate_current_att(self) -> float:
+        """Calculate current average travel time from completed vehicles."""
+        if not self.completed_vehicle_times:
+            return 600.0  # Default expected travel time
+        
+        total_time = sum(self.completed_vehicle_times.values())
+        return total_time / len(self.completed_vehicle_times)
+    
+    def _fallback_original_planning(self, vehicle_id: str, current_time: float):
+        """Fallback to original planning when CORY fails."""
+        try:
+            self.logger.log_warning(f"CORY_FALLBACK: Using original planning for {vehicle_id}")
+            
+            # Get vehicle route
+            route = traci.vehicle.getRoute(vehicle_id)
+            if not route:
+                return
+            
+            start_edge = route[0]
+            dest_edge = route[-1]
+            start_region = self.edge_to_region.get(start_edge)
+            dest_region = self.edge_to_region.get(dest_edge)
+            
+            if start_region is None or dest_region is None:
+                return
+            
+            # Generate candidates using original method
+            candidates = self._generate_macro_route_candidates_original(
+                start_region, dest_region, current_time
+            )
+            
+            if candidates:
+                selected_route = candidates[0]  # Use first candidate
+                self.vehicle_current_plans[vehicle_id] = {
+                    'macro_route': selected_route,
+                    'current_region_index': 0,
+                    'creation_time': current_time,
+                    'last_update': current_time,
+                    'fallback_planning': True
+                }
+                self.logger.log_info(f"CORY_FALLBACK: Assigned route {selected_route} for {vehicle_id}")
+                
+        except Exception as e:
+            self.logger.log_error(f"CORY_FALLBACK_ERROR: {e}")
+    
+    def _cory_cooperative_decision(self, vehicle_id: str, state_context: Dict[str, Any], 
+                                 macro_candidates: List[List[int]], current_time: float) -> Dict[str, Any]:
+        """
+        CORY Cooperative Decision Making Framework Implementation.
+        Following CLAUDE.md Phase 2: CORY协作决策机制的深入分析.
+        
+        Pioneer-Observer协作哲学:
+        - Pioneer (Traffic LLM): 宏观战略决策，全局优化
+        - Observer (Regional LLM): 区域协调，个体保护，局部优化
+        - J1-Judge: 协作质量评估
+        
+        Returns:
+            Dict containing:
+            - final_route: Selected macro route
+            - cooperation_quality: Quality score of cooperation
+            - pioneer_decision: Pioneer's original decision
+            - observer_feedback: Observer's evaluation and suggestions
+            - j1_judge_evaluation: Quality assessment
+        """
+        try:
+            self.logger.log_info(f"CORY_COOPERATIVE: Starting cooperative decision for {vehicle_id}")
+            
+            # [Phase 2.1: Pioneer Decision Process] - Traffic LLM as Pioneer
+            pioneer_result = self._pioneer_decision(
+                vehicle_id, state_context, macro_candidates, current_time
+            )
+            
+            if not pioneer_result or 'selected_route' not in pioneer_result:
+                self.logger.log_error(f"CORY_PIONEER_FAILED: Pioneer decision failed for {vehicle_id}")
+                return {'final_route': macro_candidates[0] if macro_candidates else None,
+                       'cooperation_quality': 0.1}
+            
+            # [Phase 2.2: Observer Feedback Process] - Regional LLM as Observer
+            observer_result = self._observer_feedback(
+                vehicle_id, state_context, pioneer_result, current_time
+            )
+            
+            if not observer_result:
+                self.logger.log_warning(f"CORY_OBSERVER_FAILED: Observer feedback failed for {vehicle_id}, using Pioneer decision")
+                observer_result = {'acceptance': True, 'improvements': [], 'conflicts': []}
+            
+            # [Phase 2.3: J1-Judge Quality Evaluation]
+            j1_judge_result = self._j1_judge_evaluation(
+                vehicle_id, pioneer_result, observer_result, current_time
+            )
+            
+            # [Phase 2.4: Final Decision Synthesis]
+            final_result = self._synthesize_final_decision(
+                vehicle_id, pioneer_result, observer_result, j1_judge_result, current_time
+            )
+            
+            self.logger.log_info(f"CORY_COOPERATIVE_SUCCESS: Completed cooperative decision for {vehicle_id} - "
+                               f"Final route: {final_result.get('final_route')}, "
+                               f"Quality: {final_result.get('cooperation_quality', 0):.3f}")
+            
+            return final_result
+            
+        except Exception as e:
+            self.logger.log_error(f"CORY_COOPERATIVE_ERROR: Cooperative decision failed for {vehicle_id}: {e}")
+            return {'final_route': macro_candidates[0] if macro_candidates else None,
+                   'cooperation_quality': 0.1,
+                   'error': str(e)}
+    
+    def _pioneer_decision(self, vehicle_id: str, state_context: Dict[str, Any], 
+                        macro_candidates: List[List[int]], current_time: float) -> Dict[str, Any]:
+        """
+        Pioneer Decision Process - Traffic LLM as Pioneer.
+        
+        Following CLAUDE.md: Traffic LLM担任Pioneer的角色，负责基于宏观交通状态提出初始的路径选择方案。
+        这个阶段的重点是全局优化，考虑的是如何最大化整个系统的效率。
+        
+        Returns:
+            Pioneer decision with route selection, reasoning, and confidence
+        """
+        try:
+            self.logger.log_info(f"CORY_PIONEER: Starting Pioneer decision for {vehicle_id}")
+            
+            # [Macro Context Construction] - 专门为Traffic LLM设计的输入格式
+            macro_context = self._prepare_macro_context(state_context, macro_candidates)
+            
+            # [Decision Strategy] - Traffic LLM学习全局优化偏好
+            decision_input = {
+                'vehicle_id': vehicle_id,
+                'current_time': current_time,
+                'start_region': state_context['start_region'],
+                'dest_region': state_context['dest_region'],
+                'route_candidates': macro_candidates,
+                'regional_congestion': state_context['regional_congestion'],
+                'boundary_flows': state_context['boundary_flows'],
+                'traffic_predictions': state_context['traffic_predictions'],
+                'global_state': state_context['global_state']
+            }
+            
+            # Use Traffic LLM for Pioneer decision
+            pioneer_response = self._call_traffic_llm_pioneer(decision_input, macro_context)
+            
+            if not pioneer_response:
+                self.logger.log_error(f"CORY_PIONEER_LLM_FAILED: Traffic LLM call failed for {vehicle_id}")
+                # Fallback to heuristic decision
+                return {
+                    'selected_route': macro_candidates[0] if macro_candidates else [],
+                    'reasoning': 'Fallback heuristic selection (LLM failed)',
+                    'confidence': 0.3,
+                    'decision_type': 'fallback',
+                    'timestamp': current_time
+                }
+            
+            # Extract Pioneer decision
+            selected_route = pioneer_response.get('selected_route', macro_candidates[0] if macro_candidates else [])
+            reasoning = pioneer_response.get('reasoning', 'Pioneer strategic decision')
+            confidence = pioneer_response.get('confidence', 0.7)
+            
+            pioneer_result = {
+                'selected_route': selected_route,
+                'reasoning': reasoning,
+                'confidence': confidence,
+                'decision_type': 'pioneer_strategic',
+                'macro_context': macro_context,
+                'timestamp': current_time,
+                'alternative_routes': [r for r in macro_candidates if r != selected_route]
+            }
+            
+            self.logger.log_info(f"CORY_PIONEER_SUCCESS: Pioneer selected route {selected_route} for {vehicle_id} "
+                               f"(confidence: {confidence:.3f}, reasoning: {reasoning[:100]}...)")
+            
+            return pioneer_result
+            
+        except Exception as e:
+            self.logger.log_error(f"CORY_PIONEER_ERROR: Pioneer decision failed for {vehicle_id}: {e}")
+            return {
+                'selected_route': macro_candidates[0] if macro_candidates else [],
+                'reasoning': f'Error in Pioneer decision: {e}',
+                'confidence': 0.1,
+                'decision_type': 'error_fallback',
+                'timestamp': current_time
+            }
+    
+    def _prepare_macro_context(self, state_context: Dict[str, Any], macro_candidates: List[List[int]]) -> Dict[str, Any]:
+        """
+        Prepare macro context specifically for Traffic LLM Pioneer decision.
+        
+        Following CLAUDE.md: 这个格式包含区域拥堵映射表、边界流量信息、预测数据等关键信息
+        """
+        regional_congestion = state_context['regional_congestion']
+        boundary_flows = state_context['boundary_flows']
+        traffic_predictions = state_context['traffic_predictions']
+        
+        # Smooth congestion values using exponential moving average
+        smoothed_congestion = {}
+        alpha = 0.7  # Smoothing factor
+        for region_id, congestion in regional_congestion.items():
+            # For now, just use current value (could enhance with historical data)
+            smoothed_congestion[region_id] = congestion
+        
+        # Calculate boundary flow intensity
+        boundary_flow_map = {}
+        for edge_id, flow_info in boundary_flows.items():
+            boundary_flow_map[edge_id] = {
+                'intensity': flow_info['vehicle_count'],
+                'from_region': flow_info['from_region'],
+                'to_region': flow_info['to_region']
+            }
+        
+        # Format prediction data for different time horizons
+        formatted_predictions = {}
+        for horizon, predictions in traffic_predictions.items():
+            formatted_predictions[horizon] = predictions
+        
+        macro_context = {
+            'regional_congestion_smoothed': smoothed_congestion,
+            'boundary_flow_intensity': boundary_flow_map,
+            'multi_horizon_predictions': formatted_predictions,
+            'route_candidates': macro_candidates,
+            'num_regions': len(smoothed_congestion),
+            'context_type': 'macro_strategic'
+        }
+        
+        return macro_context
     
     def _handle_stuck_vehicle_replanning(self, vehicle_id: str, current_time: float):
         """Handle replanning for stuck vehicles by treating them as newly born."""
@@ -631,9 +1051,184 @@ class MultiAgentTrafficEnvironment:
         except Exception as e:
             self.logger.log_error(f"STUCK_REPLAN: Failed for {vehicle_id}: {e}")
     
-    def _generate_macro_route_candidates(self, start_region: int, dest_region: int, current_time: float) -> List[List[int]]:
+    def _call_traffic_llm_pioneer(self, decision_input: Dict[str, Any], macro_context: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Generate macro route candidates based on reachability, connectivity, congestion, distance.
+        Call Traffic LLM for Pioneer decision making.
+        
+        Uses the enhanced macro route planning capability or falls back to hybrid decision making.
+        """
+        try:
+            if hasattr(self.traffic_llm, 'macro_route_planning'):
+                # Use enhanced LLM method
+                global_state = {
+                    'current_time': decision_input['current_time'],
+                    'total_vehicles': decision_input['global_state']['total_vehicles'],
+                    'regional_congestion': decision_input['regional_congestion'],
+                    'boundary_congestion': macro_context['boundary_flow_intensity'],
+                    'avg_travel_time': decision_input['global_state']['current_avg_travel_time']
+                }
+                
+                route_requests = [{
+                    'vehicle_id': decision_input['vehicle_id'],
+                    'start_region': decision_input['start_region'],
+                    'end_region': decision_input['dest_region'],
+                    'possible_routes': decision_input['route_candidates'],
+                    'route_urgency': 'normal',
+                    'special_requirements': None
+                }]
+                
+                regional_conditions = {}
+                for region_id, congestion in decision_input['regional_congestion'].items():
+                    regional_conditions[region_id] = {
+                        'congestion_level': congestion,
+                        'capacity_utilization': min(1.0, congestion / 5.0),
+                        'vehicle_count': 0,  # Could be enhanced
+                        'status': 'congested' if congestion > 3.0 else 'normal'
+                    }
+                
+                llm_result = self.traffic_llm.macro_route_planning(
+                    global_state=global_state,
+                    route_requests=route_requests,
+                    regional_conditions=regional_conditions,
+                    boundary_analysis={},  # Simplified for now
+                    flow_predictions={'time_horizon': 1800, 'regional_trend': 'stable'},
+                    coordination_needs={'load_balancing_required': True},
+                    region_routes={}
+                )
+                
+                # Extract result
+                macro_routes = llm_result.get('macro_routes', [])
+                if macro_routes:
+                    # Convert selected option number to actual route
+                    selected_option = macro_routes[0].get('selected_route_option', macro_routes[0].get('planned_route', '1'))
+                    selected_route = self._parse_route_option(selected_option, decision_input['route_candidates'])
+                    
+                    return {
+                        'selected_route': selected_route,
+                        'reasoning': macro_routes[0].get('reasoning', 'Strategic macro planning'),
+                        'confidence': 0.8
+                    }
+            
+            # Fallback to hybrid decision making
+            observation_text = self._create_pioneer_observation(decision_input, macro_context)
+            
+            # Create numbered options for LLM selection
+            numbered_options = []
+            for i, route in enumerate(decision_input['route_candidates']):
+                numbered_options.append(f"Option {i+1}: {route}")
+            answer_options = " | ".join(numbered_options)
+            
+            decisions = self.traffic_llm.hybrid_decision_making_pipeline(
+                [observation_text], [f'"{answer_options}"']
+            )
+            
+            if decisions and len(decisions) > 0:
+                decision = decisions[0]
+                selected_option_str = decision.get('answer', '1')
+                
+                # Parse selected option number to actual route
+                selected_route = self._parse_route_option(selected_option_str, decision_input['route_candidates'])
+                
+                return {
+                    'selected_route': selected_route,
+                    'reasoning': decision.get('summary', 'Hybrid decision making'),
+                    'confidence': 0.7
+                }
+            
+            return None
+            
+        except Exception as e:
+            self.logger.log_error(f"CORY_TRAFFIC_LLM_ERROR: {e}")
+            return None
+    
+    def _parse_route_option(self, selected_option, route_candidates):
+        """Parse LLM selected option number to actual route."""
+        try:
+            # Handle different formats of option selection
+            option_num = None
+            
+            if isinstance(selected_option, (list, tuple)):
+                # If LLM returned the actual route, try to find it in candidates
+                for i, candidate in enumerate(route_candidates):
+                    if candidate == selected_option:
+                        return candidate
+                # If not found, use first option
+                return route_candidates[0] if route_candidates else []
+            
+            elif isinstance(selected_option, str):
+                # Parse option number from string
+                if selected_option.isdigit():
+                    option_num = int(selected_option)
+                elif 'option' in selected_option.lower():
+                    # Extract number from "Option1", "option2", etc.
+                    import re
+                    match = re.search(r'(\d+)', selected_option)
+                    if match:
+                        option_num = int(match.group(1))
+                else:
+                    # Try to parse as route directly
+                    try:
+                        import ast
+                        parsed_route = ast.literal_eval(selected_option)
+                        if isinstance(parsed_route, list):
+                            # Check if this route exists in candidates
+                            for candidate in route_candidates:
+                                if candidate == parsed_route:
+                                    return candidate
+                    except:
+                        pass
+            
+            elif isinstance(selected_option, int):
+                option_num = selected_option
+            
+            # Convert option number to route (1-indexed)
+            if option_num is not None:
+                if 1 <= option_num <= len(route_candidates):
+                    return route_candidates[option_num - 1]
+            
+            # Fallback to first candidate
+            return route_candidates[0] if route_candidates else []
+            
+        except Exception as e:
+            self.logger.log_error(f"ROUTE_OPTION_PARSE_ERROR: {e}, selected_option: {selected_option}")
+            return route_candidates[0] if route_candidates else []
+    
+    def _create_pioneer_observation(self, decision_input: Dict[str, Any], macro_context: Dict[str, Any]) -> str:
+        """Create observation text for Pioneer LLM decision."""
+        observation = f"""PIONEER MACRO ROUTE DECISION:
+        
+        Vehicle: {decision_input['vehicle_id']}
+        Route: Region {decision_input['start_region']} -> Region {decision_input['dest_region']}
+        Time: {decision_input['current_time']:.1f}s
+        
+        REGIONAL CONGESTION STATUS:
+        """
+        
+        for region_id, congestion in decision_input['regional_congestion'].items():
+            status = "HIGH" if congestion > 3.0 else "MEDIUM" if congestion > 1.5 else "LOW"
+            observation += f"Region {region_id}: {congestion:.3f} ({status})\n"
+        
+        observation += f"\nROUTE CANDIDATES:\n"
+        for i, route in enumerate(decision_input['route_candidates']):
+            observation += f"{i+1}. {route}\n"
+        
+        observation += f"\nGLOBAL STATE:\n"
+        observation += f"Total vehicles: {decision_input['global_state']['total_vehicles']}\n"
+        observation += f"Current ATT: {decision_input['global_state']['current_avg_travel_time']:.1f}s\n"
+        
+        return observation
+    
+    def _generate_macro_route_candidates_original(self, start_region: int, dest_region: int, current_time: float) -> List[List[int]]:
+        """Original macro route candidate generation for fallback."""
+        return self._generate_macro_route_candidates(start_region, dest_region, current_time)
+    
+    def _generate_macro_route_candidates(self, start_region: int, dest_region: int, current_time: float, state_context: Dict[str, Any] = None) -> List[List[int]]:
+        """
+        Enhanced macro route candidate generation for CORY framework.
+        Considers reachability, connectivity, congestion, distance, and state context.
+        
+        Args:
+            state_context: Enhanced state information from CORY state construction
         """
         try:
             candidates = []
@@ -692,13 +1287,610 @@ class MultiAgentTrafficEnvironment:
             evaluated_candidates.sort(key=lambda x: x[1], reverse=True)
             top_candidates = [route for route, score in evaluated_candidates[:5]]  # Top 5 candidates
             
-            self.logger.log_info(f"MACRO_CANDIDATES: Generated {len(top_candidates)} candidates for {start_region}->{dest_region}")
+            # Enhanced logging with state context if available
+            if state_context:
+                regional_congestion = state_context.get('regional_congestion', {})
+                avg_congestion = sum(regional_congestion.get(r, 0) for route in top_candidates for r in route) / max(sum(len(route) for route in top_candidates), 1)
+                self.logger.log_info(f"CORY_MACRO_CANDIDATES: Generated {len(top_candidates)} candidates for regions {start_region}->{dest_region}: {top_candidates} "
+                                   f"(Avg route congestion: {avg_congestion:.3f})")
+            else:
+                self.logger.log_info(f"MACRO_CANDIDATES: Generated {len(top_candidates)} candidates for {start_region}->{dest_region}")
             
             return top_candidates
             
         except Exception as e:
-            self.logger.log_error(f"MACRO_CANDIDATES: Failed to generate candidates: {e}")
+            self.logger.log_error(f"CORY_MACRO_CANDIDATES_ERROR: Failed to generate candidates: {e}")
             return []
+    
+    def _observer_feedback(self, vehicle_id: str, state_context: Dict[str, Any], 
+                         pioneer_result: Dict[str, Any], current_time: float) -> Dict[str, Any]:
+        """
+        Observer Feedback Process - Regional LLM as Observer.
+        
+        Following CLAUDE.md: Regional LLM担任Observer的角色，负责从区域协调和个体保护的角度
+        对Pioneer的方案进行评估和改进。这个阶段的重点是局部优化和公平性考虑。
+        
+        多维度评估框架:
+        - 可行性评估：检查Pioneer提出的路径在当前交通状况下是否真正可行
+        - 效率评估：从区域交通管理的角度评估路径的效率
+        - 公平性评估：评估Pioneer的决策是否可能导致个别车辆的过度牺牲
+        
+        Returns:
+            Observer feedback with acceptance, improvements, conflicts, and suggestions
+        """
+        try:
+            self.logger.log_info(f"CORY_OBSERVER: Starting Observer feedback for {vehicle_id}")
+            
+            # [Regional Context Construction] - 为Regional LLM创建输入
+            regional_context = self._prepare_regional_context(state_context, pioneer_result)
+            
+            # [Multi-dimensional Evaluation Framework]
+            # 1. Feasibility Assessment
+            feasibility_score = self._assess_route_feasibility(
+                pioneer_result['selected_route'], state_context
+            )
+            
+            # 2. Efficiency Assessment 
+            efficiency_score = self._assess_route_efficiency(
+                pioneer_result['selected_route'], state_context
+            )
+            
+            # 3. Fairness Assessment
+            fairness_score = self._assess_route_fairness(
+                pioneer_result['selected_route'], state_context
+            )
+            
+            # [Improvement Suggestions Generation]
+            improvements = self._generate_improvement_suggestions(
+                pioneer_result, feasibility_score, efficiency_score, fairness_score
+            )
+            
+            # [Conflict Identification & Resolution]
+            conflicts = self._identify_conflicts(
+                pioneer_result['selected_route'], state_context
+            )
+            
+            # [Regional LLM Feedback Call]
+            observer_llm_result = self._call_regional_llm_observer(
+                vehicle_id, regional_context, pioneer_result, 
+                feasibility_score, efficiency_score, fairness_score,
+                improvements, conflicts, current_time
+            )
+            
+            # [Compile Observer Result]
+            observer_result = {
+                'acceptance': observer_llm_result.get('acceptance', True),
+                'feasibility_score': feasibility_score,
+                'efficiency_score': efficiency_score,
+                'fairness_score': fairness_score,
+                'improvements': improvements,
+                'conflicts': conflicts,
+                'llm_feedback': observer_llm_result,
+                'refined_routes': observer_llm_result.get('refined_routes', []),
+                'observer_reasoning': observer_llm_result.get('reasoning', 'Observer evaluation completed'),
+                'timestamp': current_time
+            }
+            
+            self.logger.log_info(f"CORY_OBSERVER_SUCCESS: Observer feedback completed for {vehicle_id} - "
+                               f"Acceptance: {observer_result['acceptance']}, "
+                               f"Scores: F={feasibility_score:.2f}, E={efficiency_score:.2f}, Fa={fairness_score:.2f}, "
+                               f"Improvements: {len(improvements)}, Conflicts: {len(conflicts)}")
+            
+            return observer_result
+            
+        except Exception as e:
+            self.logger.log_error(f"CORY_OBSERVER_ERROR: Observer feedback failed for {vehicle_id}: {e}")
+            return {
+                'acceptance': True,  # Default to acceptance on error
+                'feasibility_score': 0.5,
+                'efficiency_score': 0.5,
+                'fairness_score': 0.5,
+                'improvements': [],
+                'conflicts': [],
+                'error': str(e),
+                'timestamp': current_time
+            }
+    
+    def _prepare_regional_context(self, state_context: Dict[str, Any], pioneer_result: Dict[str, Any]) -> Dict[str, Any]:
+        """Prepare regional context for Observer evaluation."""
+        selected_route = pioneer_result['selected_route']
+        
+        # Get detailed regional information for the selected route
+        route_regional_details = {}
+        for region_id in selected_route:
+            route_regional_details[region_id] = {
+                'congestion_level': state_context['regional_congestion'].get(region_id, 0),
+                'region_edges': [edge for edge, reg in self.edge_to_region.items() if reg == region_id],
+                'expected_vehicles': 0  # Could be enhanced with actual counts
+            }
+        
+        # Calculate route-specific metrics
+        route_length = len(selected_route)
+        route_congestion_sum = sum(state_context['regional_congestion'].get(r, 0) for r in selected_route)
+        route_avg_congestion = route_congestion_sum / max(route_length, 1)
+        
+        regional_context = {
+            'pioneer_selected_route': selected_route,
+            'pioneer_reasoning': pioneer_result.get('reasoning', ''),
+            'pioneer_confidence': pioneer_result.get('confidence', 0.5),
+            'route_regional_details': route_regional_details,
+            'route_metrics': {
+                'length': route_length,
+                'avg_congestion': route_avg_congestion,
+                'total_congestion': route_congestion_sum
+            },
+            'alternative_routes': pioneer_result.get('alternative_routes', []),
+            'context_type': 'regional_observer'
+        }
+        
+        return regional_context
+    
+    def _assess_route_feasibility(self, selected_route: List[int], state_context: Dict[str, Any]) -> float:
+        """Assess the feasibility of the selected route."""
+        if not selected_route:
+            return 0.0
+        
+        feasibility_score = 1.0
+        
+        # Check if route is physically connected
+        for i in range(len(selected_route) - 1):
+            current_region = selected_route[i]
+            next_region = selected_route[i + 1]
+            
+            # Check if regions are connected
+            if not self.traffic_agent.region_graph.has_edge(current_region, next_region):
+                feasibility_score *= 0.5  # Penalize disconnected regions
+        
+        # Check congestion levels (heavily congested regions reduce feasibility)
+        for region_id in selected_route:
+            congestion = state_context['regional_congestion'].get(region_id, 0)
+            if congestion > 4.0:  # Very high congestion
+                feasibility_score *= 0.8
+            elif congestion > 2.0:  # Moderate congestion
+                feasibility_score *= 0.9
+        
+        return max(feasibility_score, 0.1)  # Minimum feasibility
+    
+    def _assess_route_efficiency(self, selected_route: List[int], state_context: Dict[str, Any]) -> float:
+        """Assess the efficiency of the selected route from regional management perspective."""
+        if not selected_route:
+            return 0.0
+        
+        # Calculate route efficiency based on length and congestion
+        route_length = len(selected_route)
+        total_congestion = sum(state_context['regional_congestion'].get(r, 0) for r in selected_route)
+        avg_congestion = total_congestion / max(route_length, 1)
+        
+        # Efficiency is higher for shorter routes with less congestion
+        length_efficiency = max(0, 1.0 - (route_length - 2) * 0.1)  # Penalize long routes
+        congestion_efficiency = max(0, 1.0 - avg_congestion * 0.2)  # Penalize congested routes
+        
+        efficiency_score = (length_efficiency + congestion_efficiency) / 2
+        return max(efficiency_score, 0.1)
+    
+    def _assess_route_fairness(self, selected_route: List[int], state_context: Dict[str, Any]) -> float:
+        """Assess fairness - whether the route might cause excessive individual sacrifice."""
+        if not selected_route:
+            return 1.0  # Neutral fairness for empty route
+        
+        # Estimate expected travel time based on route and congestion
+        route_length = len(selected_route)
+        total_congestion = sum(state_context['regional_congestion'].get(r, 0) for r in selected_route)
+        
+        # Rough travel time estimation (600s base + congestion penalty + length penalty)
+        estimated_travel_time = 600 + total_congestion * 100 + (route_length - 2) * 150
+        
+        # Fairness threshold (900s as mentioned in CLAUDE.md)
+        fairness_threshold = 900
+        
+        if estimated_travel_time <= fairness_threshold:
+            fairness_score = 1.0
+        else:
+            # Linear decrease in fairness score for times exceeding threshold
+            fairness_score = max(0, 1.0 - (estimated_travel_time - fairness_threshold) / fairness_threshold)
+        
+        return fairness_score
+    
+    def _generate_improvement_suggestions(self, pioneer_result: Dict[str, Any], 
+                                        feasibility_score: float, efficiency_score: float, 
+                                        fairness_score: float) -> List[Dict[str, Any]]:
+        """Generate improvement suggestions based on assessment scores."""
+        improvements = []
+        
+        if feasibility_score < 0.7:
+            improvements.append({
+                'type': 'feasibility',
+                'suggestion': 'Consider alternative routes due to connectivity or high congestion issues',
+                'priority': 'high'
+            })
+        
+        if efficiency_score < 0.6:
+            improvements.append({
+                'type': 'efficiency',
+                'suggestion': 'Route may be suboptimal - consider shorter or less congested alternatives',
+                'priority': 'medium'
+            })
+        
+        if fairness_score < 0.8:
+            improvements.append({
+                'type': 'fairness',
+                'suggestion': 'Route may cause excessive individual travel time - consider individual protection',
+                'priority': 'high'
+            })
+        
+        return improvements
+    
+    def _identify_conflicts(self, selected_route: List[int], state_context: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Identify potential conflicts in the selected route."""
+        conflicts = []
+        
+        # Fairness conflicts (excessive travel time)
+        route_length = len(selected_route)
+        total_congestion = sum(state_context['regional_congestion'].get(r, 0) for r in selected_route)
+        estimated_time = 600 + total_congestion * 100 + (route_length - 2) * 150
+        
+        if estimated_time > 900:  # Fairness threshold
+            conflicts.append({
+                'type': 'fairness_conflict',
+                'description': f'Estimated travel time {estimated_time:.0f}s exceeds fairness threshold (900s)',
+                'severity': 'high',
+                'resolution_needed': True
+            })
+        
+        return conflicts
+    
+    def _call_regional_llm_observer(self, vehicle_id: str, regional_context: Dict[str, Any],
+                                  pioneer_result: Dict[str, Any], feasibility_score: float,
+                                  efficiency_score: float, fairness_score: float,
+                                  improvements: List[Dict], conflicts: List[Dict],
+                                  current_time: float) -> Dict[str, Any]:
+        """Call Regional LLM for Observer feedback."""
+        try:
+            # Create regional observation text
+            observation = self._create_observer_observation(
+                vehicle_id, regional_context, pioneer_result,
+                feasibility_score, efficiency_score, fairness_score,
+                improvements, conflicts
+            )
+            
+            # Use Regional LLM for evaluation - simplified approach
+            answer_options = "Accept/Reject/Modify"
+            decisions = self.regional_llm.hybrid_decision_making_pipeline(
+                [observation], [f'"{answer_options}"']
+            )
+            
+            if decisions and len(decisions) > 0:
+                decision = decisions[0]
+                acceptance = 'accept' in decision.get('answer', 'accept').lower()
+                
+                return {
+                    'acceptance': acceptance,
+                    'reasoning': decision.get('summary', 'Regional evaluation completed'),
+                    'refined_routes': [],
+                    'decision_response': decision
+                }
+            
+            # Default acceptance
+            return {
+                'acceptance': True,
+                'reasoning': 'Default acceptance (LLM call failed)',
+                'refined_routes': []
+            }
+            
+        except Exception as e:
+            self.logger.log_error(f"CORY_REGIONAL_LLM_ERROR: {e}")
+            return {
+                'acceptance': True,  # Default to acceptance on error
+                'reasoning': f'Error in regional LLM call: {e}',
+                'refined_routes': []
+            }
+    
+    def _create_observer_observation(self, vehicle_id: str, regional_context: Dict[str, Any],
+                                   pioneer_result: Dict[str, Any], feasibility_score: float,
+                                   efficiency_score: float, fairness_score: float,
+                                   improvements: List[Dict], conflicts: List[Dict]) -> str:
+        """Create observation text for Observer LLM evaluation."""
+        observation = f"""OBSERVER REGIONAL EVALUATION:
+        
+        Vehicle: {vehicle_id}
+        Pioneer Selected Route: {regional_context['pioneer_selected_route']}
+        Pioneer Reasoning: {pioneer_result.get('reasoning', 'Not provided')}
+        Pioneer Confidence: {pioneer_result.get('confidence', 0.5):.3f}
+        
+        ROUTE ASSESSMENT SCORES:
+        Feasibility: {feasibility_score:.3f} {'(PASS)' if feasibility_score > 0.7 else '(FAIL)'}
+        Efficiency: {efficiency_score:.3f} {'(PASS)' if efficiency_score > 0.6 else '(FAIL)'}
+        Fairness: {fairness_score:.3f} {'(PASS)' if fairness_score > 0.8 else '(FAIL)'}
+        
+        REGIONAL DETAILS:
+        """
+        
+        for region_id, details in regional_context['route_regional_details'].items():
+            observation += f"Region {region_id}: Congestion {details['congestion_level']:.3f}\n"
+        
+        if improvements:
+            observation += f"\nIMPROVEMENT SUGGESTIONS ({len(improvements)}):\n"
+            for imp in improvements:
+                observation += f"- {imp['type'].upper()}: {imp['suggestion']}\n"
+        
+        if conflicts:
+            observation += f"\nCONFLICTS IDENTIFIED ({len(conflicts)}):\n"
+            for conflict in conflicts:
+                observation += f"- {conflict['type'].upper()}: {conflict['description']}\n"
+        
+        observation += "\nPlease evaluate and provide acceptance decision (Accept/Reject/Modify)."
+        
+        return observation
+    
+    def _j1_judge_evaluation(self, vehicle_id: str, pioneer_result: Dict[str, Any], 
+                           observer_result: Dict[str, Any], current_time: float) -> Dict[str, Any]:
+        """
+        J1-Judge Quality Evaluation - Core component of CORY framework.
+        
+        Following CLAUDE.md: J1-Judge是整个CORY框架中的关键组件，负责评估Pioneer和Observer之间合作的质量。
+        
+        评估维度:
+        - 一致性分数: Pioneer决策和Observer反馈之间的协调程度
+        - 改进分数: Observer提出的改进建议数量和质量
+        - 冲突解决分数: Observer识别和解决冲突的能力
+        
+        Returns:
+            Quality evaluation with consistency, improvement, conflict resolution scores
+        """
+        try:
+            self.logger.log_info(f"CORY_J1_JUDGE: Starting quality evaluation for {vehicle_id}")
+            
+            # [Consistency Score Calculation] - 一致性分数衡量Pioneer决策和Observer反馈之间的协调程度
+            consistency_score = self._calculate_consistency_score(
+                pioneer_result, observer_result
+            )
+            
+            # [Improvement Score Calculation] - 改进分数基于Observer提出的改进建议数量和质量
+            improvement_score = self._calculate_improvement_score(
+                observer_result.get('improvements', [])
+            )
+            
+            # [Conflict Resolution Score] - 冲突解决分数衡量Observer识别和解决冲突的能力
+            conflict_resolution_score = self._calculate_conflict_resolution_score(
+                observer_result.get('conflicts', [])
+            )
+            
+            # [Comprehensive Quality Score] - 综合质量分数通过加权求和得到
+            # 权重分配: 一致性(0.4) + 改进能力(0.3) + 冲突解决(0.3)
+            cooperation_quality = (
+                0.4 * consistency_score + 
+                0.3 * improvement_score + 
+                0.3 * conflict_resolution_score
+            )
+            
+            # [Quality Assessment Details]
+            quality_details = {
+                'consistency_analysis': self._analyze_consistency(pioneer_result, observer_result),
+                'improvement_analysis': self._analyze_improvements(observer_result.get('improvements', [])),
+                'conflict_analysis': self._analyze_conflicts(observer_result.get('conflicts', []))
+            }
+            
+            j1_judge_result = {
+                'cooperation_quality': cooperation_quality,
+                'consistency_score': consistency_score,
+                'improvement_score': improvement_score,
+                'conflict_resolution_score': conflict_resolution_score,
+                'quality_details': quality_details,
+                'evaluation_timestamp': current_time,
+                'quality_level': self._determine_quality_level(cooperation_quality)
+            }
+            
+            self.logger.log_info(f"CORY_J1_JUDGE_SUCCESS: Quality evaluation completed for {vehicle_id} - "
+                               f"Overall Quality: {cooperation_quality:.3f} ({j1_judge_result['quality_level']}), "
+                               f"Consistency: {consistency_score:.3f}, Improvement: {improvement_score:.3f}, "
+                               f"Conflict Resolution: {conflict_resolution_score:.3f}")
+            
+            return j1_judge_result
+            
+        except Exception as e:
+            self.logger.log_error(f"CORY_J1_JUDGE_ERROR: Quality evaluation failed for {vehicle_id}: {e}")
+            return {
+                'cooperation_quality': 0.5,  # Default medium quality on error
+                'consistency_score': 0.5,
+                'improvement_score': 0.5,
+                'conflict_resolution_score': 0.5,
+                'error': str(e),
+                'evaluation_timestamp': current_time,
+                'quality_level': 'MEDIUM'
+            }
+    
+    def _calculate_consistency_score(self, pioneer_result: Dict[str, Any], observer_result: Dict[str, Any]) -> float:
+        """Calculate consistency score between Pioneer and Observer."""
+        # Check Observer's acceptance of Pioneer decision
+        acceptance = observer_result.get('acceptance', True)
+        
+        if acceptance:
+            # Complete acceptance
+            return 0.9
+        else:
+            # Check if there are minor adjustments suggested
+            improvements = observer_result.get('improvements', [])
+            minor_improvements = [imp for imp in improvements if imp.get('priority') in ['low', 'medium']]
+            major_improvements = [imp for imp in improvements if imp.get('priority') == 'high']
+            
+            if len(major_improvements) == 0 and len(minor_improvements) > 0:
+                # Minor adjustments only
+                return 0.7
+            elif len(major_improvements) > 0:
+                # Major revisions needed
+                return 0.4
+            else:
+                # Rejection without clear improvements
+                return 0.2
+    
+    def _calculate_improvement_score(self, improvements: List[Dict[str, Any]]) -> float:
+        """Calculate improvement score based on suggestions."""
+        if not improvements:
+            return 0.3  # Base score for no suggestions
+        
+        # Score based on number and quality of improvements
+        # Formula: min(0.3 + 0.1 * improvement_count, 1.0)
+        improvement_count = len(improvements)
+        improvement_score = min(0.3 + 0.1 * improvement_count, 1.0)
+        
+        # Adjust based on priority of improvements
+        high_priority_count = len([imp for imp in improvements if imp.get('priority') == 'high'])
+        if high_priority_count > 0:
+            improvement_score = min(improvement_score + 0.1 * high_priority_count, 1.0)
+        
+        return improvement_score
+    
+    def _calculate_conflict_resolution_score(self, conflicts: List[Dict[str, Any]]) -> float:
+        """Calculate conflict resolution score."""
+        if not conflicts:
+            # No conflicts identified - could be good or indicate poor analysis
+            return 0.8
+        
+        # Score based on conflict identification and resolution
+        resolved_conflicts = [c for c in conflicts if c.get('resolution_needed', False)]
+        
+        if len(resolved_conflicts) == 0:
+            # All conflicts resolved
+            return 1.0
+        else:
+            # Partial resolution
+            total_conflicts = len(conflicts)
+            resolved_count = len(conflicts) - len(resolved_conflicts)
+            return max(0.0, resolved_count / total_conflicts)
+    
+    def _analyze_consistency(self, pioneer_result: Dict[str, Any], observer_result: Dict[str, Any]) -> str:
+        """Analyze consistency between Pioneer and Observer decisions."""
+        acceptance = observer_result.get('acceptance', True)
+        if acceptance:
+            return "High consistency - Observer accepts Pioneer decision"
+        else:
+            improvements = observer_result.get('improvements', [])
+            return f"Low consistency - Observer suggests {len(improvements)} improvements"
+    
+    def _analyze_improvements(self, improvements: List[Dict[str, Any]]) -> str:
+        """Analyze improvement suggestions."""
+        if not improvements:
+            return "No improvement suggestions provided"
+        
+        high_priority = len([imp for imp in improvements if imp.get('priority') == 'high'])
+        medium_priority = len([imp for imp in improvements if imp.get('priority') == 'medium'])
+        low_priority = len([imp for imp in improvements if imp.get('priority') == 'low'])
+        
+        return f"Improvements suggested: {high_priority} high, {medium_priority} medium, {low_priority} low priority"
+    
+    def _analyze_conflicts(self, conflicts: List[Dict[str, Any]]) -> str:
+        """Analyze conflict identification and resolution."""
+        if not conflicts:
+            return "No conflicts identified"
+        
+        resolved = len([c for c in conflicts if not c.get('resolution_needed', True)])
+        unresolved = len(conflicts) - resolved
+        
+        return f"Conflicts: {len(conflicts)} total, {resolved} resolved, {unresolved} unresolved"
+    
+    def _determine_quality_level(self, cooperation_quality: float) -> str:
+        """Determine quality level based on cooperation quality score."""
+        if cooperation_quality >= 0.8:
+            return "HIGH"
+        elif cooperation_quality >= 0.6:
+            return "MEDIUM"
+        else:
+            return "LOW"
+    
+    def _synthesize_final_decision(self, vehicle_id: str, pioneer_result: Dict[str, Any],
+                                 observer_result: Dict[str, Any], j1_judge_result: Dict[str, Any],
+                                 current_time: float) -> Dict[str, Any]:
+        """
+        Synthesize final decision based on Pioneer-Observer cooperation and J1-Judge evaluation.
+        
+        Following CLAUDE.md: 在获得合作质量分数后，系统通过_synthesize_final_decision函数生成最终决策。
+        
+        决策策略:
+        - 高质量合作(>=0.7): 优先采用Observer优化的决策
+        - 低质量合作(<0.7): 谨慎处理Observer建议，主要使用Pioneer决策
+        
+        Returns:
+            Final synthesized decision with route, quality, and metadata
+        """
+        try:
+            self.logger.log_info(f"CORY_SYNTHESIZE: Starting final decision synthesis for {vehicle_id}")
+            
+            cooperation_quality = j1_judge_result.get('cooperation_quality', 0.5)
+            
+            # [High Quality Cooperation] - cooperation_quality >= 0.7
+            if cooperation_quality >= 0.7:
+                self.logger.log_info(f"CORY_SYNTHESIZE: High quality cooperation detected ({cooperation_quality:.3f})")
+                
+                # Check if Observer provided refined routes
+                refined_routes = observer_result.get('refined_routes', [])
+                if refined_routes and len(refined_routes) > 0:
+                    final_route = refined_routes[0]  # Use first refined route
+                    decision_rationale = "Observer-optimized route selected (high cooperation quality)"
+                else:
+                    final_route = pioneer_result['selected_route']
+                    decision_rationale = "Pioneer route confirmed by Observer (high cooperation quality)"
+                
+                # Include Observer's improvements and reasoning
+                synthesis_details = {
+                    'synthesis_type': 'high_quality_cooperation',
+                    'observer_improvements_applied': len(observer_result.get('improvements', [])),
+                    'conflicts_resolved': len([c for c in observer_result.get('conflicts', []) if not c.get('resolution_needed', True)]),
+                    'observer_acceptance': observer_result.get('acceptance', True)
+                }
+                
+            # [Low Quality Cooperation] - cooperation_quality < 0.7
+            else:
+                self.logger.log_info(f"CORY_SYNTHESIZE: Low quality cooperation detected ({cooperation_quality:.3f})")
+                
+                # Use Pioneer's decision as primary, but record Observer feedback
+                final_route = pioneer_result['selected_route']
+                decision_rationale = "Pioneer route maintained (low cooperation quality - Observer feedback recorded for reference)"
+                
+                synthesis_details = {
+                    'synthesis_type': 'low_quality_cooperation',
+                    'observer_concerns': len(observer_result.get('improvements', [])),
+                    'unresolved_conflicts': len([c for c in observer_result.get('conflicts', []) if c.get('resolution_needed', True)]),
+                    'fallback_to_pioneer': True
+                }
+            
+            # [Decision Confidence] - 基于合作质量传递置信度
+            final_confidence = cooperation_quality
+            
+            # [Compile Final Result]
+            final_result = {
+                'final_route': final_route,
+                'cooperation_quality': cooperation_quality,
+                'final_confidence': final_confidence,
+                'decision_rationale': decision_rationale,
+                'synthesis_details': synthesis_details,
+                'pioneer_decision': pioneer_result,
+                'observer_feedback': observer_result,
+                'j1_judge_evaluation': j1_judge_result,
+                'synthesis_timestamp': current_time,
+                'cory_framework_version': '1.0'
+            }
+            
+            self.logger.log_info(f"CORY_SYNTHESIZE_SUCCESS: Final decision synthesized for {vehicle_id} - "
+                               f"Route: {final_route}, Quality: {cooperation_quality:.3f}, "
+                               f"Confidence: {final_confidence:.3f}, Type: {synthesis_details['synthesis_type']}")
+            
+            return final_result
+            
+        except Exception as e:
+            self.logger.log_error(f"CORY_SYNTHESIZE_ERROR: Final decision synthesis failed for {vehicle_id}: {e}")
+            # Fallback to Pioneer decision
+            return {
+                'final_route': pioneer_result.get('selected_route', []),
+                'cooperation_quality': 0.1,
+                'final_confidence': 0.1,
+                'decision_rationale': f'Error in synthesis - fallback to Pioneer: {e}',
+                'synthesis_details': {'synthesis_type': 'error_fallback'},
+                'pioneer_decision': pioneer_result,
+                'observer_feedback': observer_result,
+                'j1_judge_evaluation': j1_judge_result,
+                'synthesis_timestamp': current_time,
+                'error': str(e)
+            }
     
     def _supplement_region_connections_emergency(self, start_region: int, dest_region: int):
         """Emergency supplement of region connections when pathfinding fails."""
@@ -1539,6 +2731,13 @@ class MultiAgentTrafficEnvironment:
                             veh_id, self.vehicle_start_times[veh_id], current_time, travel_time
                         )
                         
+                        # RL Training Data Collection - Collect data BEFORE cleanup
+                        if self.rl_data_collection_enabled:
+                            self.logger.log_info(f"RL_DATA_COLLECTION_TRIGGER: Vehicle {veh_id} completed, collecting training data")
+                            self._collect_rl_training_data(veh_id, travel_time, current_time)
+                        else:
+                            self.logger.log_info(f"RL_DATA_COLLECTION_DISABLED: Vehicle {veh_id} completed but RL data collection is disabled")
+                        
                         # Clean up vehicle plans and broadcast completion
                         self._cleanup_completed_vehicle_plans(veh_id, current_time)
                         
@@ -1953,6 +3152,10 @@ class MultiAgentTrafficEnvironment:
                 # Update prediction engine based on new positions
                 self.update_prediction_engine(current_time)
                 
+                # Check for and apply latest LoRA adapters (every 10 simulation steps)
+                if int(step) % 10 == 0:
+                    self._check_and_apply_latest_adapters()
+                
                 # Update traffic agent global state based on new positions
                 self.update_traffic_agent(current_time)
                 
@@ -2202,6 +3405,191 @@ class MultiAgentTrafficEnvironment:
         except Exception as e:
             self.logger.log_error(f"BROADCAST_UPDATE: Failed for {vehicle_id}: {e}")
     
+    def _collect_rl_training_data(self, vehicle_id: str, travel_time: float, completion_time: float):
+        """
+        Collect comprehensive RL training data for completed vehicles.
+        
+        This function gathers all necessary data for MAGRPO training, including:
+        - CORY decision data (Pioneer, Observer, J1-Judge)
+        - Performance metrics and rewards
+        - State and action information
+        """
+        try:
+            self.logger.log_info(f"RL_DATA_COLLECTION_START: Starting data collection for {vehicle_id}, "
+                               f"travel_time={travel_time:.1f}s, training_queue={'available' if self.training_queue else 'None'}")
+            
+            rl_training_data = {}
+            
+            # Basic vehicle information
+            rl_training_data['vehicle_id'] = vehicle_id
+            rl_training_data['start_time'] = self.vehicle_start_times.get(vehicle_id, completion_time)
+            rl_training_data['completion_time'] = completion_time
+            rl_training_data['travel_time'] = travel_time
+            
+            # CORY Decision Data - Extract from vehicle_current_plans
+            macro_plan = self.vehicle_current_plans.get(vehicle_id, {})
+            if macro_plan:
+                rl_training_data['macro_route'] = macro_plan.get('macro_route', [])
+                rl_training_data['cooperation_quality'] = macro_plan.get('cooperation_quality', 0.0)
+                rl_training_data['cory_decision_type'] = macro_plan.get('cory_decision_type', 'unknown')
+                rl_training_data['pioneer_decision'] = macro_plan.get('pioneer_decision', {})
+                rl_training_data['observer_feedback'] = macro_plan.get('observer_feedback', {})
+                rl_training_data['j1_judge_evaluation'] = macro_plan.get('j1_judge_evaluation', {})
+                rl_training_data['state_context'] = macro_plan.get('state_context', {})
+            
+            # Regional Planning Data
+            regional_plan = self.vehicle_regional_plans.get(vehicle_id, {})
+            if regional_plan:
+                rl_training_data['regional_route'] = regional_plan.get('route', [])
+                rl_training_data['target_region'] = regional_plan.get('target_region', -1)
+                rl_training_data['boundary_edge'] = regional_plan.get('boundary_edge', '')
+                rl_training_data['regional_reasoning'] = regional_plan.get('reasoning', '')
+            
+            # Travel Metrics
+            travel_metrics = self.vehicle_travel_metrics.get(vehicle_id, {})
+            rl_training_data['travel_metrics'] = travel_metrics
+            
+            # Calculate normalized rewards for RL training
+            rewards = self._calculate_normalized_rewards(vehicle_id, travel_time, completion_time)
+            rl_training_data['rewards'] = rewards
+            
+            # Performance indicators for GRPO grouping
+            rl_training_data['vehicle_region_start'] = None
+            rl_training_data['vehicle_region_dest'] = None
+            if macro_plan.get('macro_route'):
+                route = macro_plan['macro_route']
+                rl_training_data['vehicle_region_start'] = route[0] if route else None
+                rl_training_data['vehicle_region_dest'] = route[-1] if route else None
+            
+            # System state at completion
+            rl_training_data['system_att'] = self._calculate_current_att()
+            rl_training_data['system_vehicle_count'] = len(self.vehicle_travel_metrics)
+            rl_training_data['completion_order'] = self.completed_vehicles
+            
+            # Store completion time for ATT calculation
+            self.completed_vehicle_times[vehicle_id] = travel_time
+            
+            # Send to training manager if queue is available
+            if self.training_queue is not None:
+                try:
+                    self.training_queue.put(rl_training_data, block=False)
+                    self.logger.log_info(f"RL_DATA_SENT: Training data for {vehicle_id} sent to training manager")
+                except Exception as queue_error:
+                    self.logger.log_warning(f"RL_DATA_QUEUE_ERROR: Failed to send training data for {vehicle_id}: {queue_error}")
+            else:
+                self.logger.log_warning(f"RL_DATA_NO_QUEUE: Training queue not available for {vehicle_id}")
+                
+        except Exception as e:
+            self.logger.log_error(f"RL_DATA_COLLECTION_ERROR: Failed to collect training data for {vehicle_id}: {e}")
+    
+    def _calculate_normalized_rewards(self, vehicle_id: str, travel_time: float, completion_time: float) -> Dict[str, float]:
+        """
+        Calculate normalized rewards for RL training following CLAUDE.md specifications.
+        
+        Returns separate rewards for Traffic LLM and Regional LLM based on their roles:
+        - Traffic LLM: ATT improvement + cooperation quality  
+        - Regional LLM: Regional efficiency + individual protection + cooperation quality
+        """
+        try:
+            rewards = {}
+            
+            # Base expected travel time (600s as per CLAUDE.md)
+            expected_time = 600.0
+            
+            # ATT improvement calculation (for Traffic LLM)
+            att_improvement = max(0, (expected_time - travel_time) / expected_time)
+            att_reward = min(att_improvement * 2.0, 1.0)  # Cap at 1.0, multiply by 2.0 for sensitivity
+            
+            # Cooperation quality from CORY framework
+            macro_plan = self.vehicle_current_plans.get(vehicle_id, {})
+            cooperation_quality = macro_plan.get('cooperation_quality', 0.5)
+            
+            # Regional efficiency calculation (for Regional LLM)
+            regional_metrics = self._calculate_regional_efficiency(vehicle_id, travel_time)
+            efficiency_reward = min(regional_metrics * 2.0, 1.0)
+            
+            # Individual protection (fairness threshold: 900s as per CLAUDE.md)
+            fairness_threshold = 900.0
+            if travel_time <= fairness_threshold:
+                individual_protection = 1.0
+            else:
+                individual_protection = max(0, 1.0 - (travel_time - fairness_threshold) / fairness_threshold)
+            
+            # Traffic LLM rewards (Pioneer role)
+            rewards['traffic_llm'] = {
+                'att_reward': att_reward,
+                'cooperation_reward': cooperation_quality,
+                'total_reward': 0.6 * att_reward + 0.4 * cooperation_quality  # Weights from CLAUDE.md
+            }
+            
+            # Regional LLM rewards (Observer role)  
+            rewards['regional_llm'] = {
+                'efficiency_reward': efficiency_reward,
+                'individual_protection_reward': individual_protection,
+                'cooperation_reward': cooperation_quality,
+                'total_reward': 0.5 * efficiency_reward + 0.2 * individual_protection + 0.3 * cooperation_quality
+            }
+            
+            self.logger.log_info(f"RL_REWARDS: {vehicle_id} -> Traffic:{rewards['traffic_llm']['total_reward']:.3f}, "
+                               f"Regional:{rewards['regional_llm']['total_reward']:.3f}")
+            
+            return rewards
+            
+        except Exception as e:
+            self.logger.log_error(f"RL_REWARD_CALCULATION_ERROR: {vehicle_id} -> {e}")
+            # Return default rewards on error
+            return {
+                'traffic_llm': {'att_reward': 0.5, 'cooperation_reward': 0.5, 'total_reward': 0.5},
+                'regional_llm': {'efficiency_reward': 0.5, 'individual_protection_reward': 0.5, 
+                               'cooperation_reward': 0.5, 'total_reward': 0.5}
+            }
+    
+    def _calculate_regional_efficiency(self, vehicle_id: str, travel_time: float) -> float:
+        """
+        Calculate regional efficiency based on vehicle's performance in different regions.
+        
+        Following CLAUDE.md: Regional efficiency considers vehicle's contribution to 
+        regional traffic flow and its adherence to regional routing decisions.
+        """
+        try:
+            efficiency_score = 0.5  # Default baseline
+            
+            # Get vehicle's macro route
+            macro_plan = self.vehicle_current_plans.get(vehicle_id, {})
+            macro_route = macro_plan.get('macro_route', [])
+            
+            if not macro_route:
+                return efficiency_score
+            
+            # Calculate efficiency based on route length and travel time
+            route_length = len(macro_route)
+            if route_length <= 2:  # Direct route
+                # Shorter routes are more efficient
+                time_efficiency = min(1.0, 600.0 / max(travel_time, 300.0))  # Normalize against 600s baseline
+                efficiency_score = time_efficiency * 1.2  # Bonus for direct routes
+            else:
+                # Multi-region routes: penalize excessive detours
+                expected_time_per_region = 200.0  # Base time per region
+                expected_total_time = route_length * expected_time_per_region
+                time_efficiency = min(1.0, expected_total_time / max(travel_time, expected_total_time * 0.5))
+                efficiency_score = time_efficiency
+            
+            # Consider cooperation quality impact on regional efficiency
+            cooperation_quality = macro_plan.get('cooperation_quality', 0.5)
+            if cooperation_quality > 0.7:  # High quality cooperation
+                efficiency_score *= 1.1  # Bonus for good cooperation
+            elif cooperation_quality < 0.3:  # Poor cooperation
+                efficiency_score *= 0.9  # Penalty for poor cooperation
+            
+            # Cap efficiency score at 1.0
+            efficiency_score = min(efficiency_score, 1.0)
+            
+            return efficiency_score
+            
+        except Exception as e:
+            self.logger.log_error(f"REGIONAL_EFFICIENCY_ERROR: {vehicle_id} -> {e}")
+            return 0.5  # Default efficiency on error
+
     def _cleanup_completed_vehicle_plans(self, vehicle_id: str, current_time: float):
         """Clean up plans when vehicle completes journey."""
         try:

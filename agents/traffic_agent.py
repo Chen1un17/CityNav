@@ -833,23 +833,24 @@ class TrafficAgent:
         observation_parts.append(f"Macro Route Planning: Region {start_region} → Region {end_region}")
         observation_parts.append("")
         
-        # Current regional congestion
+        # Current regional congestion (compressed format: R[id]:[congestion])
         regional_congestion = context.get('regional_congestion', {})
-        observation_parts.append("Regional Congestion Levels:")
+        congestion_list = []
         for region_id in range(context['num_regions']):
             congestion = regional_congestion.get(region_id, 0)
-            observation_parts.append(f"  Region {region_id}: {congestion:.1f}")
+            congestion_list.append(f"R{region_id}:{congestion:.1f}")
+        observation_parts.append("Regional_Congestion: " + "|".join(congestion_list))
         observation_parts.append("")
         
-        # Possible routes
+        # Possible routes (compressed format: Rt[n]:R[id]>R[id]>[cong:x.x,bdry:x.x])
         possible_routes = self._get_possible_regional_routes(start_region, end_region)
-        observation_parts.append("Possible Regional Routes:")
+        route_list = []
         
         for i, route in enumerate(possible_routes):
             if len(route) <= 1:
                 continue
                 
-            route_str = " → ".join([f"R{r}" for r in route])
+            route_str = ">".join([f"R{r}" for r in route])
             
             # Calculate route congestion
             route_congestion = np.mean([
@@ -857,38 +858,44 @@ class TrafficAgent:
             ])
             
             # Get boundary information
-            boundary_info = []
+            boundary_congestion = context.get('boundary_congestion', {})
+            avg_boundary_cong = 0
+            boundary_count = 0
             for j in range(len(route) - 1):
                 from_r, to_r = route[j], route[j + 1]
                 boundaries = self.region_connections.get((from_r, to_r), [])
                 if boundaries:
-                    boundary_congestion = context.get('boundary_congestion', {})
-                    avg_boundary_cong = np.mean([
+                    avg_boundary_cong += np.mean([
                         boundary_congestion.get(edge, 0) for edge in boundaries
                     ])
-                    boundary_info.append(f"boundary_congestion: {avg_boundary_cong:.1f}")
+                    boundary_count += 1
             
-            observation_parts.append(f"  Route {i + 1}: {route_str}")
-            observation_parts.append(f"    Average region congestion: {route_congestion:.1f}")
-            if boundary_info:
-                observation_parts.append(f"    {', '.join(boundary_info)}")
+            avg_boundary_cong = avg_boundary_cong / max(1, boundary_count)
+            route_compact = f"Rt{i+1}:{route_str}[cong:{route_congestion:.1f},bdry:{avg_boundary_cong:.1f}]"
+            route_list.append(route_compact)
+        
+        if route_list:
+            observation_parts.append("Routes: " + " | ".join(route_list))
             observation_parts.append("")
         
-        # Traffic predictions
+        # Traffic predictions (compressed format: edge_id:forecast)
         congestion_forecast = context.get('congestion_forecast', {})
         if congestion_forecast:
-            observation_parts.append("Congestion Forecast (next 30 minutes):")
+            forecast_list = []
             for edge_id, forecast in list(congestion_forecast.items())[:5]:  # Show top 5
                 avg_forecast = np.mean(forecast) if forecast else 0
-                observation_parts.append(f"  Boundary {edge_id}: {avg_forecast:.1f}")
+                forecast_list.append(f"{edge_id}:{avg_forecast:.1f}")
+            observation_parts.append("Forecast_30min: " + "|".join(forecast_list))
             observation_parts.append("")
         
-        # Current performance
+        # Current performance (compressed format: metric:value)
         performance = context.get('performance_metrics', {})
         if performance:
-            observation_parts.append("System Performance:")
-            observation_parts.append(f"  Success rate: {performance.get('success_rate', 0):.1f}%")
-            observation_parts.append(f"  Average travel time: {performance.get('avg_travel_time', 0):.1f}s")
+            perf_list = [
+                f"success:{performance.get('success_rate', 0):.1f}%",
+                f"avg_time:{performance.get('avg_travel_time', 0):.1f}s"
+            ]
+            observation_parts.append("Performance: " + "|".join(perf_list))
             observation_parts.append("")
         
         return "\n".join(observation_parts)
