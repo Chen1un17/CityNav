@@ -83,6 +83,7 @@ class MultiAgentTrafficEnvironment:
             'regional': None  # Current Regional LLM LoRA adapter name
         }
         self.lora_update_lock = threading.Lock()  # Thread-safe adapter updates
+        self.llm_call_lock = threading.Lock()    # 防止多LLM实例同时调用的互斥锁
         
         # === 优化加载顺序：先加载模型后加载路网 ===
         print("\n=== Step 1: 初始化LLM模型 ===")
@@ -910,8 +911,20 @@ class MultiAgentTrafficEnvironment:
                 'global_state': state_context['global_state']
             }
             
-            # Use Traffic LLM for Pioneer decision
-            pioneer_response = self._call_traffic_llm_pioneer(decision_input, macro_context)
+            # Check LLM health before calling
+            if self.traffic_llm is None or not hasattr(self.traffic_llm, 'model') or self.traffic_llm.model is None:
+                self.logger.log_error(f"CORY_PIONEER_LLM_UNAVAILABLE: Traffic LLM is None or damaged for {vehicle_id}")
+                return {
+                    'selected_route': macro_candidates[0] if macro_candidates else [],
+                    'reasoning': 'LLM unavailable - using first route candidate',
+                    'confidence': 0.2,
+                    'decision_type': 'llm_unavailable',
+                    'timestamp': current_time
+                }
+            
+            # Use Traffic LLM for Pioneer decision (带锁保护)
+            with self.llm_call_lock:
+                pioneer_response = self._call_traffic_llm_pioneer(decision_input, macro_context)
             
             if not pioneer_response:
                 self.logger.log_error(f"CORY_PIONEER_LLM_FAILED: Traffic LLM call failed for {vehicle_id}")
@@ -1112,11 +1125,9 @@ class MultiAgentTrafficEnvironment:
             # Fallback to hybrid decision making
             observation_text = self._create_pioneer_observation(decision_input, macro_context)
             
-            # Create numbered options for LLM selection
-            numbered_options = []
-            for i, route in enumerate(decision_input['route_candidates']):
-                numbered_options.append(f"Option {i+1}: {route}")
-            answer_options = " | ".join(numbered_options)
+            # Create simple option indices for LLM selection (1, 2, 3, etc.)
+            num_candidates = len(decision_input['route_candidates'])
+            answer_options = "/".join([str(i+1) for i in range(num_candidates)])
             
             decisions = self.traffic_llm.hybrid_decision_making_pipeline(
                 [observation_text], [f'"{answer_options}"']
@@ -1194,27 +1205,31 @@ class MultiAgentTrafficEnvironment:
             return route_candidates[0] if route_candidates else []
     
     def _create_pioneer_observation(self, decision_input: Dict[str, Any], macro_context: Dict[str, Any]) -> str:
-        """Create observation text for Pioneer LLM decision."""
-        observation = f"""PIONEER MACRO ROUTE DECISION:
+        """Create compressed observation text for Pioneer LLM decision - PROMPT OPTIMIZATION."""
+        # Compress vehicle and route info
+        v_id = str(decision_input['vehicle_id'])[-4:]  # Use last 4 chars of vehicle ID
+        s_reg = decision_input['start_region']
+        d_reg = decision_input['dest_region']
+        time_s = decision_input['current_time']
         
-        Vehicle: {decision_input['vehicle_id']}
-        Route: Region {decision_input['start_region']} -> Region {decision_input['dest_region']}
-        Time: {decision_input['current_time']:.1f}s
+        observation = f"V{v_id} R{s_reg}->R{d_reg} T{time_s:.0f}s\n\nCONG:"
         
-        REGIONAL CONGESTION STATUS:
-        """
+        # Compress congestion info - only show relevant regions
+        relevant_regions = set([s_reg, d_reg])
+        for route in decision_input['route_candidates']:
+            relevant_regions.update(route)
         
         for region_id, congestion in decision_input['regional_congestion'].items():
-            status = "HIGH" if congestion > 3.0 else "MEDIUM" if congestion > 1.5 else "LOW"
-            observation += f"Region {region_id}: {congestion:.3f} ({status})\n"
+            if region_id in relevant_regions:
+                status = "H" if congestion > 3.0 else "M" if congestion > 1.5 else "L"
+                observation += f" R{region_id}:{congestion:.1f}({status})"
         
-        observation += f"\nROUTE CANDIDATES:\n"
+        observation += f"\n\nOPTS:"
         for i, route in enumerate(decision_input['route_candidates']):
-            observation += f"{i+1}. {route}\n"
+            observation += f" {i+1}:{route}"
         
-        observation += f"\nGLOBAL STATE:\n"
-        observation += f"Total vehicles: {decision_input['global_state']['total_vehicles']}\n"
-        observation += f"Current ATT: {decision_input['global_state']['current_avg_travel_time']:.1f}s\n"
+        # Compress global state to essentials
+        observation += f"\n\nGLB: V{decision_input['global_state']['total_vehicles']} ATT{decision_input['global_state']['current_avg_travel_time']:.0f}s"
         
         return observation
     
@@ -1350,12 +1365,13 @@ class MultiAgentTrafficEnvironment:
                 pioneer_result['selected_route'], state_context
             )
             
-            # [Regional LLM Feedback Call]
-            observer_llm_result = self._call_regional_llm_observer(
-                vehicle_id, regional_context, pioneer_result, 
-                feasibility_score, efficiency_score, fairness_score,
-                improvements, conflicts, current_time
-            )
+            # [Regional LLM Feedback Call] (带锁保护)
+            with self.llm_call_lock:
+                observer_llm_result = self._call_regional_llm_observer(
+                    vehicle_id, regional_context, pioneer_result, 
+                    feasibility_score, efficiency_score, fairness_score,
+                    improvements, conflicts, current_time
+                )
             
             # [Compile Observer Result]
             observer_result = {
@@ -1561,7 +1577,10 @@ class MultiAgentTrafficEnvironment:
             
             if decisions and len(decisions) > 0:
                 decision = decisions[0]
-                acceptance = 'accept' in decision.get('answer', 'accept').lower()
+                answer = decision.get('answer', 'accept')
+                # Safe handling of potentially None answer
+                answer_str = str(answer).lower() if answer is not None else 'accept'
+                acceptance = 'accept' in answer_str
                 
                 return {
                     'acceptance': acceptance,

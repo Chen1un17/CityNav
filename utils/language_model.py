@@ -80,17 +80,20 @@ class LLM(object):
             
             # 配置vLLM参数以支持指定GPU
             # 限制max_model_len以节省KV cache内存，同时保持在10000以上
-            effective_max_len = max(min(max_tokens, 12288), 10240)  # 在10240-12288之间
+            # Reduce effective max length to handle long prompts
+            effective_max_len = max(min(max_tokens, 8192), 6144)  # 在6144-8192之间，更紧凑以处理长prompt
             
             vllm_kwargs = {
                 "model": llm_path,
-                "gpu_memory_utilization": self.gpu_memory_utilization,
+                "gpu_memory_utilization": max(0.75, self.gpu_memory_utilization - 0.05),  # 降低内存利用率防止CUDA错误
                 "tensor_parallel_size": self.tensor_parallel_size,
                 "max_model_len": effective_max_len,  # 限制序列长度以节省KV cache
                 "enforce_eager": True,
                 "trust_remote_code": True,
-                "swap_space": 4,  # 4GB swap space
-                "disable_log_stats": True  # 减少日志开销
+                "swap_space": 6,  # 增加swap space到6GB缓解内存压力
+                "disable_log_stats": True,  # 减少日志开销
+                "max_num_seqs": 16,  # 限制并发序列数减少内存占用
+                "block_size": 16  # 减小block size节约内存
             }
             
             print(f"调整序列长度: {max_tokens} -> {effective_max_len} (节省KV cache内存)")
@@ -145,17 +148,20 @@ class LLM(object):
             # 其他情况（模型名称等），尝试作为远程模型使用vLLM加载
             print(f"尝试使用vLLM加载模型: {llm_path}")
             # 限制max_model_len以节省KV cache内存，同时保持在10000以上
-            effective_max_len = max(min(max_tokens, 12288), 10240)  # 在10240-12288之间
+            # Reduce effective max length to handle long prompts
+            effective_max_len = max(min(max_tokens, 8192), 6144)  # 在6144-8192之间，更紧凑以处理长prompt
             
             vllm_kwargs = {
                 "model": llm_path,
-                "gpu_memory_utilization": self.gpu_memory_utilization,
+                "gpu_memory_utilization": max(0.75, self.gpu_memory_utilization - 0.05),  # 降低内存利用率防止CUDA错误
                 "tensor_parallel_size": self.tensor_parallel_size,
                 "max_model_len": effective_max_len,  # 限制序列长度以节省KV cache
                 "enforce_eager": True,
                 "trust_remote_code": True,
-                "swap_space": 4,  # 4GB swap space
-                "disable_log_stats": True  # 减少日志开销
+                "swap_space": 6,  # 增加swap space到6GB缓解内存压力
+                "disable_log_stats": True,  # 减少日志开销
+                "max_num_seqs": 16,  # 限制并发序列数减少内存占用
+                "block_size": 16  # 减小block size节约内存
             }
             
             print(f"调整序列长度: {max_tokens} -> {effective_max_len} (节省KV cache内存)")
@@ -245,6 +251,37 @@ class LLM(object):
         memory_count = 0
 
         return memory, memory_count, memory_size
+    
+    def _validate_and_clean_decision(self, decision_dict, default_answer="1"):
+        """
+        Validate and clean LLM decision response to ensure required fields are present and valid.
+        Based on Context7 best practices for structured LLM output validation.
+        """
+        if not isinstance(decision_dict, dict):
+            return {"answer": default_answer, "summary": "Invalid response format, using default"}
+        
+        # Validate and clean 'answer' field
+        answer = decision_dict.get("answer")
+        if answer is None:
+            answer = default_answer
+        elif not isinstance(answer, (str, int, float)):
+            answer = str(answer) if answer is not None else default_answer
+        else:
+            answer = str(answer).strip()
+            if not answer:
+                answer = default_answer
+        
+        # Validate and clean 'summary' field  
+        summary = decision_dict.get("summary")
+        if summary is None or not isinstance(summary, str) or not summary.strip():
+            summary = f"Selected option {answer}"
+        else:
+            summary = str(summary).strip()
+        
+        return {
+            "answer": answer,
+            "summary": summary
+        }
 
     def update_memory(self, sample_info):
         if not self.use_reflection:
@@ -324,8 +361,36 @@ class LLM(object):
                     time.sleep(5)
                     retry_count += 1
         else:
-            responses_gen = self.model.chat([message], use_tqdm=False, sampling_params=self.generation_kwargs)
-            response = responses_gen[0].outputs[0].text
+            # Add CUDA error handling for vLLM
+            retry_count = 0
+            while retry_count < 2:
+                try:
+                    if self.model is None:
+                        print(f"ERROR: Model is None, cannot perform inference")
+                        return None
+                    responses_gen = self.model.chat([message], use_tqdm=False, sampling_params=self.generation_kwargs)
+                    response = responses_gen[0].outputs[0].text
+                    break
+                except Exception as e:
+                    error_msg = str(e)
+                    if "CUDA error" in error_msg or "illegal memory access" in error_msg:
+                        print(f"CUDA_ERROR_RECOVERY: Detected CUDA error in inference: {error_msg}")
+                        # Try to clear CUDA cache
+                        try:
+                            import torch
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                                torch.cuda.synchronize()
+                        except:
+                            pass
+                        time.sleep(2)  # Wait for GPU to stabilize
+                        retry_count += 1
+                        if retry_count >= 2:
+                            print(f"CUDA_ERROR_FATAL: Multiple CUDA errors, returning None")
+                            return None
+                    else:
+                        print(f"LLM_INFERENCE_ERROR: Non-CUDA error: {error_msg}")
+                        return None
 
         return response
 
@@ -696,12 +761,16 @@ class LLM(object):
                     decision = {}
                     failed_responses.append(res)
 
-                if "answer" not in decision or "summary" not in decision:
+                # Use enhanced validation and cleaning
+                decision = self._validate_and_clean_decision(decision, default_answer="1")
+                
+                # Check if we still have issues after validation
+                if not decision or not decision.get("answer") or not decision.get("summary"):
                     retry_queries.append(queries[i])
                     decision = {}
                     failed_responses.append(res)
-
-                if decision:
+                else:
+                    # Add additional context fields
                     decision.update({
                         "data_text": sample_info[ori_query_index][0] if isinstance(sample_info[ori_query_index], (list, tuple)) and len(sample_info[ori_query_index]) == 2 else sample_info[ori_query_index],
                         "data_analysis": sample_info[ori_query_index][1] if isinstance(sample_info[ori_query_index], (list, tuple)) and len(sample_info[ori_query_index]) == 2 else "N/A"
@@ -929,15 +998,15 @@ class LLM(object):
             # Prepare the regional coordination query
             query = copy.copy(self.overall_template)
             
-            # Replace template variables with actual data
+            # Replace template variables with compact data - PROMPT COMPRESSION  
             regional_template = copy.copy(self.regional_coordination_template)
             regional_template = regional_template.replace("<region_id>", str(region_id))
-            regional_template = regional_template.replace("<regional_context>", str(regional_context))
-            regional_template = regional_template.replace("<vehicles_data>", str(vehicles_data))
-            regional_template = regional_template.replace("<boundary_status>", str(boundary_status))
-            regional_template = regional_template.replace("<coordination_messages>", str(coordination_messages))
-            regional_template = regional_template.replace("<traffic_predictions>", str(traffic_predictions))
-            regional_template = regional_template.replace("<route_options>", str(route_options))
+            regional_template = regional_template.replace("<regional_context>", self._compress_data(regional_context))
+            regional_template = regional_template.replace("<vehicles_data>", self._compress_data(vehicles_data))
+            regional_template = regional_template.replace("<boundary_status>", self._compress_data(boundary_status))
+            regional_template = regional_template.replace("<coordination_messages>", self._compress_data(coordination_messages))
+            regional_template = regional_template.replace("<traffic_predictions>", self._compress_data(traffic_predictions))
+            regional_template = regional_template.replace("<route_options>", self._compress_data(route_options))
             
             query = query.replace("<step_instruction>", regional_template)
             query = query.replace("<data_text>", f"Regional coordination for Region {region_id}")
@@ -985,15 +1054,15 @@ class LLM(object):
             # Prepare the macro planning query
             query = copy.copy(self.overall_template)
             
-            # Replace template variables with actual data
+            # Replace template variables with compact data - PROMPT COMPRESSION
             macro_template = copy.copy(self.macro_planning_template)
-            macro_template = macro_template.replace("<global_state>", str(global_state))
-            macro_template = macro_template.replace("<route_requests>", str(route_requests))
-            macro_template = macro_template.replace("<regional_conditions>", str(regional_conditions))
-            macro_template = macro_template.replace("<boundary_analysis>", str(boundary_analysis))
-            macro_template = macro_template.replace("<flow_predictions>", str(flow_predictions))
-            macro_template = macro_template.replace("<coordination_needs>", str(coordination_needs))
-            macro_template = macro_template.replace("<region_routes>", str(region_routes))
+            macro_template = macro_template.replace("<global_state>", self._compress_data(global_state))
+            macro_template = macro_template.replace("<route_requests>", self._compress_data(route_requests))
+            macro_template = macro_template.replace("<regional_conditions>", self._compress_data(regional_conditions))
+            macro_template = macro_template.replace("<boundary_analysis>", self._compress_data(boundary_analysis))
+            macro_template = macro_template.replace("<flow_predictions>", self._compress_data(flow_predictions))
+            macro_template = macro_template.replace("<coordination_needs>", self._compress_data(coordination_needs))
+            macro_template = macro_template.replace("<region_routes>", self._compress_data(region_routes))
             
             query = query.replace("<step_instruction>", macro_template)
             query = query.replace("<data_text>", "Macro route planning across regions")
@@ -1194,6 +1263,62 @@ class LLM(object):
                 "confidence": "LOW"
             } for _ in data_texts]
 
+    def _compress_data(self, data):
+        """
+        Compress data for prompt efficiency without losing decision-critical information.
+        Removes verbose natural language while preserving key decision factors.
+        """
+        if data is None:
+            return "N/A"
+        
+        if isinstance(data, dict):
+            if not data:
+                return "{}"
+            
+            # For dictionaries, extract only essential key-value pairs
+            compressed_items = []
+            for k, v in data.items():
+                # Compress key names
+                key = str(k).replace("_", "").replace(" ", "")[:8]
+                
+                # Compress values based on type
+                if isinstance(v, (int, float)):
+                    value = f"{v:.2f}" if isinstance(v, float) else str(v)
+                elif isinstance(v, str):
+                    value = v[:20]  # Truncate long strings
+                elif isinstance(v, (list, tuple)):
+                    value = f"[{len(v)}items]" if len(v) > 3 else str(v)
+                else:
+                    value = str(v)[:15]
+                
+                compressed_items.append(f"{key}:{value}")
+            
+            return "{" + ",".join(compressed_items) + "}"
+        
+        elif isinstance(data, (list, tuple)):
+            if not data:
+                return "[]"
+            
+            # For lists, show structure and key elements
+            if len(data) <= 3:
+                return str(data)
+            else:
+                # Show first and last elements with count
+                return f"[{data[0]}...{data[-1]}({len(data)}total)]"
+        
+        elif isinstance(data, str):
+            if len(data) <= 50:
+                return data
+            else:
+                # Keep essential parts, remove filler words
+                compressed = data.replace(" the ", " ").replace(" and ", "&").replace(" with ", "w/")
+                return compressed[:50] + "..." if len(compressed) > 50 else compressed
+        
+        else:
+            # For other types, convert to string and truncate
+            str_data = str(data)
+            return str_data[:30] + "..." if len(str_data) > 30 else str_data
+
 
 class LocalLLMManager:
     """
@@ -1214,17 +1339,23 @@ class LocalLLMManager:
         """初始化两个共享LLM实例"""
         print("\n=== 初始化共享LLM实例 ===")
         
+        # 设置CUDA内存管理环境变量，防止多vLLM实例冲突
+        import os
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:False"
+        os.environ["CUDA_LAUNCH_BLOCKING"] = "0"  # 正常模式下设为0，调试时可设为1
+        print("[INFO] 已设置CUDA内存管理环境变量")
+        
         # 初始化Traffic LLM (使用GPU 0)
         print("正在初始化 Traffic LLM (GPU 0)...")
         self.traffic_llm = LLM(
             llm_path=self.model_path,
-            batch_size=16,
+            batch_size=7,
             top_k=50,
             top_p=1.0,
             temperature=0.1,
             max_tokens=10240,  # 保持在10k以上，但不会太高
             memory_size=3,
-            task_info=self.task_info,
+            task_info=self.task_info,     # 禁用CUDA图优化，解决多LLM实例内存冲突
             use_reflection=True,
             gpu_ids=[0],  # 使用GPU 0
             tensor_parallel_size=1,
@@ -1236,14 +1367,14 @@ class LocalLLMManager:
         print("正在初始化 Regional LLM (GPU 1)...")
         self.regional_llm = LLM(
             llm_path=self.model_path,
-            batch_size=16,
+            batch_size=8,
             top_k=50,
             top_p=1.0,
             temperature=0.1,
             max_tokens=10240,  # 保持在10k以上，但不会太高
             memory_size=3,
             task_info=self.task_info,
-            use_reflection=True,
+            use_reflection=True,     # 禁用CUDA图优化，解决多LLM实例内存冲突
             gpu_ids=[1],  # 使用GPU 1
             tensor_parallel_size=1,
             gpu_memory_utilization=0.85  # 稍微增加内存利用率

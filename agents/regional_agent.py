@@ -505,11 +505,14 @@ class RegionalAgent:
                 vehicle_id, current_edge, route_candidates, target_region, current_time
             )
             
-            # Create answer options for LLM with validation
-            answer_options = "/".join([
-                str(candidate['boundary_edge']) for candidate in route_candidates
-                if candidate.get('boundary_edge') is not None
-            ])
+            # Create answer options as option numbers for LLM with validation
+            valid_candidates = [candidate for candidate in route_candidates if candidate.get('boundary_edge') is not None]
+            if not valid_candidates:
+                self.logger.log_error(f"REGIONAL_ROUTING: No valid candidates for {vehicle_id}")
+                return route_candidates[0] if route_candidates else None
+            
+            # Use option indices (1, 2, 3, etc.) instead of boundary edge IDs
+            answer_options = "/".join([str(i+1) for i in range(len(valid_candidates))])
             
             if not answer_options:
                 self.logger.log_error(f"REGIONAL_ROUTING: No valid answer options for {vehicle_id}")
@@ -527,55 +530,47 @@ class RegionalAgent:
                     [observation_text], [answer_options]
                 )
                 
-                # Robust response validation and processing
+                # Simplified option-index based response processing
                 if decisions and len(decisions) > 0 and isinstance(decisions[0], dict) and 'answer' in decisions[0]:
                     llm_answer = decisions[0]['answer']
                     
-                    # Enhanced LLM response processing: prioritize edge ID matching over index mapping
-                    if llm_answer is None:
-                        selected_boundary = route_candidates[0]['boundary_edge']
-                        reasoning = 'LLM returned None answer, using fallback'
-                    else:
-                        # Convert to string for processing
-                        answer_str = str(llm_answer).strip().strip('"\'') if llm_answer else ""
-                        
-                        # Strategy 1: Direct boundary edge ID match (primary method)
-                        selected_boundary = None
-                        for candidate in route_candidates:
-                            if str(candidate['boundary_edge']) == answer_str:
-                                selected_boundary = candidate['boundary_edge']
-                                break
-                        
-                        # Strategy 2: If no direct match, try option index mapping
-                        if selected_boundary is None and isinstance(llm_answer, (int, float)):
-                            try:
-                                option_index = int(llm_answer)
-                                if 1 <= option_index <= len(route_candidates):
-                                    selected_boundary = route_candidates[option_index - 1]['boundary_edge']
-                            except (ValueError, IndexError, TypeError):
-                                pass
-                        
-                        # Strategy 3: Try option index from string
-                        if selected_boundary is None and answer_str.isdigit():
-                            try:
-                                option_index = int(answer_str)
-                                if 1 <= option_index <= len(route_candidates):
-                                    selected_boundary = route_candidates[option_index - 1]['boundary_edge']
-                            except (ValueError, IndexError):
-                                pass
-                        
-                        # Fallback: use best candidate
-                        if selected_boundary is None:
-                            selected_boundary = route_candidates[0]['boundary_edge']
-                            self.logger.log_warning(f"REGIONAL_ROUTING: No match found for LLM answer '{answer_str}', using fallback")
+                    # Parse option index from LLM response
+                    selected_boundary = None
+                    reasoning = 'LLM regional route decision'
                     
-                    reasoning = decisions[0].get('summary', 'LLM regional route decision')
-                    if not isinstance(reasoning, str):
-                        reasoning = str(reasoning) if reasoning is not None else 'LLM regional route decision'
+                    if llm_answer is not None:
+                        try:
+                            # Convert answer to integer option index
+                            if isinstance(llm_answer, (int, float)):
+                                option_index = int(llm_answer)
+                            elif isinstance(llm_answer, str) and llm_answer.strip().isdigit():
+                                option_index = int(llm_answer.strip())
+                            else:
+                                raise ValueError(f"Invalid option format: {llm_answer}")
+                            
+                            # Validate option index range
+                            if 1 <= option_index <= len(valid_candidates):
+                                selected_boundary = valid_candidates[option_index - 1]['boundary_edge']
+                                reasoning = decisions[0].get('summary', f'Selected option {option_index}')
+                                if not isinstance(reasoning, str):
+                                    reasoning = str(reasoning) if reasoning is not None else f'Selected option {option_index}'
+                            else:
+                                self.logger.log_warning(f"REGIONAL_ROUTING: Option index {option_index} out of range [1, {len(valid_candidates)}] for {vehicle_id}")
+                                selected_boundary = valid_candidates[0]['boundary_edge']
+                                reasoning = f'Option index out of range, using fallback (option 1)'
+                                
+                        except (ValueError, TypeError) as e:
+                            self.logger.log_warning(f"REGIONAL_ROUTING: Invalid LLM answer '{llm_answer}' for {vehicle_id}: {e}")
+                            selected_boundary = valid_candidates[0]['boundary_edge']
+                            reasoning = f'Invalid LLM response format, using fallback (option 1)'
+                    else:
+                        self.logger.log_warning(f"REGIONAL_ROUTING: LLM returned None answer for {vehicle_id}")
+                        selected_boundary = valid_candidates[0]['boundary_edge']
+                        reasoning = 'LLM returned None answer, using fallback (option 1)'
                 else:
                     # LLM response validation failed
-                    selected_boundary = route_candidates[0]['boundary_edge']
-                    reasoning = 'Invalid LLM response structure, using fallback'
+                    selected_boundary = valid_candidates[0]['boundary_edge'] if valid_candidates else route_candidates[0]['boundary_edge']
+                    reasoning = 'Invalid LLM response structure, using fallback (option 1)'
                     if decisions:
                         self.logger.log_warning(f"REGIONAL_ROUTING: Invalid LLM response: {type(decisions[0])}, len={len(decisions)}")
                     else:
@@ -652,6 +647,9 @@ class RegionalAgent:
         
         observation_parts.append("OBJECTIVE: Select the best route to the target region boundary")
         observation_parts.append("while minimizing travel time, congestion, and balancing edge utilization.")
+        observation_parts.append("")
+        observation_parts.append("IMPORTANT: You must respond with ONLY the option number (1, 2, 3, etc.)")
+        observation_parts.append("Do NOT return route descriptions or boundary edge IDs.")
         
         return "\n".join(observation_parts)
     

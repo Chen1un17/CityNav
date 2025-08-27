@@ -17,7 +17,7 @@ import os
 import sys
 from datetime import datetime
 os.environ["WANDB_MODE"] = "offline"
-os.environ["VLLM_USE_V1"] = "0"
+# os.environ["VLLM_USE_V1"] = "0"
 from main import main
 
 
