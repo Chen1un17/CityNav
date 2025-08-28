@@ -189,7 +189,7 @@ def run_with_training():
     batch_size = 4  # Reduced batch for training mode to save memory
     location = "Manhattan"
     step_size = 180.0  # 3-minute decision intervals
-    max_steps = 21600  # 3 hours simulation (sufficient for training data collection)
+    max_steps = 43200  # 3 hours simulation (sufficient for training data collection)
     use_local_llm = True  # 必须使用本地LLM
     enable_training = True  # 启用训练
     
