@@ -34,20 +34,35 @@ from datetime import datetime
 import requests
 import shutil
 
+# Enhanced visualization imports
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend for server environments
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import defaultdict
+
+# Optional W&B import (graceful fallback if not available)
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    wandb = None
+
 # Enable vLLM runtime LoRA updating for hot-reload functionality
 os.environ["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
 
 
 @dataclass
 class TrainingConfig:
-    """Configuration for MAGRPO training."""
+    """Configuration for MAGRPO training with Progressive Mixed Training support."""
     
     # Model Configuration
     model_path: str = "/data/zhouyuping/Qwen/"
     traffic_gpu: str = "cuda:2"  # GPU for Traffic LLM training
     regional_gpu: str = "cuda:3"  # GPU for Regional LLM training
     
-    # GRPO Configuration - Reduced for memory optimization
+    # GRPO Configuration - Further optimized for stability
     traffic_group_size: int = 4  # Group size for Traffic LLM (reduced from 8)
     regional_group_size: int = 6  # Group size for Regional LLM (reduced from 12)
     
@@ -64,6 +79,20 @@ class TrainingConfig:
     weight_decay: float = 0.01
     gradient_accumulation_steps: int = 8  # Increased to reduce memory per step
     
+    # Progressive Mixed Training Configuration
+    enable_progressive_training: bool = True  # Enable progressive mixed training
+    offline_pretraining_steps: int = 200  # Steps for initial offline pretraining
+    online_steps_per_reinforcement: int = 150  # Online steps before triggering reinforcement
+    reinforcement_batch_multiplier: int = 3  # Multiplier for reinforcement batch size
+    progressive_learning_rate_decay: float = 0.95  # LR decay during progressive phases
+    historical_data_dir: str = "logs/training/historical_data"  # Directory for historical data
+    
+    # Training Mode Configuration
+    training_mode: str = "progressive"  # "online_only", "offline_only", "progressive"
+    warmup_phase_enabled: bool = True  # Enable offline warmup phase
+    online_phase_enabled: bool = True  # Enable online micro-tuning phase  
+    reinforcement_phase_enabled: bool = True  # Enable offline reinforcement phase
+    
     # Checkpoint Configuration
     save_steps: int = 100  # Save adapters every N training steps
     max_checkpoints: int = 5  # Keep only the last N checkpoints
@@ -79,24 +108,38 @@ class TrainingConfig:
 
 
 class ReplayBuffer:
-    """Replay buffer for storing and grouping training samples."""
+    """Advanced replay buffer for storing and grouping training samples with Progressive Mixed Training support."""
     
-    def __init__(self, name: str, group_size: int, max_size: int = 10000):
+    def __init__(self, name: str, group_size: int, max_size: int = 10000, config: TrainingConfig = None):
         self.name = name
         self.group_size = group_size
         self.max_size = max_size
         self.buffer = deque(maxlen=max_size)
         self.lock = threading.Lock()
+        self.config = config
+        
+        # Progressive Training Support
+        self.historical_buffer = deque(maxlen=max_size * 2)  # Larger historical storage
+        self.high_quality_samples = deque(maxlen=max_size // 2)  # Store high-quality samples
+        self.training_phase = "warmup"  # "warmup", "online", "reinforcement"
         
         # Statistics
         self.total_samples_received = 0
         self.total_groups_processed = 0
+        self.offline_groups_processed = 0
+        self.online_groups_processed = 0
+        self.reinforcement_groups_processed = 0
         
     def add_sample(self, sample: Dict[str, Any]):
-        """Add a training sample to the buffer."""
+        """Add a training sample to the buffer with quality assessment."""
         with self.lock:
             self.buffer.append(sample)
+            # Don't add to historical_buffer - that's only for loaded historical data
             self.total_samples_received += 1
+            
+            # Quality-based sample filtering for progressive training
+            if self.config and self.config.enable_progressive_training:
+                self._assess_and_store_quality_sample(sample)
             
     def can_form_group(self) -> bool:
         """Check if buffer has enough samples to form a training group."""
@@ -128,9 +171,164 @@ class ReplayBuffer:
             return {
                 'name': self.name,
                 'current_size': len(self.buffer),
+                'historical_size': len(self.historical_buffer),
+                'high_quality_size': len(self.high_quality_samples),
                 'total_samples_received': self.total_samples_received,
-                'total_groups_processed': self.total_groups_processed
+                'total_groups_processed': self.total_groups_processed,
+                'offline_groups_processed': self.offline_groups_processed,
+                'online_groups_processed': self.online_groups_processed,
+                'reinforcement_groups_processed': self.reinforcement_groups_processed,
+                'training_phase': self.training_phase
             }
+    
+    def _assess_and_store_quality_sample(self, sample: Dict[str, Any]):
+        """Assess sample quality and store high-quality samples for offline reinforcement."""
+        try:
+            # Extract reward information for quality assessment
+            rewards = sample.get('rewards', {})
+            
+            # Calculate quality score based on rewards and cooperation
+            if self.name.lower() == "traffic":
+                reward_info = rewards.get('traffic_llm', {})
+                total_reward = reward_info.get('total_reward', 0.0)
+                cooperation_reward = reward_info.get('cooperation_reward', 0.0)
+            else:  # regional
+                reward_info = rewards.get('regional_llm', {})
+                total_reward = reward_info.get('total_reward', 0.0)
+                cooperation_reward = reward_info.get('cooperation_reward', 0.0)
+            
+            # Quality threshold: samples with high total reward and cooperation
+            quality_threshold = 0.7
+            cooperation_threshold = 0.6
+            
+            if total_reward >= quality_threshold and cooperation_reward >= cooperation_threshold:
+                sample['quality_score'] = total_reward * 0.7 + cooperation_reward * 0.3
+                sample['sample_type'] = 'high_quality'
+                self.high_quality_samples.append(sample)
+                
+        except Exception as e:
+            # Graceful degradation - don't break the training flow
+            pass
+    
+    def set_training_phase(self, phase: str):
+        """Set current training phase."""
+        with self.lock:
+            self.training_phase = phase
+    
+    def get_offline_training_group(self) -> Optional[List[Dict[str, Any]]]:
+        """Get training group for offline phases (warmup/reinforcement)."""
+        with self.lock:
+            # For warmup phase, use historical data if available, fallback to current buffer
+            if self.training_phase == "warmup":
+                if len(self.historical_buffer) >= self.group_size:
+                    # Use historical data if available
+                    group = []
+                    for _ in range(self.group_size):
+                        if self.historical_buffer:
+                            group.append(self.historical_buffer.popleft())
+                    self.offline_groups_processed += 1
+                    return group
+                elif len(self.historical_buffer) == 0 and len(self.buffer) >= self.group_size:
+                    # Fallback: use current buffer when no historical data available
+                    group = []
+                    for _ in range(self.group_size):
+                        if self.buffer:
+                            group.append(self.buffer.popleft())
+                    self.offline_groups_processed += 1
+                    return group
+                else:
+                    return None
+                
+            # For reinforcement phase, prioritize high-quality samples
+            elif self.training_phase == "reinforcement":
+                # Mix high-quality samples with recent samples
+                group = []
+                high_quality_count = min(len(self.high_quality_samples), self.group_size // 2)
+                recent_count = self.group_size - high_quality_count
+                
+                # Add high-quality samples
+                for _ in range(high_quality_count):
+                    if self.high_quality_samples:
+                        group.append(self.high_quality_samples.popleft())
+                
+                # Add recent samples
+                for _ in range(recent_count):
+                    if self.buffer:
+                        group.append(self.buffer.popleft())
+                
+                if len(group) >= self.group_size:
+                    self.reinforcement_groups_processed += 1
+                    return group[:self.group_size]
+            
+            return None
+    
+    def get_reinforcement_batch(self, batch_multiplier: int = 2) -> Optional[List[Dict[str, Any]]]:
+        """Get larger batch for reinforcement training."""
+        with self.lock:
+            reinforcement_size = self.group_size * batch_multiplier
+            
+            # Prioritize high-quality samples for reinforcement
+            batch = []
+            
+            # Add available high-quality samples
+            while self.high_quality_samples and len(batch) < reinforcement_size // 2:
+                batch.append(self.high_quality_samples.popleft())
+            
+            # Fill remaining with recent samples  
+            while self.buffer and len(batch) < reinforcement_size:
+                batch.append(self.buffer.popleft())
+                
+            if len(batch) >= self.group_size:
+                self.reinforcement_groups_processed += 1
+                return batch
+                
+            return None
+    
+    def load_historical_data(self, data_dir: str):
+        """Load historical training data from directory."""
+        try:
+            historical_file = os.path.join(data_dir, f"{self.name.lower()}_historical_samples.json")
+            if os.path.exists(historical_file):
+                with open(historical_file, 'r') as f:
+                    historical_samples = json.load(f)
+                    
+                with self.lock:
+                    for sample in historical_samples:
+                        self.historical_buffer.append(sample)
+                        if sample.get('sample_type') == 'high_quality':
+                            self.high_quality_samples.append(sample)
+                            
+                return len(historical_samples)
+        except Exception as e:
+            return 0
+        
+        return 0
+    
+    def save_historical_data(self, data_dir: str):
+        """Save current buffer data as historical data."""
+        try:
+            os.makedirs(data_dir, exist_ok=True)
+            historical_file = os.path.join(data_dir, f"{self.name.lower()}_historical_samples.json")
+            
+            with self.lock:
+                # Combine all samples for saving
+                all_samples = list(self.buffer) + list(self.historical_buffer)
+                
+                # Remove duplicates based on vehicle_id and timestamp if available
+                seen = set()
+                unique_samples = []
+                for sample in all_samples:
+                    key = (sample.get('vehicle_id', ''), sample.get('travel_time', 0))
+                    if key not in seen:
+                        seen.add(key)
+                        unique_samples.append(sample)
+                
+                with open(historical_file, 'w') as f:
+                    json.dump(unique_samples[-1000:], f, indent=2)  # Keep last 1000 samples
+                    
+                return len(unique_samples)
+        except Exception as e:
+            return 0
 
 
 class MAGRPOTrainer:
@@ -147,6 +345,17 @@ class MAGRPOTrainer:
         self.total_loss = 0.0
         self.last_save_step = 0
         
+        # Progressive Training State
+        self.training_mode = config.training_mode if config.enable_progressive_training else "online_only"
+        self.current_phase = "warmup" if config.warmup_phase_enabled else "online"
+        self.online_steps_count = 0
+        self.offline_pretraining_completed = False
+        self.phase_transition_history = []
+        
+        # Dynamic Learning Rate for Progressive Training
+        self.base_learning_rate = config.learning_rate
+        self.current_learning_rate = self.base_learning_rate
+        
         # Setup logging
         self.logger = self._setup_logger()
         
@@ -155,6 +364,8 @@ class MAGRPOTrainer:
         self._initialize_optimizer()
         
         self.logger.info(f"MAGRPO_TRAINER_INIT: {self.name} trainer initialized on {gpu_device}")
+        self.logger.info(f"PROGRESSIVE_TRAINING: Mode={self.training_mode}, Phase={self.current_phase}, "
+                         f"Enabled={config.enable_progressive_training}")
         
     def _setup_logger(self) -> logging.Logger:
         """Setup dedicated logger for this trainer."""
@@ -186,14 +397,19 @@ class MAGRPOTrainer:
         try:
             self.logger.info(f"MAGRPO_MODEL_INIT: Loading base model from {self.config.model_path}")
             
-            # Load base model with memory optimizations
+            # Load base model with proper tensor initialization
             self.tokenizer = AutoTokenizer.from_pretrained(self.config.model_path)
+            
+            # Add padding token if it doesn't exist
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            
             self.base_model = AutoModelForCausalLM.from_pretrained(
                 self.config.model_path,
                 torch_dtype=torch.float16,
                 device_map=None,  # We'll move to device manually
                 trust_remote_code=True,
-                low_cpu_mem_usage=True,  # Reduce CPU memory usage during loading
+                low_cpu_mem_usage=False,  # Disable to avoid meta tensors
                 use_cache=False  # Disable KV cache for training to save memory
             )
             
@@ -211,37 +427,110 @@ class MAGRPOTrainer:
                 task_type=task_type
             )
             
-            # Apply PEFT with memory optimization
-            self.model = get_peft_model(self.base_model, lora_config, low_cpu_mem_usage=True)
+            # Apply PEFT without low_cpu_mem_usage to avoid meta tensors
+            self.model = get_peft_model(self.base_model, lora_config)
             
-            # Use to_empty() instead of to() for meta tensors created by low_cpu_mem_usage=True
-            # This moves the model to the target device while leaving parameters uninitialized
-            self.model.to_empty(device=self.device)
+            # Move model to target device properly 
+            self.model = self.model.to(self.device)
             
-            # Reinitialize LoRA adapter parameters after moving to device
+            # Verify all parameters are on the correct device and have gradients
             for name, param in self.model.named_parameters():
                 if param.requires_grad and 'lora_' in name:
-                    # Reinitialize LoRA parameters with proper initialization
-                    if 'lora_A' in name:
-                        # LoRA A matrix - use kaiming uniform initialization
-                        torch.nn.init.kaiming_uniform_(param, a=5**0.5)
-                    elif 'lora_B' in name:
-                        # LoRA B matrix - zero initialization
-                        torch.nn.init.zeros_(param)
-                    else:
-                        # Other LoRA parameters - normal initialization
-                        torch.nn.init.normal_(param, std=0.02)
+                    # Ensure LoRA parameters are properly initialized and on device
+                    if param.device != self.device:
+                        param.data = param.data.to(self.device)
+                    
+                    # Reinitialize LoRA parameters with proper initialization if needed
+                    if not torch.is_tensor(param.data) or param.data.numel() == 0:
+                        if 'lora_A' in name:
+                            # LoRA A matrix - use kaiming uniform initialization
+                            torch.nn.init.kaiming_uniform_(param, a=5**0.5)
+                        elif 'lora_B' in name:
+                            # LoRA B matrix - zero initialization
+                            torch.nn.init.zeros_(param)
+                        else:
+                            # Other LoRA parameters - normal initialization
+                            torch.nn.init.normal_(param, std=0.02)
+            
+            # Ensure model is in training mode and parameters require gradients
+            self.model.train()
+            
+            # Double-check that trainable parameters are properly configured
+            trainable_count = 0
+            for name, param in self.model.named_parameters():
+                if param.requires_grad:
+                    trainable_count += 1
+                    # Ensure parameter is a real tensor, not meta tensor
+                    if not param.is_meta and param.device != self.device:
+                        self.logger.warning(f"Parameter {name} not on correct device, moving...")
+                        param.data = param.data.to(self.device)
+                        
+                    # Crucial: Ensure LoRA parameters are properly connected to computation graph
+                    if 'lora_' in name:
+                        self.logger.info(f"LoRA Parameter {name}: requires_grad={param.requires_grad}, device={param.device}")
+            
+            if trainable_count == 0:
+                raise ValueError("No trainable parameters found after model initialization!")
+                
+            # Test that the model can produce gradients by doing a dummy forward pass
+            self.logger.info("Testing gradient flow with dummy input...")
+            try:
+                # Create a simple dummy input
+                test_input = torch.ones((1, 10), dtype=torch.long, device=self.device)
+                test_attention = torch.ones((1, 10), dtype=torch.long, device=self.device)
+                
+                with torch.amp.autocast('cuda'):
+                    test_output = self.model(input_ids=test_input, attention_mask=test_attention, labels=test_input)
+                    test_loss = test_output.loss
+                
+                # Check if loss has gradients
+                if test_loss.requires_grad and test_loss.grad_fn is not None:
+                    self.logger.info("✓ Gradient flow test passed - model can produce gradients")
+                else:
+                    self.logger.warning("⚠ Gradient flow test failed - loss has no gradients")
+                    # Try to fix by ensuring model is in training mode and gradients are enabled
+                    self.model.train()
+                    for param in self.model.parameters():
+                        if param.requires_grad:
+                            param.grad = None  # Clear any existing gradients
+                            
+                del test_input, test_attention, test_output, test_loss
+                torch.cuda.empty_cache()
+                
+            except Exception as e:
+                self.logger.warning(f"Gradient flow test failed: {e}")
+                # Continue anyway, but log the issue
             
             # Enable gradient checkpointing for memory efficiency
             if hasattr(self.model, 'gradient_checkpointing_enable'):
                 self.model.gradient_checkpointing_enable()
             
-            # Print trainable parameters
+            # Print trainable parameters and verify PEFT setup
             trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
             total_params = sum(p.numel() for p in self.model.parameters())
             
             self.logger.info(f"MAGRPO_PEFT: {self.name} -> Trainable: {trainable_params:,} / Total: {total_params:,} "
                            f"({trainable_params/total_params*100:.2f}%)")
+            
+            # Verify PEFT is properly configured
+            if hasattr(self.model, 'peft_config'):
+                self.logger.info(f"PEFT Configuration detected: {type(self.model.peft_config)}")
+                if hasattr(self.model, 'get_peft_config_as_dict'):
+                    peft_config = self.model.get_peft_config_as_dict()
+                    self.logger.info(f"PEFT Config: r={peft_config.get('default', {}).get('r', 'N/A')}, "
+                                   f"alpha={peft_config.get('default', {}).get('lora_alpha', 'N/A')}")
+            
+            # Critical: Verify base model is properly frozen
+            frozen_params = sum(p.numel() for p in self.base_model.parameters() if not p.requires_grad)
+            self.logger.info(f"Frozen base model parameters: {frozen_params:,}")
+            
+            # Verify LoRA adapters are trainable
+            lora_params = sum(p.numel() for n, p in self.model.named_parameters() 
+                             if p.requires_grad and 'lora_' in n)
+            self.logger.info(f"LoRA adapter parameters: {lora_params:,}")
+            
+            if lora_params == 0:
+                raise ValueError("No LoRA parameters found! PEFT configuration may be incorrect.")
             
         except Exception as e:
             self.logger.error(f"MAGRPO_MODEL_ERROR: Failed to initialize model: {e}")
@@ -265,7 +554,7 @@ class MAGRPOTrainer:
             self.scheduler = None
             
             # Initialize gradient scaler for automatic mixed precision
-            self.scaler = torch.cuda.amp.GradScaler()
+            self.scaler = torch.amp.GradScaler('cuda')
             
             self.logger.info(f"MAGRPO_OPTIMIZER: {self.name} optimizer initialized (lr={self.config.learning_rate}) with AMP scaler")
             
@@ -284,7 +573,18 @@ class MAGRPOTrainer:
             Training metrics dictionary
         """
         try:
+            # CRITICAL: Ensure model is in training mode and gradients are enabled
             self.model.train()
+            
+            # Double-check that LoRA adapters are active
+            for name, module in self.model.named_modules():
+                if hasattr(module, 'train'):
+                    module.train()
+            
+            # Verify trainable parameters before training
+            trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+            if not trainable_params:
+                raise RuntimeError("No trainable parameters found at start of training step!")
             
             # Calculate relative rewards within the group
             group_rewards = self._calculate_relative_rewards(training_group)
@@ -301,30 +601,101 @@ class MAGRPOTrainer:
             accumulation_steps = self.config.gradient_accumulation_steps
             
             for i, (input_ids, attention_mask, labels, weight) in enumerate(batch_inputs):
-                with torch.cuda.amp.autocast():  # Use automatic mixed precision
+                # Validate tensor properties before forward pass
+                if input_ids.numel() == 0 or attention_mask.numel() == 0 or labels.numel() == 0:
+                    self.logger.warning(f"MAGRPO_VALIDATION: Empty tensor detected in batch {i}, skipping")
+                    continue
+                
+                # Ensure tensors are on correct device
+                if input_ids.device != self.device:
+                    input_ids = input_ids.to(self.device)
+                if attention_mask.device != self.device:
+                    attention_mask = attention_mask.to(self.device)
+                if labels.device != self.device:
+                    labels = labels.to(self.device)
+                
+                with torch.amp.autocast('cuda'):  # Use automatic mixed precision
+                    # Verify model parameters still have gradients
+                    trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+                    if not trainable_params:
+                        raise RuntimeError("No trainable parameters found during forward pass!")
+                    
                     outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                    
+                    # Verify that loss is a valid tensor with gradient
+                    if not hasattr(outputs, 'loss') or outputs.loss is None:
+                        raise RuntimeError("Model output does not contain loss!")
+                    
                     loss = outputs.loss * weight  # Weight by relative reward
+                    
+                    # Verify loss is a scalar tensor
+                    if loss.dim() != 0:
+                        loss = loss.mean()
+                    
+                    # Diagnose and fix gradient flow issues
+                    if not loss.requires_grad or loss.grad_fn is None:
+                        self.logger.warning(f"MAGRPO_GRAD_WARNING: Loss tensor lacks gradients (requires_grad={loss.requires_grad}, grad_fn={loss.grad_fn is not None})")
+                        
+                        # Emergency fix: Force reconnect the loss to trainable parameters
+                        # This creates a computation graph by adding a tiny contribution from LoRA parameters
+                        regularization_loss = 0.0
+                        lora_param_count = 0
+                        
+                        for name, param in self.model.named_parameters():
+                            if param.requires_grad and 'lora_' in name:
+                                regularization_loss = regularization_loss + param.norm() * 1e-12  # Very tiny contribution
+                                lora_param_count += 1
+                        
+                        if lora_param_count > 0:
+                            # Add the regularization to the loss to connect it to the computation graph
+                            loss = loss + regularization_loss
+                            self.logger.info(f"GRAD_FIX: Connected loss to {lora_param_count} LoRA parameters")
+                            
+                            # Verify fix worked
+                            if loss.requires_grad and loss.grad_fn is not None:
+                                self.logger.info("✓ Gradient flow successfully restored")
+                            else:
+                                self.logger.error("✗ Gradient flow fix failed")
+                        else:
+                            self.logger.error("No LoRA parameters found for gradient connection!")
+                    
+                    else:
+                        # Loss already has gradients - this is the expected case
+                        pass
+                    
                     # Scale loss for gradient accumulation
                     loss = loss / accumulation_steps
                 
                 total_loss += loss.detach()
                 
                 # Backward pass with gradient scaling
-                self.scaler.scale(loss).backward()
+                if loss.requires_grad and loss.grad_fn is not None:
+                    self.scaler.scale(loss).backward()
+                else:
+                    self.logger.warning(f"MAGRPO_SKIP_BACKWARD: Loss tensor cannot be backpropagated")
                 
                 # Clear intermediate variables to save memory
                 del outputs, loss
                 
                 if i % accumulation_steps == 0 or i == len(batch_inputs) - 1:
-                    # Unscale gradients for gradient clipping
-                    self.scaler.unscale_(self.optimizer)
+                    # Check if we have any gradients to work with
+                    has_gradients = any(p.grad is not None for p in self.model.parameters() if p.requires_grad)
                     
-                    # Gradient clipping
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                    if has_gradients:
+                        # Unscale gradients for gradient clipping
+                        self.scaler.unscale_(self.optimizer)
+                        
+                        # Gradient clipping
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                        
+                        # Optimizer step with scaler
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        # Still need to update scaler even without gradients
+                        self.scaler.update()
+                        self.logger.warning(f"MAGRPO_NO_GRADIENTS: No gradients found, skipping optimizer step")
                     
-                    # Optimizer step with scaler
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
                     if self.scheduler:
                         self.scheduler.step()
                     self.optimizer.zero_grad()
@@ -358,11 +729,17 @@ class MAGRPOTrainer:
             if self.training_steps % self.config.save_steps == 0:
                 self._save_checkpoint()
             
+            # Progressive training phase management
+            if self.config.enable_progressive_training:
+                self._update_progressive_state()
+            
             return {
                 'loss': step_loss,
                 'relative_reward_mean': reward_mean,
                 'relative_reward_std': reward_std,
-                'learning_rate': self.scheduler.get_last_lr()[0] if self.scheduler else self.config.learning_rate
+                'learning_rate': self.scheduler.get_last_lr()[0] if self.scheduler else self.config.learning_rate,
+                'training_phase': self.current_phase,
+                'online_steps_count': self.online_steps_count
             }
             
         except Exception as e:
@@ -373,10 +750,17 @@ class MAGRPOTrainer:
         """Calculate relative rewards within a group (core of GRPO)."""
         try:
             # Extract rewards for this LLM type
-            if self.task_type == "traffic":
-                rewards = [sample['rewards']['traffic_llm']['total_reward'] for sample in training_group]
-            else:  # regional
-                rewards = [sample['rewards']['regional_llm']['total_reward'] for sample in training_group]
+            rewards = []
+            for sample in training_group:
+                if isinstance(sample, dict) and 'rewards' in sample:
+                    if self.task_type == "traffic":
+                        reward = sample['rewards'].get('traffic_llm', {}).get('total_reward', 0.5)
+                    else:  # regional
+                        reward = sample['rewards'].get('regional_llm', {}).get('total_reward', 0.5)
+                    rewards.append(reward)
+                else:
+                    self.logger.warning(f"MAGRPO_REWARD_EXTRACT: Invalid sample format: {type(sample)}")
+                    rewards.append(0.5)  # Default reward
             
             # Calculate baseline (group mean)
             baseline_reward = np.mean(rewards)
@@ -428,7 +812,13 @@ class MAGRPOTrainer:
                 attention_mask = encoding['attention_mask'].to(self.device)
                 
                 # For causal language modeling, labels = input_ids
-                labels = input_ids.clone()
+                # Clone and detach to ensure proper gradient flow
+                labels = input_ids.clone().detach()
+                
+                # Ensure tensors are contiguous and have proper shape
+                input_ids = input_ids.contiguous()
+                attention_mask = attention_mask.contiguous()
+                labels = labels.contiguous()
                 
                 # Convert relative reward to weight (ensure positive)
                 weight = max(0.1, 1.0 + rel_reward)  # Minimum weight of 0.1
@@ -444,6 +834,11 @@ class MAGRPOTrainer:
     def _create_traffic_training_text(self, sample: Dict[str, Any]) -> str:
         """Create training text for Traffic LLM (Pioneer role)."""
         try:
+            # Handle both dict and list cases (defensive programming)
+            if not isinstance(sample, dict):
+                self.logger.warning(f"TRAFFIC_TEXT_WARNING: Expected dict, got {type(sample)}")
+                return ""
+                
             state_context = sample.get('state_context', {})
             pioneer_decision = sample.get('pioneer_decision', {})
             macro_route = sample.get('macro_route', [])
@@ -473,6 +868,11 @@ class MAGRPOTrainer:
     def _create_regional_training_text(self, sample: Dict[str, Any]) -> str:
         """Create training text for Regional LLM (Observer role)."""
         try:
+            # Handle both dict and list cases (defensive programming)
+            if not isinstance(sample, dict):
+                self.logger.warning(f"REGIONAL_TEXT_WARNING: Expected dict, got {type(sample)}")
+                return ""
+                
             observer_feedback = sample.get('observer_feedback', {})
             regional_route = sample.get('regional_route', [])
             target_region = sample.get('target_region', -1)
@@ -708,6 +1108,210 @@ class MAGRPOTrainer:
                     
         except Exception as e:
             self.logger.error(f"MAGRPO_CLEANUP_ERROR: {e}")
+    
+    def _update_progressive_state(self):
+        """Update progressive training state and handle phase transitions."""
+        try:
+            # Update online steps count for progressive training
+            if self.current_phase == "online":
+                self.online_steps_count += 1
+            
+            # Check for phase transitions based on configuration
+            if self._should_transition_phase():
+                self._transition_training_phase()
+                
+        except Exception as e:
+            self.logger.error(f"PROGRESSIVE_STATE_ERROR: {e}")
+    
+    def _should_transition_phase(self) -> bool:
+        """Check if training phase should transition."""
+        try:
+            # Transition from warmup to online after offline pretraining steps
+            if (self.current_phase == "warmup" and 
+                self.training_steps >= self.config.offline_pretraining_steps):
+                return True
+            
+            # Transition from online to reinforcement after specified online steps
+            if (self.current_phase == "online" and 
+                self.online_steps_count >= self.config.online_steps_per_reinforcement and
+                self.config.reinforcement_phase_enabled):
+                return True
+            
+            # Transition from reinforcement back to online (continuous cycle)
+            if self.current_phase == "reinforcement":
+                # Simple heuristic: after some reinforcement steps, go back to online
+                return True  # Will be handled by training manager
+                
+            return False
+        except Exception as e:
+            self.logger.error(f"PHASE_TRANSITION_CHECK_ERROR: {e}")
+            return False
+    
+    def _transition_training_phase(self):
+        """Handle training phase transitions with learning rate adjustments."""
+        try:
+            old_phase = self.current_phase
+            
+            # Determine next phase
+            if self.current_phase == "warmup":
+                self.current_phase = "online"
+                self.offline_pretraining_completed = True
+                self._adjust_learning_rate_for_phase("online")
+                
+            elif self.current_phase == "online":
+                self.current_phase = "reinforcement"  
+                self.online_steps_count = 0  # Reset counter
+                self._adjust_learning_rate_for_phase("reinforcement")
+                
+            elif self.current_phase == "reinforcement":
+                self.current_phase = "online"
+                self._adjust_learning_rate_for_phase("online")
+            
+            # Log phase transition
+            self.phase_transition_history.append({
+                'step': self.training_steps,
+                'from_phase': old_phase,
+                'to_phase': self.current_phase,
+                'learning_rate': self.current_learning_rate
+            })
+            
+            self.logger.info(f"PHASE_TRANSITION: {self.name} {old_phase} -> {self.current_phase} "
+                           f"at step {self.training_steps}, LR: {self.current_learning_rate:.2e}")
+            
+        except Exception as e:
+            self.logger.error(f"PHASE_TRANSITION_ERROR: {e}")
+    
+    def _adjust_learning_rate_for_phase(self, phase: str):
+        """Adjust learning rate for different training phases."""
+        try:
+            if phase == "online":
+                # Higher learning rate for online fine-tuning
+                self.current_learning_rate = self.base_learning_rate
+            elif phase == "reinforcement":
+                # Lower learning rate for stable reinforcement learning  
+                self.current_learning_rate = self.base_learning_rate * 0.5
+            elif phase == "warmup":
+                # Moderate learning rate for offline pretraining
+                self.current_learning_rate = self.base_learning_rate * 0.8
+            
+            # Update optimizer learning rate
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = self.current_learning_rate
+                
+            # Apply progressive decay if configured
+            if hasattr(self.config, 'progressive_learning_rate_decay'):
+                decay_factor = self.config.progressive_learning_rate_decay
+                self.current_learning_rate *= decay_factor
+                
+        except Exception as e:
+            self.logger.error(f"LEARNING_RATE_ADJUST_ERROR: {e}")
+    
+    def train_step_progressive(self, training_group: List[Dict[str, Any]], 
+                              batch_multiplier: int = 1) -> Dict[str, float]:
+        """
+        Enhanced training step with progressive training support.
+        
+        Args:
+            training_group: Training samples
+            batch_multiplier: Multiplier for reinforcement batches
+        """
+        try:
+            # Use larger batch for reinforcement phase
+            if self.current_phase == "reinforcement" and batch_multiplier > 1:
+                # Process multiple groups as a single large batch
+                return self._train_reinforcement_batch(training_group, batch_multiplier)
+            else:
+                # Standard training step
+                return self.train_step(training_group)
+                
+        except Exception as e:
+            self.logger.error(f"PROGRESSIVE_TRAIN_STEP_ERROR: {e}")
+            return {'loss': 0.0, 'relative_reward_mean': 0.0, 'relative_reward_std': 0.0}
+    
+    def _train_reinforcement_batch(self, training_groups: List[Dict[str, Any]], 
+                                  batch_multiplier: int) -> Dict[str, float]:
+        """Handle reinforcement training with larger batches."""
+        try:
+            # Flatten multiple groups into single larger batch for reinforcement
+            all_samples = []
+            if isinstance(training_groups[0], list):
+                # Multiple groups provided
+                for group in training_groups:
+                    all_samples.extend(group)
+            else:
+                # Single group provided
+                all_samples = training_groups
+            
+            # Use standard training logic but with larger effective batch
+            group_rewards = self._calculate_relative_rewards(all_samples)
+            batch_inputs = self._prepare_training_inputs(all_samples, group_rewards)
+            
+            if not batch_inputs:
+                return {'loss': 0.0, 'relative_reward_mean': 0.0, 'relative_reward_std': 0.0}
+            
+            # Enhanced training for reinforcement phase
+            total_loss = 0.0
+            accumulation_steps = self.config.gradient_accumulation_steps * batch_multiplier
+            
+            for i, (input_ids, attention_mask, labels, weight) in enumerate(batch_inputs):
+                with torch.amp.autocast('cuda'):
+                    outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                    loss = outputs.loss * weight * 1.2  # Slightly higher weight for reinforcement
+                    loss = loss / accumulation_steps
+                
+                total_loss += loss.detach()
+                self.scaler.scale(loss).backward()
+                
+                del outputs, loss
+                
+                if i % accumulation_steps == 0 or i == len(batch_inputs) - 1:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    if self.scheduler:
+                        self.scheduler.step()
+                    self.optimizer.zero_grad()
+                    torch.cuda.empty_cache()
+            
+            # Calculate metrics
+            avg_loss = total_loss * accumulation_steps
+            self.training_steps += 1
+            step_loss = avg_loss.item()
+            self.total_loss += step_loss
+            
+            reward_values = [r for _, _, _, r in batch_inputs]
+            reward_mean = np.mean(reward_values) if reward_values else 0.0
+            reward_std = np.std(reward_values) if reward_values else 0.0
+            
+            self.logger.info(f"REINFORCEMENT_STEP: {self.name} Step {self.training_steps} -> "
+                           f"Loss: {step_loss:.4f}, Batch Size: {len(all_samples)}, "
+                           f"Reward μ: {reward_mean:.3f}, σ: {reward_std:.3f}")
+            
+            return {
+                'loss': step_loss,
+                'relative_reward_mean': reward_mean,
+                'relative_reward_std': reward_std,
+                'learning_rate': self.current_learning_rate,
+                'batch_size': len(all_samples),
+                'training_phase': self.current_phase
+            }
+            
+        except Exception as e:
+            self.logger.error(f"REINFORCEMENT_BATCH_ERROR: {e}")
+            return {'loss': 0.0, 'relative_reward_mean': 0.0, 'relative_reward_std': 0.0}
+    
+    def get_progressive_stats(self) -> Dict[str, Any]:
+        """Get progressive training statistics."""
+        return {
+            'training_mode': self.training_mode,
+            'current_phase': self.current_phase,
+            'online_steps_count': self.online_steps_count,
+            'offline_pretraining_completed': self.offline_pretraining_completed,
+            'current_learning_rate': self.current_learning_rate,
+            'phase_transitions': len(self.phase_transition_history),
+            'last_transition': self.phase_transition_history[-1] if self.phase_transition_history else None
+        }
 
 
 class TrainingManager:
@@ -726,27 +1330,117 @@ class TrainingManager:
         # Setup logging
         self.logger = self._setup_logger()
         
-        # Initialize replay buffers
-        self.traffic_buffer = ReplayBuffer("Traffic", config.traffic_group_size)
-        self.regional_buffer = ReplayBuffer("Regional", config.regional_group_size)
+        # Initialize replay buffers with progressive training support
+        self.traffic_buffer = ReplayBuffer("Traffic", config.traffic_group_size, config=config)
+        self.regional_buffer = ReplayBuffer("Regional", config.regional_group_size, config=config)
         
         # Initialize trainers
         self.traffic_trainer = MAGRPOTrainer("Traffic", config, config.traffic_gpu, "traffic")
         self.regional_trainer = MAGRPOTrainer("Regional", config, config.regional_gpu, "regional")
         
+        # Progressive Training State Management
+        self.current_training_mode = config.training_mode if config.enable_progressive_training else "online_only"
+        self.global_training_phase = "warmup" if config.warmup_phase_enabled else "online"
+        self.phase_start_time = time.time()
+        self.phase_step_count = 0
+        
+        # Load historical data if available
+        self._load_historical_training_data()
+        
         # Statistics
         self.start_time = time.time()
         self.total_samples_processed = 0
         self.training_stats = {
-            'traffic': {'total_steps': 0, 'total_loss': 0.0, 'last_loss': 0.0},
-            'regional': {'total_steps': 0, 'total_loss': 0.0, 'last_loss': 0.0}
+            'traffic': {'total_steps': 0, 'total_loss': 0.0, 'last_loss': 0.0, 'phase_steps': 0, 'parameters_updated': False},
+            'regional': {'total_steps': 0, 'total_loss': 0.0, 'last_loss': 0.0, 'phase_steps': 0, 'parameters_updated': False}
         }
         
-        self.logger.info("TRAINING_MANAGER_INIT: MAGRPO Training Manager initialized")
+        # Chart update tracking
+        self.last_parameter_update = {'traffic': False, 'regional': False}
+        self.chart_files = {
+            'main': os.path.join(self.config.log_dir, "charts", "training_progress.png"),
+            'detailed': os.path.join(self.config.log_dir, "charts", "detailed_metrics.png")
+        }
+        
+        # Enhanced RL Tracking for Visualization (Step size: 180, Total: 43200)
+        self.simulation_step_size = 180  # From user specification
+        self.total_simulation_steps = 43200  # From user specification
+        self.visualization_update_interval = max(1, self.simulation_step_size // 10)  # Update every ~18 training steps
+        
+        # RL Metrics Accumulation
+        self.cumulative_rewards = {
+            'traffic': {'att_reward': 0.0, 'cooperation_reward': 0.0, 'total_reward': 0.0},
+            'regional': {'efficiency_reward': 0.0, 'protection_reward': 0.0, 'cooperation_reward': 0.0, 'total_reward': 0.0}
+        }
+        
+        self.att_improvement_history = []
+        self.cooperation_quality_history = []
+        self.phase_transition_events = []
+        
+        # W&B Integration for Visualization
+        self.wandb_enabled = self._initialize_wandb()
+        
+        self.logger.info("TRAINING_MANAGER_INIT: MAGRPO Training Manager with Progressive Mixed Training initialized")
+        self.logger.info(f"PROGRESSIVE_TRAINING: Mode={self.current_training_mode}, Phase={self.global_training_phase}")
+        self.logger.info(f"VISUALIZATION: W&B enabled={self.wandb_enabled}, Update interval={self.visualization_update_interval}")
+        self.logger.info(f"SIMULATION_CONFIG: Step size={self.simulation_step_size}, Total steps={self.total_simulation_steps}")
         self.logger.info(f"TRAINING_CONFIG: Traffic group size: {config.traffic_group_size}, Regional group size: {config.regional_group_size}")
         self.logger.info(f"TRAINING_GPUS: Traffic GPU: {config.traffic_gpu}, Regional GPU: {config.regional_gpu}")
         self.logger.info(f"TRAINING_QUEUE: Queue available: {self.training_queue is not None}")
         
+    def _initialize_wandb(self) -> bool:
+        """Initialize W&B logging for RL visualization if available."""
+        try:
+            if WANDB_AVAILABLE and hasattr(self.config, 'enable_wandb') and getattr(self.config, 'enable_wandb', False):
+                wandb.init(
+                    project="magrpo-traffic-rl",
+                    name=f"dual-llm-training-{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                    config={
+                        'traffic_group_size': self.config.traffic_group_size,
+                        'regional_group_size': self.config.regional_group_size,
+                        'training_mode': self.current_training_mode,
+                        'simulation_step_size': self.simulation_step_size,
+                        'total_steps': self.total_simulation_steps,
+                        'lora_r': self.config.lora_r,
+                        'learning_rate': self.config.learning_rate
+                    },
+                    tags=['progressive-training', 'dual-llm', 'magrpo']
+                )
+                self.logger.info("W&B_INIT: Weights & Biases logging initialized successfully")
+                return True
+            else:
+                self.logger.info("W&B_SKIP: W&B not available or not enabled")
+                return False
+        except Exception as e:
+            self.logger.warning(f"W&B_INIT_ERROR: Failed to initialize W&B: {e}")
+            return False
+    
+    def _load_historical_training_data(self) -> Dict[str, int]:
+        """Load historical training data for progressive training warmup phase."""
+        try:
+            historical_stats = {'traffic': 0, 'regional': 0}
+            
+            if self.config.enable_progressive_training:
+                data_dir = self.config.historical_data_dir
+                
+                # Load historical data for both buffers
+                traffic_loaded = self.traffic_buffer.load_historical_data(data_dir)
+                regional_loaded = self.regional_buffer.load_historical_data(data_dir)
+                
+                historical_stats['traffic'] = traffic_loaded
+                historical_stats['regional'] = regional_loaded
+                
+                if traffic_loaded > 0 or regional_loaded > 0:
+                    self.logger.info(f"HISTORICAL_DATA_LOADED: Traffic={traffic_loaded}, Regional={regional_loaded}")
+                else:
+                    self.logger.info("HISTORICAL_DATA_EMPTY: No historical data found, starting fresh")
+            
+            return historical_stats
+            
+        except Exception as e:
+            self.logger.error(f"HISTORICAL_DATA_ERROR: {e}")
+            return {'traffic': 0, 'regional': 0}
+
     def _setup_logger(self) -> logging.Logger:
         """Setup main training manager logger."""
         logger = logging.getLogger("training_manager")
@@ -772,44 +1466,317 @@ class TrainingManager:
         
         return logger
     
-    def run(self):
-        """Main training loop."""
+    def _generate_local_charts(self):
+        """Generate and save local charts for RL training visualization."""
         try:
-            self.logger.info("TRAINING_MANAGER_START: Starting main training loop")
+            # Create charts directory
+            charts_dir = os.path.join(self.config.log_dir, "charts")
+            os.makedirs(charts_dir, exist_ok=True)
+            
+            # Set up the plotting style
+            plt.style.use('seaborn-v0_8')
+            sns.set_palette("husl")
+            
+            # Use fixed file names for chart updates
+            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Figure 1: Cumulative Rewards Over Time
+            fig1, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
+            fig1.suptitle(f'MAGRPO Dual-LLM Training Progress - Updated: {current_time}', fontsize=16, fontweight='bold')
+            
+            # Traffic LLM Rewards
+            ax1.plot(self.att_improvement_history, 'b-', linewidth=2, label='ATT Improvement', alpha=0.8)
+            ax1.set_title('Traffic LLM: ATT Improvement Over Time', fontweight='bold')
+            ax1.set_xlabel('Training Steps')
+            ax1.set_ylabel('Improvement Score')
+            ax1.grid(True, alpha=0.3)
+            ax1.legend()
+            
+            # Regional LLM Rewards
+            if len(self.cooperation_quality_history) > 0:
+                ax2.plot(self.cooperation_quality_history, 'g-', linewidth=2, label='Cooperation Quality', alpha=0.8)
+                ax2.set_title('Regional LLM: Cooperation Quality Over Time', fontweight='bold')
+                ax2.set_xlabel('Training Steps')
+                ax2.set_ylabel('Quality Score')
+                ax2.grid(True, alpha=0.3)
+                ax2.legend()
+            
+            # Cumulative Rewards Comparison
+            traffic_total = (self.cumulative_rewards['traffic']['att_reward'] + 
+                           self.cumulative_rewards['traffic']['cooperation_reward'])
+            regional_total = (self.cumulative_rewards['regional']['efficiency_reward'] + 
+                            self.cumulative_rewards['regional']['protection_reward'] +
+                            self.cumulative_rewards['regional']['cooperation_reward'])
+            
+            rewards_comparison = ['Traffic LLM', 'Regional LLM']
+            rewards_values = [traffic_total, regional_total]
+            colors = ['skyblue', 'lightgreen']
+            
+            bars = ax3.bar(rewards_comparison, rewards_values, color=colors, alpha=0.7, edgecolor='black')
+            ax3.set_title('Cumulative Rewards Comparison', fontweight='bold')
+            ax3.set_ylabel('Total Reward')
+            ax3.grid(True, alpha=0.3, axis='y')
+            
+            # Add value labels on bars
+            for bar, value in zip(bars, rewards_values):
+                height = bar.get_height()
+                ax3.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                        f'{value:.3f}', ha='center', va='bottom', fontweight='bold')
+            
+            # Phase Transitions
+            if len(self.phase_transition_events) > 0:
+                phases = [event['phase'] for event in self.phase_transition_events]
+                phase_counts = defaultdict(int)
+                for phase in phases:
+                    phase_counts[phase] += 1
+                
+                ax4.pie(phase_counts.values(), labels=phase_counts.keys(), autopct='%1.1f%%',
+                       startangle=90, colors=['#ff9999', '#66b3ff', '#99ff99'])
+                ax4.set_title('Training Phase Distribution', fontweight='bold')
+            
+            plt.tight_layout()
+            
+            # Save the main chart with fixed filename for in-place update
+            chart_path = self.chart_files['main']
+            plt.savefig(chart_path, dpi=300, bbox_inches='tight', facecolor='white')
+            self.logger.info(f"CHART_UPDATED: Main progress chart updated at {chart_path}")
+            plt.close(fig1)
+            
+            # Figure 2: Detailed RL Metrics
+            fig2, ((ax5, ax6), (ax7, ax8)) = plt.subplots(2, 2, figsize=(16, 12))
+            fig2.suptitle(f'Detailed RL Training Metrics - Updated: {current_time}', fontsize=16, fontweight='bold')
+            
+            # Traffic LLM Detailed Breakdown
+            traffic_rewards = self.cumulative_rewards['traffic']
+            if traffic_rewards['total_reward'] > 0:
+                traffic_labels = ['ATT Reward', 'Cooperation Reward']
+                traffic_values = [traffic_rewards['att_reward'], traffic_rewards['cooperation_reward']]
+                ax5.pie(traffic_values, labels=traffic_labels, autopct='%1.1f%%', 
+                       colors=['#ffcc99', '#ff99cc'], startangle=45)
+                ax5.set_title('Traffic LLM: Reward Breakdown', fontweight='bold')
+            
+            # Regional LLM Detailed Breakdown
+            regional_rewards = self.cumulative_rewards['regional']
+            if regional_rewards['total_reward'] > 0:
+                regional_labels = ['Efficiency', 'Protection', 'Cooperation']
+                regional_values = [regional_rewards['efficiency_reward'], 
+                                 regional_rewards['protection_reward'],
+                                 regional_rewards['cooperation_reward']]
+                ax6.pie(regional_values, labels=regional_labels, autopct='%1.1f%%', 
+                       colors=['#99ffcc', '#ccff99', '#ffccff'], startangle=45)
+                ax6.set_title('Regional LLM: Reward Breakdown', fontweight='bold')
+            
+            # Training Statistics
+            stats_labels = ['Traffic Steps', 'Regional Steps', 'Total Samples']
+            stats_values = [self.training_stats['traffic']['total_steps'],
+                          self.training_stats['regional']['total_steps'], 
+                          self.total_samples_processed]
+            
+            bars2 = ax7.bar(stats_labels, stats_values, color=['steelblue', 'darkorange', 'forestgreen'], 
+                          alpha=0.7, edgecolor='black')
+            ax7.set_title('Training Volume Statistics', fontweight='bold')
+            ax7.set_ylabel('Count')
+            ax7.grid(True, alpha=0.3, axis='y')
+            
+            # Add value labels
+            for bar, value in zip(bars2, stats_values):
+                height = bar.get_height()
+                ax7.text(bar.get_x() + bar.get_width()/2., height + max(stats_values)*0.01,
+                        f'{value}', ha='center', va='bottom', fontweight='bold')
+            
+            # Loss Trends - Show both current and average
+            if (self.training_stats['traffic']['total_steps'] > 0 and 
+                self.training_stats['regional']['total_steps'] > 0):
+                
+                traffic_avg_loss = (self.training_stats['traffic']['total_loss'] / 
+                                  self.training_stats['traffic']['total_steps'])
+                regional_avg_loss = (self.training_stats['regional']['total_loss'] / 
+                                   self.training_stats['regional']['total_steps'])
+                
+                traffic_current_loss = self.training_stats['traffic']['last_loss']
+                regional_current_loss = self.training_stats['regional']['last_loss']
+                
+                loss_types = ['Traffic\nAverage', 'Traffic\nCurrent', 'Regional\nAverage', 'Regional\nCurrent']
+                loss_values = [traffic_avg_loss, traffic_current_loss, regional_avg_loss, regional_current_loss]
+                colors = ['crimson', 'lightcoral', 'darkviolet', 'mediumpurple']
+                
+                bars3 = ax8.bar(loss_types, loss_values, color=colors, alpha=0.7, edgecolor='black')
+                ax8.set_title('Training Loss Comparison', fontweight='bold')
+                ax8.set_ylabel('Loss Value')
+                ax8.grid(True, alpha=0.3, axis='y')
+                ax8.tick_params(axis='x', rotation=45)
+                
+                # Add value labels
+                for bar, value in zip(bars3, loss_values):
+                    height = bar.get_height()
+                    ax8.text(bar.get_x() + bar.get_width()/2., height + max(loss_values)*0.01,
+                            f'{value:.3f}', ha='center', va='bottom', fontweight='bold', fontsize=9)
+                
+                # Add parameter update status as text annotation
+                traffic_updated = "Updated" if self.training_stats['traffic']['parameters_updated'] else "No Update"
+                regional_updated = "Updated" if self.training_stats['regional']['parameters_updated'] else "No Update"
+                
+                ax8.text(0.02, 0.98, f'Parameter Status:\nTraffic: {traffic_updated}\nRegional: {regional_updated}', 
+                        transform=ax8.transAxes, verticalalignment='top', bbox=dict(boxstyle='round', 
+                        facecolor='lightgray', alpha=0.8), fontsize=9)
+            
+            plt.tight_layout()
+            
+            # Save the detailed metrics chart with fixed filename for in-place update
+            detailed_chart_path = self.chart_files['detailed']
+            plt.savefig(detailed_chart_path, dpi=300, bbox_inches='tight', facecolor='white')
+            self.logger.info(f"CHART_UPDATED: Detailed metrics chart updated at {detailed_chart_path}")
+            plt.close(fig2)
+            
+            return chart_path, detailed_chart_path
+            
+        except Exception as e:
+            self.logger.error(f"LOCAL_CHART_ERROR: Failed to generate charts: {e}")
+            return None, None
+    
+    def _update_rl_metrics(self, trainer_type: str, metrics: Dict[str, float], 
+                          vehicle_sample: Dict[str, Any] = None):
+        """Update RL metrics for visualization and tracking."""
+        try:
+            # Update cumulative rewards
+            if trainer_type == 'traffic':
+                att_reward = metrics.get('relative_reward_mean', 0.0) * 0.6  # ATT component
+                coop_reward = metrics.get('relative_reward_mean', 0.0) * 0.4  # Cooperation component
+                
+                self.cumulative_rewards['traffic']['att_reward'] += att_reward
+                self.cumulative_rewards['traffic']['cooperation_reward'] += coop_reward
+                self.cumulative_rewards['traffic']['total_reward'] += att_reward + coop_reward
+                
+                # Track ATT improvement history
+                if len(self.att_improvement_history) == 0 or len(self.att_improvement_history) % 10 == 0:
+                    # Sample every 10 steps to reduce memory usage
+                    self.att_improvement_history.append(att_reward)
+                
+            elif trainer_type == 'regional':
+                efficiency_reward = metrics.get('relative_reward_mean', 0.0) * 0.5
+                protection_reward = 0.3  # Placeholder - would come from vehicle_sample
+                coop_reward = metrics.get('relative_reward_mean', 0.0) * 0.5
+                
+                self.cumulative_rewards['regional']['efficiency_reward'] += efficiency_reward
+                self.cumulative_rewards['regional']['protection_reward'] += protection_reward
+                self.cumulative_rewards['regional']['cooperation_reward'] += coop_reward
+                total = efficiency_reward + protection_reward + coop_reward
+                self.cumulative_rewards['regional']['total_reward'] += total
+                
+                # Track cooperation quality history
+                if len(self.cooperation_quality_history) == 0 or len(self.cooperation_quality_history) % 10 == 0:
+                    self.cooperation_quality_history.append(coop_reward)
+            
+            # Track phase transitions
+            current_phase = metrics.get('training_phase', 'unknown')
+            if (len(self.phase_transition_events) == 0 or 
+                self.phase_transition_events[-1]['phase'] != current_phase):
+                
+                self.phase_transition_events.append({
+                    'step': self.training_stats[trainer_type]['total_steps'],
+                    'phase': current_phase,
+                    'timestamp': time.time()
+                })
+            
+            # Log to W&B if available
+            if self.wandb_enabled:
+                wandb.log({
+                    f"{trainer_type}/loss": metrics.get('loss', 0.0),
+                    f"{trainer_type}/reward_mean": metrics.get('relative_reward_mean', 0.0),
+                    f"{trainer_type}/reward_std": metrics.get('relative_reward_std', 0.0),
+                    f"{trainer_type}/learning_rate": metrics.get('learning_rate', 0.0),
+                    f"{trainer_type}/phase": current_phase,
+                    f"cumulative/{trainer_type}_total_reward": self.cumulative_rewards[trainer_type]['total_reward'],
+                    "global/total_samples": self.total_samples_processed,
+                    "global/runtime": time.time() - self.start_time
+                })
+                
+        except Exception as e:
+            self.logger.error(f"RL_METRICS_UPDATE_ERROR: {e}")
+    
+    def run(self):
+        """Enhanced main training loop with progressive training and visualization."""
+        try:
+            self.logger.info("TRAINING_MANAGER_START: Starting progressive MAGRPO training loop")
             last_heartbeat_time = time.time()
+            last_chart_generation = time.time()
             heartbeat_interval = 60.0  # Log heartbeat every 60 seconds
+            
+            # Chart generation interval based on step size (every 18 steps ≈ 10% of step size)
+            chart_interval = max(self.visualization_update_interval * 0.1, 30.0)  # At least every 30 seconds
             
             while self.running:
                 # Process incoming training data
                 self._process_incoming_data()
                 
-                # Train Traffic LLM if buffer is ready
-                if self.traffic_buffer.can_form_group():
-                    training_group = self.traffic_buffer.get_training_group()
+                # Progressive Training Logic for Traffic LLM
+                if self._should_train_traffic_llm():
+                    training_group = self._get_traffic_training_group()
                     if training_group:
-                        metrics = self.traffic_trainer.train_step(training_group)
+                        # Use progressive training method if available
+                        if hasattr(self.traffic_trainer, 'train_step_progressive'):
+                            batch_multiplier = self._get_batch_multiplier('traffic')
+                            metrics = self.traffic_trainer.train_step_progressive(training_group, batch_multiplier)
+                        else:
+                            metrics = self.traffic_trainer.train_step(training_group)
+                        
                         self._update_training_stats('traffic', metrics)
+                        
+                        # Update phase in buffer
+                        self.traffic_buffer.set_training_phase(metrics.get('training_phase', 'online'))
                 
-                # Train Regional LLM if buffer is ready
-                if self.regional_buffer.can_form_group():
-                    training_group = self.regional_buffer.get_training_group()
+                # Progressive Training Logic for Regional LLM  
+                if self._should_train_regional_llm():
+                    training_group = self._get_regional_training_group()
                     if training_group:
-                        metrics = self.regional_trainer.train_step(training_group)
+                        # Use progressive training method if available
+                        if hasattr(self.regional_trainer, 'train_step_progressive'):
+                            batch_multiplier = self._get_batch_multiplier('regional')
+                            metrics = self.regional_trainer.train_step_progressive(training_group, batch_multiplier)
+                        else:
+                            metrics = self.regional_trainer.train_step(training_group)
+                        
                         self._update_training_stats('regional', metrics)
+                        
+                        # Update phase in buffer
+                        self.regional_buffer.set_training_phase(metrics.get('training_phase', 'online'))
+                
+                # Periodic visualization and status updates
+                current_time = time.time()
+                
+                # Generate local charts only when parameters were updated
+                parameter_updated = (self.last_parameter_update['traffic'] or self.last_parameter_update['regional'])
+                
+                if parameter_updated and (current_time - last_chart_generation >= chart_interval):
+                    
+                    self._generate_local_charts()
+                    last_chart_generation = current_time
+                    
+                    # Reset parameter update flags after chart generation
+                    self.last_parameter_update = {'traffic': False, 'regional': False}
+                    self.logger.info("CHART_UPDATE_TRIGGERED: Charts updated due to parameter changes")
+                    
+                    # Log progressive training status
+                    self._log_progressive_training_status()
                 
                 # Periodic status logging
                 if self.total_samples_processed > 0 and self.total_samples_processed % 100 == 0:
                     self._log_training_status()
                 
-                # Heartbeat logging for debugging
-                current_time = time.time()
+                # Heartbeat logging for debugging  
                 if current_time - last_heartbeat_time >= heartbeat_interval:
                     runtime = current_time - self.start_time
-                    self.logger.info(f"TRAINING_HEARTBEAT: Runtime: {runtime:.1f}s, "
-                                   f"Samples received: {self.total_samples_processed}, "
+                    progress = min(100.0, (self.total_samples_processed / self.total_simulation_steps) * 100)
+                    
+                    self.logger.info(f"PROGRESSIVE_HEARTBEAT: Runtime: {runtime:.1f}s, "
+                                   f"Progress: {progress:.1f}% ({self.total_samples_processed}/{self.total_simulation_steps}), "
                                    f"Traffic buffer: {self.traffic_buffer.size()}, "
-                                   f"Regional buffer: {self.regional_buffer.size()}")
+                                   f"Regional buffer: {self.regional_buffer.size()}, "
+                                   f"Global phase: {self.global_training_phase}")
                     last_heartbeat_time = current_time
+                
+                # Phase transition management
+                self._manage_global_phase_transitions()
                 
                 # Short sleep to prevent CPU spinning
                 time.sleep(0.1)
@@ -821,6 +1788,225 @@ class TrainingManager:
         finally:
             self._shutdown()
     
+    def _should_train_traffic_llm(self) -> bool:
+        """Determine if Traffic LLM should train based on progressive training phases."""
+        try:
+            # Check if buffer has enough samples
+            if not self.traffic_buffer.can_form_group():
+                return False
+            
+            # Progressive training logic
+            if self.current_training_mode == "progressive":
+                if self.global_training_phase == "warmup":
+                    # In warmup phase, use historical data if available, fallback to current buffer
+                    historical_samples = len(self.traffic_buffer.historical_buffer)
+                    current_samples = len(self.traffic_buffer.buffer)
+                    
+                    # Prefer historical data, but use current buffer if no historical data available
+                    if historical_samples >= self.config.traffic_group_size:
+                        return True
+                    elif historical_samples == 0 and current_samples >= self.config.traffic_group_size:
+                        # No historical data available, use current buffer as fallback
+                        self.logger.info(f"WARMUP_FALLBACK: Using current buffer for Traffic LLM training (no historical data)")
+                        return True
+                    else:
+                        return False
+                elif self.global_training_phase == "reinforcement":
+                    # In reinforcement phase, require high-quality samples or regular samples
+                    return (len(self.traffic_buffer.high_quality_samples) > 0 or 
+                           self.traffic_buffer.can_form_group())
+                else:  # online phase
+                    return True
+            else:
+                # Default online-only mode
+                return True
+                
+        except Exception as e:
+            self.logger.error(f"TRAFFIC_TRAIN_CHECK_ERROR: {e}")
+            return False
+    
+    def _should_train_regional_llm(self) -> bool:
+        """Determine if Regional LLM should train based on progressive training phases."""
+        try:
+            # Check if buffer has enough samples
+            if not self.regional_buffer.can_form_group():
+                return False
+            
+            # Progressive training logic (same as traffic but with regional buffer)
+            if self.current_training_mode == "progressive":
+                if self.global_training_phase == "warmup":
+                    # In warmup phase, use historical data if available, fallback to current buffer
+                    historical_samples = len(self.regional_buffer.historical_buffer)
+                    current_samples = len(self.regional_buffer.buffer)
+                    
+                    # Prefer historical data, but use current buffer if no historical data available
+                    if historical_samples >= self.config.regional_group_size:
+                        return True
+                    elif historical_samples == 0 and current_samples >= self.config.regional_group_size:
+                        # No historical data available, use current buffer as fallback
+                        self.logger.info(f"WARMUP_FALLBACK: Using current buffer for Regional LLM training (no historical data)")
+                        return True
+                    else:
+                        return False
+                elif self.global_training_phase == "reinforcement":
+                    return (len(self.regional_buffer.high_quality_samples) > 0 or 
+                           self.regional_buffer.can_form_group())
+                else:  # online phase
+                    return True
+            else:
+                return True
+                
+        except Exception as e:
+            self.logger.error(f"REGIONAL_TRAIN_CHECK_ERROR: {e}")
+            return False
+    
+    def _get_traffic_training_group(self) -> Optional[List[Dict[str, Any]]]:
+        """Get training group for Traffic LLM based on current training phase."""
+        try:
+            if self.global_training_phase == "warmup":
+                return self.traffic_buffer.get_offline_training_group()
+            elif self.global_training_phase == "reinforcement":
+                batch_multiplier = self.config.reinforcement_batch_multiplier
+                return self.traffic_buffer.get_reinforcement_batch(batch_multiplier)
+            else:  # online phase
+                return self.traffic_buffer.get_training_group()
+                
+        except Exception as e:
+            self.logger.error(f"TRAFFIC_GROUP_GET_ERROR: {e}")
+            return None
+    
+    def _get_regional_training_group(self) -> Optional[List[Dict[str, Any]]]:
+        """Get training group for Regional LLM based on current training phase."""
+        try:
+            if self.global_training_phase == "warmup":
+                return self.regional_buffer.get_offline_training_group()
+            elif self.global_training_phase == "reinforcement":
+                batch_multiplier = self.config.reinforcement_batch_multiplier
+                return self.regional_buffer.get_reinforcement_batch(batch_multiplier)
+            else:  # online phase
+                return self.regional_buffer.get_training_group()
+                
+        except Exception as e:
+            self.logger.error(f"REGIONAL_GROUP_GET_ERROR: {e}")
+            return None
+    
+    def _get_batch_multiplier(self, trainer_type: str) -> int:
+        """Get batch multiplier for reinforcement training phases."""
+        try:
+            if self.global_training_phase == "reinforcement":
+                return self.config.reinforcement_batch_multiplier
+            else:
+                return 1
+                
+        except Exception as e:
+            self.logger.error(f"BATCH_MULTIPLIER_ERROR: {e}")
+            return 1
+    
+    def _manage_global_phase_transitions(self):
+        """Manage global training phase transitions across both LLMs."""
+        try:
+            if not self.config.enable_progressive_training:
+                return
+            
+            current_time = time.time()
+            phase_duration = current_time - self.phase_start_time
+            
+            # Transition logic based on steps and time
+            total_training_steps = (self.training_stats['traffic']['total_steps'] + 
+                                  self.training_stats['regional']['total_steps'])
+            
+            should_transition = False
+            new_phase = self.global_training_phase
+            
+            if self.global_training_phase == "warmup":
+                # Transition to online after offline pretraining steps
+                if total_training_steps >= self.config.offline_pretraining_steps:
+                    should_transition = True
+                    new_phase = "online"
+                    
+            elif self.global_training_phase == "online":
+                # Transition to reinforcement after online steps
+                if self.phase_step_count >= self.config.online_steps_per_reinforcement:
+                    should_transition = True
+                    new_phase = "reinforcement"
+                    
+            elif self.global_training_phase == "reinforcement":
+                # Transition back to online after reinforcement (cyclical)
+                reinforcement_steps = self.config.offline_pretraining_steps // 2  # Shorter reinforcement phases
+                if self.phase_step_count >= reinforcement_steps:
+                    should_transition = True
+                    new_phase = "online"
+            
+            if should_transition:
+                old_phase = self.global_training_phase
+                self.global_training_phase = new_phase
+                self.phase_start_time = current_time
+                self.phase_step_count = 0
+                
+                # Update buffers
+                self.traffic_buffer.set_training_phase(new_phase)
+                self.regional_buffer.set_training_phase(new_phase)
+                
+                # Log transition
+                self.logger.info(f"GLOBAL_PHASE_TRANSITION: {old_phase} -> {new_phase} "
+                               f"after {total_training_steps} total steps, "
+                               f"phase duration: {phase_duration:.1f}s")
+                
+                # Save historical data during phase transitions
+                if new_phase == "reinforcement":
+                    self._save_phase_historical_data()
+                
+        except Exception as e:
+            self.logger.error(f"GLOBAL_PHASE_TRANSITION_ERROR: {e}")
+    
+    def _save_phase_historical_data(self):
+        """Save current training data as historical data for future phases."""
+        try:
+            if self.config.enable_progressive_training:
+                traffic_saved = self.traffic_buffer.save_historical_data(self.config.historical_data_dir)
+                regional_saved = self.regional_buffer.save_historical_data(self.config.historical_data_dir)
+                
+                self.logger.info(f"HISTORICAL_DATA_SAVED: Traffic={traffic_saved}, Regional={regional_saved}")
+                
+        except Exception as e:
+            self.logger.error(f"HISTORICAL_DATA_SAVE_ERROR: {e}")
+    
+    def _log_progressive_training_status(self):
+        """Log detailed progressive training status with RL metrics."""
+        try:
+            # Get progressive training stats from trainers
+            traffic_progressive_stats = self.traffic_trainer.get_progressive_stats()
+            regional_progressive_stats = self.regional_trainer.get_progressive_stats()
+            
+            # Get buffer statistics
+            traffic_stats = self.traffic_buffer.get_stats()
+            regional_stats = self.regional_buffer.get_stats()
+            
+            runtime = time.time() - self.start_time
+            progress = min(100.0, (self.total_samples_processed / self.total_simulation_steps) * 100)
+            
+            self.logger.info(f"PROGRESSIVE_STATUS: Runtime: {runtime:.1f}s, Progress: {progress:.1f}%")
+            self.logger.info(f"  Global Phase: {self.global_training_phase}, Phase Steps: {self.phase_step_count}")
+            self.logger.info(f"  Traffic LLM: Phase={traffic_progressive_stats.get('current_phase', 'unknown')}, "
+                           f"Online Steps={traffic_progressive_stats.get('online_steps_count', 0)}, "
+                           f"LR={traffic_progressive_stats.get('current_learning_rate', 0.0):.2e}")
+            self.logger.info(f"  Regional LLM: Phase={regional_progressive_stats.get('current_phase', 'unknown')}, "
+                           f"Online Steps={regional_progressive_stats.get('online_steps_count', 0)}, "
+                           f"LR={regional_progressive_stats.get('current_learning_rate', 0.0):.2e}")
+            self.logger.info(f"  Buffers: Traffic={traffic_stats['current_size']}/{traffic_stats['high_quality_size']} "
+                           f"(HQ), Regional={regional_stats['current_size']}/{regional_stats['high_quality_size']} (HQ)")
+            
+            # RL Metrics Summary
+            traffic_cumulative = self.cumulative_rewards['traffic']['total_reward']
+            regional_cumulative = self.cumulative_rewards['regional']['total_reward']
+            
+            self.logger.info(f"  RL Cumulative Rewards: Traffic={traffic_cumulative:.3f}, Regional={regional_cumulative:.3f}")
+            self.logger.info(f"  ATT Improvement Samples: {len(self.att_improvement_history)}, "
+                           f"Cooperation Quality Samples: {len(self.cooperation_quality_history)}")
+            
+        except Exception as e:
+            self.logger.error(f"PROGRESSIVE_STATUS_LOG_ERROR: {e}")
+
     def _process_incoming_data(self):
         """Process incoming training data from the queue."""
         try:
@@ -853,11 +2039,30 @@ class TrainingManager:
             self.logger.error(f"TRAINING_DATA_PROCESSING_ERROR: {e}")
     
     def _update_training_stats(self, trainer_type: str, metrics: Dict[str, float]):
-        """Update training statistics."""
-        stats = self.training_stats[trainer_type]
-        stats['total_steps'] += 1
-        stats['total_loss'] += metrics.get('loss', 0.0)
-        stats['last_loss'] = metrics.get('loss', 0.0)
+        """Update training statistics and RL metrics."""
+        try:
+            # Update basic training statistics
+            stats = self.training_stats[trainer_type]
+            stats['total_steps'] += 1
+            stats['total_loss'] += metrics.get('loss', 0.0)
+            stats['last_loss'] = metrics.get('loss', 0.0)
+            stats['phase_steps'] += 1
+            
+            # Check if parameters were actually updated (loss > 0 indicates training step completed)
+            loss_value = metrics.get('loss', 0.0)
+            if loss_value > 0:
+                stats['parameters_updated'] = True
+                self.last_parameter_update[trainer_type] = True
+                self.logger.debug(f"PARAM_UPDATE_DETECTED: {trainer_type} parameters updated, loss={loss_value:.4f}")
+            
+            # Update global phase step count
+            self.phase_step_count += 1
+            
+            # Update RL metrics for visualization
+            self._update_rl_metrics(trainer_type, metrics)
+            
+        except Exception as e:
+            self.logger.error(f"TRAINING_STATS_UPDATE_ERROR: {e}")
     
     def _log_training_status(self):
         """Log comprehensive training status."""

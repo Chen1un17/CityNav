@@ -442,10 +442,10 @@ def main(location: str, step_size: float, max_steps: int, use_wandb: bool = True
         use_wandb: Whether to log results to Weights & Biases
     """
     # File paths using the new data structure
-    sumo_config = f"/data/zhouyuping/LLMNavigation/Data/NYC/{location}_sumo_config.sumocfg"
-    route_file = f"/data/zhouyuping/LLMNavigation/Data/NYC/{location}_od_0.1.rou.alt.xml"
-    road_info_file = f"/data/zhouyuping/LLMNavigation/Data/NYC/{location}_road_info.json"
-    adjacency_file = f"/data/zhouyuping/LLMNavigation/Data/NYC/Region_1/edge_adjacency_alpha_1.json"
+    sumo_config = f"/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_sumo_config.sumocfg"
+    route_file = f"/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_od_0.01.rou.alt.xml"
+    road_info_file = f"/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_road_info.json"
+    adjacency_file = f"/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_adjacency_info.json"
     
     # Verify required files exist
     required_files = [sumo_config, route_file, road_info_file, adjacency_file]
@@ -517,7 +517,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--location", 
         type=str, 
-        default="NewYork", 
+        default="Manhattan", 
         help="Location of the simulation (default: NewYork)"
     )
     parser.add_argument(
@@ -529,7 +529,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-steps", 
         type=int, 
-        default=86400, 
+        default=43200, 
         help="Maximum number of simulation steps (default: 86400)"
     )
     parser.add_argument(

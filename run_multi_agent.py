@@ -184,12 +184,12 @@ def run_with_training():
         print("本地模型不可用，请检查模型路径和GPU状态")
         sys.exit(1)
     
-    # Training parameters
+    # Training parameters - optimized for memory and stability
     llm_path = "/data/zhouyuping/Qwen/"
-    batch_size = 8  # Smaller batch for training mode
+    batch_size = 4  # Reduced batch for training mode to save memory
     location = "Manhattan"
     step_size = 180.0  # 3-minute decision intervals
-    max_steps = 43200  # 6 hours simulation (sufficient for training data collection)
+    max_steps = 21600  # 3 hours simulation (sufficient for training data collection)
     use_local_llm = True  # 必须使用本地LLM
     enable_training = True  # 启用训练
     

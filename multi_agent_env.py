@@ -332,8 +332,14 @@ class MultiAgentTrafficEnvironment:
                         route = result.get('route', [])
                         if route and len(route) > 1:
                             try:
-                                traci.vehicle.setRoute(vehicle_id, route)
-                                self.logger.log_info(f"LLM_UPDATE: Applied regional route for {vehicle_id}")
+                                # Safe route setting - ensure current edge is included
+                                current_edge = traci.vehicle.getRoadID(vehicle_id)
+                                safe_route = self._create_safe_route(current_edge, route)
+                                if safe_route:
+                                    traci.vehicle.setRoute(vehicle_id, safe_route)
+                                    self.logger.log_info(f"LLM_UPDATE: Applied regional route for {vehicle_id}")
+                                else:
+                                    self.logger.log_warning(f"LLM_UPDATE: Cannot create safe route for {vehicle_id} from {current_edge}")
                             except Exception as route_error:
                                 self.logger.log_warning(f"LLM_UPDATE: Failed to apply route for {vehicle_id}: {route_error}")
                         
@@ -644,6 +650,117 @@ class MultiAgentTrafficEnvironment:
             # Fallback to original system if CORY fails
             self._fallback_original_planning(vehicle_id, current_time)
     
+    def _create_safe_route(self, current_edge: str, target_route: List[str]) -> Optional[List[str]]:
+        """
+        Create a safe route that includes the vehicle's current edge as the first element.
+        This is required by SUMO's setRoute() function.
+        
+        Args:
+            current_edge: Vehicle's current edge ID
+            target_route: Desired route
+            
+        Returns:
+            Safe route with current edge as first element, or None if impossible
+        """
+        try:
+            # Skip junction edges (internal edges)
+            if current_edge.startswith(':'):
+                self.logger.log_warning(f"SAFE_ROUTE: Vehicle on junction edge {current_edge}, cannot set route safely")
+                return None
+            
+            # If target route is empty, return None
+            if not target_route:
+                return None
+                
+            # If current edge is already the first element, return as-is
+            if target_route[0] == current_edge:
+                return target_route
+            
+            # If current edge is somewhere in the middle of the route, extract remaining part
+            if current_edge in target_route:
+                current_index = target_route.index(current_edge)
+                safe_route = target_route[current_index:]
+                self.logger.log_info(f"SAFE_ROUTE: Extracted remaining route from current position")
+                return safe_route
+            
+            # Current edge not in target route - need to connect
+            # Try to find a route from current edge to the first edge of target route
+            try:
+                # Use SUMO's route finding to connect current edge to target route
+                connection_route = traci.simulation.findRoute(fromEdge=current_edge, toEdge=target_route[0])
+                if connection_route and hasattr(connection_route, 'edges'):
+                    # Combine connection with target route (avoid duplication of first target edge)
+                    safe_route = list(connection_route.edges) + target_route[1:]
+                    self.logger.log_info(f"SAFE_ROUTE: Connected current edge to target route")
+                    return safe_route
+                else:
+                    self.logger.log_warning(f"SAFE_ROUTE: No connection found from {current_edge} to {target_route[0]}")
+                    return None
+            except Exception as route_error:
+                self.logger.log_warning(f"SAFE_ROUTE: Route finding failed from {current_edge} to {target_route[0]}: {route_error}")
+                return None
+                
+        except Exception as e:
+            self.logger.log_error(f"SAFE_ROUTE: Error creating safe route for {current_edge}: {e}")
+            return None
+
+    def _validate_route_setting(self, vehicle_id: str, route: List[str]) -> bool:
+        """
+        Validate if a route can be safely set for a vehicle.
+        
+        Args:
+            vehicle_id: Vehicle ID
+            route: Proposed route
+            
+        Returns:
+            True if route can be set safely, False otherwise
+        """
+        try:
+            # Check if vehicle exists
+            if vehicle_id not in traci.vehicle.getIDList():
+                self.logger.log_warning(f"ROUTE_VALIDATION: Vehicle {vehicle_id} not found")
+                return False
+            
+            # Check if route is valid
+            if not route or len(route) == 0:
+                self.logger.log_warning(f"ROUTE_VALIDATION: Empty route for {vehicle_id}")
+                return False
+            
+            # Get current edge
+            current_edge = traci.vehicle.getRoadID(vehicle_id)
+            
+            # Skip validation if on junction
+            if current_edge.startswith(':'):
+                self.logger.log_warning(f"ROUTE_VALIDATION: Vehicle {vehicle_id} on junction {current_edge}")
+                return False
+            
+            # Check if current edge is in route or can be connected
+            if current_edge not in route:
+                # Try to find connection
+                try:
+                    connection_route = traci.simulation.findRoute(fromEdge=current_edge, toEdge=route[0])
+                    if not connection_route or not hasattr(connection_route, 'edges'):
+                        self.logger.log_warning(f"ROUTE_VALIDATION: No connection from {current_edge} to route start {route[0]}")
+                        return False
+                except Exception:
+                    self.logger.log_warning(f"ROUTE_VALIDATION: Route finding failed from {current_edge} to {route[0]}")
+                    return False
+            
+            # Check if all edges in route are valid
+            for edge in route:
+                try:
+                    # Try to get basic info about the edge
+                    traci.edge.getLaneNumber(edge)
+                except Exception:
+                    self.logger.log_warning(f"ROUTE_VALIDATION: Invalid edge {edge} in route")
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            self.logger.log_error(f"ROUTE_VALIDATION: Error validating route for {vehicle_id}: {e}")
+            return False
+
     def _construct_state_space(self, vehicle_id: str, current_time: float) -> Dict[str, Any]:
         """
         Construct comprehensive state space for CORY cooperative decision making.
@@ -1010,17 +1127,39 @@ class MultiAgentTrafficEnvironment:
         return macro_context
     
     def _handle_stuck_vehicle_replanning(self, vehicle_id: str, current_time: float):
-        """Handle replanning for stuck vehicles by treating them as newly born."""
+        """Handle replanning for stuck vehicles with improved safety checks and route validation."""
         try:
+            # Check if vehicle still exists in simulation
+            if vehicle_id not in traci.vehicle.getIDList():
+                self.logger.log_warning(f"STUCK_REPLAN: Vehicle {vehicle_id} no longer exists, skipping replanning")
+                return
+            
             # Check if vehicle already being replanned recently to avoid spam
             if hasattr(self, '_vehicle_replan_times'):
                 last_replan = self._vehicle_replan_times.get(vehicle_id, 0)
                 if current_time - last_replan < 120:  # Avoid replanning same vehicle within 2 minutes
+                    self.logger.log_info(f"STUCK_REPLAN: Vehicle {vehicle_id} was replanned recently, skipping")
                     return
             else:
                 self._vehicle_replan_times = {}
             
-            self.logger.log_info(f"STUCK_REPLAN: Initiating replanning for stuck vehicle {vehicle_id}")
+            # Get vehicle's current position and route info
+            try:
+                current_edge = traci.vehicle.getRoadID(vehicle_id)
+                original_route = traci.vehicle.getRoute(vehicle_id)
+                speed = traci.vehicle.getSpeed(vehicle_id)
+                
+                self.logger.log_info(f"STUCK_REPLAN: Initiating replanning for stuck vehicle {vehicle_id} - "
+                                   f"current_edge: {current_edge}, speed: {speed:.2f}, original_route_length: {len(original_route)}")
+                
+                # Skip if vehicle is on junction (internal edge)
+                if current_edge.startswith(':'):
+                    self.logger.log_warning(f"STUCK_REPLAN: Vehicle {vehicle_id} on junction edge {current_edge}, waiting for exit")
+                    return
+                    
+            except Exception as pos_error:
+                self.logger.log_error(f"STUCK_REPLAN: Cannot get position info for {vehicle_id}: {pos_error}")
+                return
             
             # Check if this is an emergency route vehicle
             is_emergency_route = False
@@ -1051,7 +1190,45 @@ class MultiAgentTrafficEnvironment:
             # Record replan time
             self._vehicle_replan_times[vehicle_id] = current_time
             
-            # Trigger macro planning as if vehicle just born
+            # Try to create emergency route first
+            try:
+                dest_edge = original_route[-1] if original_route else None
+                if dest_edge and current_edge != dest_edge:
+                    # Find alternative route using SUMO's route finder
+                    emergency_route = traci.simulation.findRoute(fromEdge=current_edge, toEdge=dest_edge)
+                    if emergency_route and hasattr(emergency_route, 'edges') and len(emergency_route.edges) > 1:
+                        emergency_route_list = list(emergency_route.edges)
+                        
+                        # Set emergency route directly
+                        traci.vehicle.setRoute(vehicle_id, emergency_route_list)
+                        
+                        self.logger.log_info(f"STUCK_REPLAN: Applied emergency route for {vehicle_id} - "
+                                           f"length: {len(emergency_route_list)}, travel_time: {emergency_route.travelTime:.1f}s")
+                        
+                        # Update vehicle plans with emergency route info
+                        current_region = self.edge_to_region.get(current_edge, -1)
+                        dest_region = self.edge_to_region.get(dest_edge, -1)
+                        
+                        self.vehicle_current_plans[vehicle_id] = {
+                            'macro_route': [current_region, dest_region] if current_region != -1 and dest_region != -1 else [0, 0],
+                            'detailed_route': emergency_route_list,
+                            'emergency_route': True,
+                            'original_dest_region': dest_region,
+                            'replan_time': current_time,
+                            'expected_travel_time': emergency_route.travelTime
+                        }
+                        
+                        # Successful emergency reroute - return early
+                        return
+                        
+                    else:
+                        self.logger.log_warning(f"STUCK_REPLAN: No alternative route found from {current_edge} to {dest_edge}")
+                        
+            except Exception as emergency_error:
+                self.logger.log_warning(f"STUCK_REPLAN: Emergency routing failed for {vehicle_id}: {emergency_error}")
+            
+            # If emergency routing failed, trigger macro planning as if vehicle just born
+            self.logger.log_info(f"STUCK_REPLAN: Falling back to full replanning for {vehicle_id}")
             self.handle_vehicle_birth_macro_planning(vehicle_id, current_time)
             
             # Also trigger regional planning if vehicle has macro route now
@@ -1063,6 +1240,8 @@ class MultiAgentTrafficEnvironment:
             
         except Exception as e:
             self.logger.log_error(f"STUCK_REPLAN: Failed for {vehicle_id}: {e}")
+            import traceback
+            self.logger.log_error(f"STUCK_REPLAN_TRACEBACK: {traceback.format_exc()}")
     
     def _call_traffic_llm_pioneer(self, decision_input: Dict[str, Any], macro_context: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -3378,10 +3557,17 @@ class MultiAgentTrafficEnvironment:
                             'reasoning': regional_plan.get('reasoning', 'Regional route planning')
                         }
                         
-                        # Execute the regional route using SUMO's setRoute
+                        # Execute the regional route using SUMO's setRoute with safety checks
                         if regional_plan['route'] and len(regional_plan['route']) > 0:
                             try:
-                                traci.vehicle.setRoute(vehicle_id, regional_plan['route'])
+                                # Ensure safe route setting
+                                current_edge = traci.vehicle.getRoadID(vehicle_id)
+                                safe_route = self._create_safe_route(current_edge, regional_plan['route'])
+                                if safe_route:
+                                    traci.vehicle.setRoute(vehicle_id, safe_route)
+                                    self.logger.log_info(f"REGIONAL_PLANNING: Set safe route for {vehicle_id}")
+                                else:
+                                    self.logger.log_warning(f"REGIONAL_PLANNING: Cannot create safe route for {vehicle_id}")
                             except Exception as route_error:
                                 self.logger.log_error(f"REGIONAL_PLANNING: Failed to set route for {vehicle_id}: {route_error}")
                                 return
@@ -3496,7 +3682,18 @@ class MultiAgentTrafficEnvironment:
                 except Exception as queue_error:
                     self.logger.log_warning(f"RL_DATA_QUEUE_ERROR: Failed to send training data for {vehicle_id}: {queue_error}")
             else:
-                self.logger.log_warning(f"RL_DATA_NO_QUEUE: Training queue not available for {vehicle_id}")
+                # Training mode not enabled - this is normal for non-training runs
+                self.logger.log_info(f"RL_DATA_OFFLINE: Training disabled, storing data locally for {vehicle_id}")
+                
+                # Store training data locally for potential future analysis
+                if not hasattr(self, '_offline_training_data'):
+                    self._offline_training_data = []
+                
+                self._offline_training_data.append(rl_training_data)
+                
+                # Keep only recent data to avoid memory issues
+                if len(self._offline_training_data) > 1000:
+                    self._offline_training_data = self._offline_training_data[-500:]  # Keep last 500 records
                 
         except Exception as e:
             self.logger.log_error(f"RL_DATA_COLLECTION_ERROR: Failed to collect training data for {vehicle_id}: {e}")
@@ -3947,7 +4144,7 @@ class MultiAgentTrafficEnvironment:
             for region_id, planning_data in planning_futures.items():
                 try:
                     # Wait for completion with timeout
-                    result = planning_data['future'].result(timeout=30)  # 30 second timeout per region
+                    result = planning_data['future'].result(timeout=3000)  # 30 second timeout per region
                     
                     if result:
                         completed_regions.append(region_id)
@@ -4019,15 +4216,21 @@ class MultiAgentTrafficEnvironment:
                                 'reasoning': regional_plan.get('reasoning', 'Batch regional planning')
                             }
                             
-                            # Apply route to vehicle in SUMO
+                            # Apply route to vehicle in SUMO with safety checks
                             if regional_plan['route'] and len(regional_plan['route']) > 0:
                                 try:
-                                    traci.vehicle.setRoute(vehicle_id, regional_plan['route'])
-                                    successful_plans += 1
-                                    
-                                    self.logger.log_info(f"REGIONAL_BATCH: {vehicle_id} assigned route to "
-                                                       f"{regional_plan['boundary_edge']} "
-                                                       f"(travel_time: {regional_plan.get('travel_time', 'unknown')}s)")
+                                    # Ensure safe route setting
+                                    current_edge = traci.vehicle.getRoadID(vehicle_id)
+                                    safe_route = self._create_safe_route(current_edge, regional_plan['route'])
+                                    if safe_route:
+                                        traci.vehicle.setRoute(vehicle_id, safe_route)
+                                        successful_plans += 1
+                                        
+                                        self.logger.log_info(f"REGIONAL_BATCH: {vehicle_id} assigned safe route to "
+                                                           f"{regional_plan['boundary_edge']} "
+                                                           f"(travel_time: {regional_plan.get('travel_time', 'unknown')}s)")
+                                    else:
+                                        self.logger.log_warning(f"REGIONAL_BATCH: Cannot create safe route for {vehicle_id}")
                                 except Exception as route_error:
                                     self.logger.log_error(f"REGIONAL_BATCH: Failed to set route for {vehicle_id}: {route_error}")
                         else:
