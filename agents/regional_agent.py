@@ -307,7 +307,10 @@ class RegionalAgent:
             else:
                 self.logger.log_error(f"REGIONAL_PLANNING: LLM failed to select route for {vehicle_id}")
                 # Return best heuristic candidate as fallback
-                return route_candidates[0] if route_candidates else None
+                if route_candidates:
+                    return route_candidates[0]
+                else:
+                    return None
                 
         except Exception as e:
             self.logger.log_error(f"REGIONAL_PLANNING: Critical error for {vehicle_id}: {e}")
@@ -509,14 +512,22 @@ class RegionalAgent:
             valid_candidates = [candidate for candidate in route_candidates if candidate.get('boundary_edge') is not None]
             if not valid_candidates:
                 self.logger.log_error(f"REGIONAL_ROUTING: No valid candidates for {vehicle_id}")
-                return route_candidates[0] if route_candidates else None
+                # Check if route_candidates has any elements before accessing
+                if route_candidates:
+                    return route_candidates[0]
+                else:
+                    return None
             
             # Use option indices (1, 2, 3, etc.) instead of boundary edge IDs
             answer_options = "/".join([str(i+1) for i in range(len(valid_candidates))])
             
             if not answer_options:
                 self.logger.log_error(f"REGIONAL_ROUTING: No valid answer options for {vehicle_id}")
-                return route_candidates[0] if route_candidates else None
+                # Check if route_candidates has any elements before accessing
+                if route_candidates:
+                    return route_candidates[0]
+                else:
+                    return None
             
             # Use LLM for decision making
             call_id = self.logger.log_llm_call_start(
@@ -569,7 +580,13 @@ class RegionalAgent:
                         reasoning = 'LLM returned None answer, using fallback (option 1)'
                 else:
                     # LLM response validation failed
-                    selected_boundary = valid_candidates[0]['boundary_edge'] if valid_candidates else route_candidates[0]['boundary_edge']
+                    if valid_candidates:
+                        selected_boundary = valid_candidates[0]['boundary_edge']
+                    elif route_candidates and route_candidates[0].get('boundary_edge'):
+                        selected_boundary = route_candidates[0]['boundary_edge']
+                    else:
+                        selected_boundary = None
+                    
                     reasoning = 'Invalid LLM response structure, using fallback (option 1)'
                     if decisions:
                         self.logger.log_warning(f"REGIONAL_ROUTING: Invalid LLM response: {type(decisions[0])}, len={len(decisions)}")
@@ -584,9 +601,13 @@ class RegionalAgent:
                         break
                 
                 # If LLM selection invalid, use best scored candidate
-                if not selected_candidate:
+                if not selected_candidate and route_candidates:
                     selected_candidate = route_candidates[0]
                     reasoning = f'Invalid LLM selection {selected_boundary}, using best candidate'
+                elif not selected_candidate:
+                    # No valid candidates at all, return None
+                    self.logger.log_error(f"REGIONAL_ROUTING: No valid route candidates for {vehicle_id}")
+                    return None
                 
                 # Add reasoning to result
                 selected_candidate['reasoning'] = reasoning
@@ -605,11 +626,17 @@ class RegionalAgent:
                 )
                 
                 # Fallback: return best scored candidate
-                return route_candidates[0] if route_candidates else None
+                if route_candidates:
+                    return route_candidates[0]
+                else:
+                    return None
                 
         except Exception as e:
             self.logger.log_error(f"LLM_REGIONAL_SELECT: Failed for {vehicle_id}: {e}")
-            return route_candidates[0] if route_candidates else None
+            if route_candidates:
+                return route_candidates[0]
+            else:
+                return None
     
     def _create_regional_planning_observation(self, vehicle_id: str, current_edge: str,
                                             route_candidates: List[Dict], target_region: int, current_time: float) -> str:

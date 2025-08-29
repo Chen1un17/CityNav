@@ -937,34 +937,245 @@ class MAGRPOTrainer:
             self.logger.error(f"MAGRPO_CHECKPOINT_ERROR: {e}")
     
     def _trigger_hot_reload(self, adapter_path: str):
-        """Trigger hot-reload of LoRA adapter to vLLM inference servers."""
+        """Trigger hot-reload of LoRA adapter using local LLM manager."""
         try:
             adapter_name = f"{self.name.lower()}_adapter_step_{self.training_steps}"
             
             # Prepare adapter for sync
             sync_adapter_path = self._prepare_adapter_for_sync(adapter_path, adapter_name)
             
-            # Check if any vLLM servers are actually available and support LoRA
+            # Strategy 1: Try vLLM API reload (legacy method)
+            vllm_success = self._try_vllm_api_reload(sync_adapter_path, adapter_name)
+            
+            # Strategy 2: Use local LLM manager direct loading (new method)
+            if not vllm_success:
+                self.logger.info("HOT_RELOAD_FALLBACK: vLLM API failed, trying local LLM manager")
+                local_success = self._try_local_llm_manager_reload(sync_adapter_path)
+                
+                if local_success:
+                    self.logger.info(f"HOT_RELOAD_LOCAL_SUCCESS: {adapter_name} loaded via local LLM manager")
+                else:
+                    self.logger.warning(f"HOT_RELOAD_LOCAL_FAILED: Local LLM manager reload failed")
+                    # Queue adapter for later processing
+                    self._queue_adapter_for_later_processing(sync_adapter_path)
+            else:
+                self.logger.info(f"HOT_RELOAD_VLLM_SUCCESS: {adapter_name} loaded via vLLM API")
+                    
+        except Exception as e:
+            self.logger.error(f"HOT_RELOAD_ERROR: {e}")
+    
+    def _try_vllm_api_reload(self, adapter_path: str, adapter_name: str) -> bool:
+        """Try to reload adapter via vLLM API (legacy method)."""
+        try:
             successful_loads = 0
             total_servers = len(self.config.vllm_inference_urls)
             
             # Hot-reload to all inference servers
             for vllm_url in self.config.vllm_inference_urls:
-                success = self._reload_adapter_to_vllm(vllm_url, adapter_name, sync_adapter_path)
+                success = self._reload_adapter_to_vllm(vllm_url, adapter_name, adapter_path)
                 if success:
-                    self.logger.info(f"HOT_RELOAD_SUCCESS: {adapter_name} loaded to {vllm_url}")
+                    self.logger.info(f"VLLM_API_SUCCESS: {adapter_name} loaded to {vllm_url}")
                     successful_loads += 1
                 else:
-                    self.logger.debug(f"HOT_RELOAD_SKIP: {adapter_name} not loaded to {vllm_url}")
+                    self.logger.debug(f"VLLM_API_SKIP: {adapter_name} not loaded to {vllm_url}")
             
-            if successful_loads == 0:
-                self.logger.warning(f"HOT_RELOAD_NO_SERVERS: No vLLM servers support LoRA loading. "
-                                  f"Adapters saved locally at {sync_adapter_path}")
+            if successful_loads > 0:
+                self.logger.info(f"VLLM_API_SUMMARY: {successful_loads}/{total_servers} servers updated")
+                return True
             else:
-                self.logger.info(f"HOT_RELOAD_SUMMARY: {successful_loads}/{total_servers} servers updated")
-                    
+                self.logger.debug("VLLM_API_NO_SUCCESS: No vLLM servers support LoRA loading")
+                return False
+                
         except Exception as e:
-            self.logger.error(f"HOT_RELOAD_ERROR: {e}")
+            self.logger.error(f"VLLM_API_ERROR: {e}")
+            return False
+    
+    def _try_local_llm_manager_reload(self, adapter_path: str) -> bool:
+        """Try to reload adapter via local LLM manager."""
+        try:
+            # Get LLM manager from multi-agent environment
+            llm_manager = self._get_llm_manager()
+            
+            if llm_manager is None:
+                self.logger.warning("LOCAL_RELOAD_NO_MANAGER: LLM manager not available")
+                return False
+            
+            # Determine LLM type from trainer name
+            llm_type = self.task_type.lower()  # 'traffic' or 'regional'
+            
+            # Load adapter directly to LLM manager
+            success = llm_manager.load_lora_adapter_direct(llm_type, adapter_path)
+            
+            if success:
+                self.logger.info(f"LOCAL_RELOAD_SUCCESS: {llm_type} adapter loaded successfully")
+                return True
+            else:
+                self.logger.warning(f"LOCAL_RELOAD_FAILED: {llm_type} adapter loading failed")
+                
+                # Try queuing for later processing
+                queue_success = llm_manager.queue_adapter_update(llm_type, adapter_path)
+                if queue_success:
+                    self.logger.info(f"LOCAL_RELOAD_QUEUED: {llm_type} adapter queued for later processing")
+                    return True  # Consider queuing as success
+                
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"LOCAL_RELOAD_ERROR: {e}")
+            return False
+    
+    def _get_llm_manager(self):
+        """Get LLM manager from the multi-agent environment."""
+        try:
+            # Import global access function
+            from multi_agent_env import get_global_llm_manager, list_registered_llm_managers
+            
+            # Try to get the current registered LLM manager
+            llm_manager = get_global_llm_manager()
+            
+            if llm_manager is not None:
+                self.logger.info(f"LLM_MANAGER_ACCESS: Successfully retrieved global LLM manager")
+                return llm_manager
+            else:
+                # List available managers for debugging
+                available_managers = list_registered_llm_managers()
+                self.logger.warning(f"LLM_MANAGER_ACCESS: No current LLM manager found. Available keys: {available_managers}")
+                return None
+            
+        except ImportError as e:
+            self.logger.error(f"LLM_MANAGER_ACCESS: Failed to import global access functions: {e}")
+            return None
+        except Exception as e:
+            self.logger.error(f"GET_LLM_MANAGER_ERROR: {e}")
+            return None
+    
+    def _queue_adapter_for_later_processing(self, adapter_path: str):
+        """Queue adapter for later processing when hot-reload fails."""
+        try:
+            # Store adapter path for later processing
+            if not hasattr(self, 'pending_adapters'):
+                self.pending_adapters = []
+                self.last_queue_process_time = 0
+            
+            self.pending_adapters.append({
+                'path': adapter_path,
+                'timestamp': time.time(),
+                'step': self.training_steps,
+                'retry_count': 0,
+                'adapter_name': f"{self.name.lower()}_adapter_step_{self.training_steps}",
+                'status': 'pending'
+            })
+            
+            self.logger.info(f"ADAPTER_QUEUED: {os.path.basename(adapter_path)} queued for later processing")
+            
+            # Clean up old queued adapters (keep only last 5, increased from 3)
+            if len(self.pending_adapters) > 5:
+                self.pending_adapters = self.pending_adapters[-5:]
+                
+        except Exception as e:
+            self.logger.error(f"ADAPTER_QUEUE_ERROR: {e}")
+
+    def _process_pending_adapters(self):
+        """Process queued adapters that failed initial loading."""
+        try:
+            if not hasattr(self, 'pending_adapters') or not self.pending_adapters:
+                return
+                
+            current_time = time.time()
+            
+            # Throttle queue processing - only process every 30 seconds
+            if current_time - getattr(self, 'last_queue_process_time', 0) < 30:
+                return
+                
+            self.last_queue_process_time = current_time
+            processed_count = 0
+            failed_count = 0
+            
+            # Process adapters in FIFO order
+            adapters_to_remove = []
+            
+            for i, adapter_info in enumerate(self.pending_adapters):
+                if processed_count >= 2:  # Limit processing to 2 adapters per cycle
+                    break
+                    
+                adapter_path = adapter_info['path']
+                adapter_name = adapter_info['adapter_name'] 
+                retry_count = adapter_info['retry_count']
+                timestamp = adapter_info['timestamp']
+                
+                # Skip if adapter is too old (older than 10 minutes)
+                if current_time - timestamp > 600:
+                    adapters_to_remove.append(i)
+                    self.logger.info(f"ADAPTER_EXPIRED: {adapter_name} removed from queue (too old)")
+                    continue
+                
+                # Skip if already reached max retry count
+                if retry_count >= 3:
+                    adapters_to_remove.append(i)
+                    self.logger.warning(f"ADAPTER_MAX_RETRIES: {adapter_name} removed from queue (max retries reached)")
+                    continue
+                
+                # Try to load the adapter again
+                self.logger.info(f"ADAPTER_RETRY: Attempting to load {adapter_name} (retry #{retry_count + 1})")
+                
+                success = self._retry_adapter_loading(adapter_path, adapter_name)
+                
+                if success:
+                    adapters_to_remove.append(i)
+                    processed_count += 1
+                    self.logger.info(f"ADAPTER_RETRY_SUCCESS: {adapter_name} loaded successfully from queue")
+                else:
+                    # Increment retry count for failed attempts
+                    self.pending_adapters[i]['retry_count'] = retry_count + 1
+                    self.pending_adapters[i]['status'] = 'failed'
+                    failed_count += 1
+                    self.logger.warning(f"ADAPTER_RETRY_FAILED: {adapter_name} failed retry #{retry_count + 1}")
+                    
+            # Remove processed/expired adapters in reverse order to maintain indices
+            for i in reversed(adapters_to_remove):
+                self.pending_adapters.pop(i)
+                
+            if processed_count > 0 or failed_count > 0:
+                self.logger.info(f"QUEUE_PROCESSING: Processed={processed_count}, Failed={failed_count}, "
+                               f"Remaining={len(self.pending_adapters)}")
+                
+        except Exception as e:
+            self.logger.error(f"QUEUE_PROCESSING_ERROR: {e}")
+
+    def _retry_adapter_loading(self, adapter_path: str, adapter_name: str) -> bool:
+        """Retry loading a queued adapter using all available methods."""
+        try:
+            # Method 1: Try local LLM manager loading
+            local_success = self._try_local_llm_manager_reload(adapter_path)
+            if local_success:
+                return True
+                
+            # Method 2: Try vLLM API loading (in case vLLM server was restarted with LoRA support)
+            vllm_success = self._try_vllm_api_reload(adapter_path, adapter_name)
+            if vllm_success:
+                return True
+                
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"ADAPTER_RETRY_ERROR: {e}")
+            return False
+
+    def get_adapter_queue_stats(self) -> Dict[str, Any]:
+        """Get statistics about the adapter queue."""
+        if not hasattr(self, 'pending_adapters'):
+            return {'queue_size': 0, 'total_pending': 0, 'total_failed': 0}
+            
+        pending_count = sum(1 for a in self.pending_adapters if a['status'] == 'pending')
+        failed_count = sum(1 for a in self.pending_adapters if a['status'] == 'failed')
+        
+        return {
+            'queue_size': len(self.pending_adapters),
+            'total_pending': pending_count,
+            'total_failed': failed_count,
+            'oldest_timestamp': min((a['timestamp'] for a in self.pending_adapters), default=0),
+            'last_process_time': getattr(self, 'last_queue_process_time', 0)
+        }
     
     def _prepare_adapter_for_sync(self, adapter_path: str, adapter_name: str) -> str:
         """Prepare adapter for synchronization to vLLM servers."""
@@ -1362,16 +1573,42 @@ class TrainingManager:
             'detailed': os.path.join(self.config.log_dir, "charts", "detailed_metrics.png")
         }
         
-        # Enhanced RL Tracking for Visualization (Step size: 180, Total: 43200)
+        # Initialize persistent figure objects for real-time updates
+        self.figures_initialized = False
+        self.fig1 = None
+        self.fig2 = None
+        self.axes1 = None
+        self.axes2 = None
+        self.line_objects = {}  # Store line objects for efficient updates
+        
+        # Enhanced RL Tracking for Visualization
         self.simulation_step_size = 180  # From user specification
-        self.total_simulation_steps = 43200  # From user specification
+        self.total_autonomous_vehicles = None  # Will be set dynamically based on actual vehicle count
+        self.total_simulation_steps = 43200  # Keep as fallback for compatibility
         self.visualization_update_interval = max(1, self.simulation_step_size // 10)  # Update every ~18 training steps
         
-        # RL Metrics Accumulation
+        # RL Metrics Accumulation with Historical Tracking
         self.cumulative_rewards = {
             'traffic': {'att_reward': 0.0, 'cooperation_reward': 0.0, 'total_reward': 0.0},
             'regional': {'efficiency_reward': 0.0, 'protection_reward': 0.0, 'cooperation_reward': 0.0, 'total_reward': 0.0}
         }
+        
+        # Historical data for line plots (time series)
+        self.training_history = {
+            'steps': [],
+            'traffic_loss': [],
+            'regional_loss': [],
+            'traffic_reward': [],
+            'regional_reward': [],
+            'traffic_lr': [],
+            'regional_lr': [],
+            'att_improvement': [],
+            'cooperation_quality': [],
+            'phase_transitions': []
+        }
+        
+        # Moving averages for smoother trends
+        self.moving_avg_window = 10
         
         self.att_improvement_history = []
         self.cooperation_quality_history = []
@@ -1383,7 +1620,7 @@ class TrainingManager:
         self.logger.info("TRAINING_MANAGER_INIT: MAGRPO Training Manager with Progressive Mixed Training initialized")
         self.logger.info(f"PROGRESSIVE_TRAINING: Mode={self.current_training_mode}, Phase={self.global_training_phase}")
         self.logger.info(f"VISUALIZATION: W&B enabled={self.wandb_enabled}, Update interval={self.visualization_update_interval}")
-        self.logger.info(f"SIMULATION_CONFIG: Step size={self.simulation_step_size}, Total steps={self.total_simulation_steps}")
+        self.logger.info(f"SIMULATION_CONFIG: Step size={self.simulation_step_size}, Total steps={self.total_simulation_steps}, Auto vehicles=TBD")
         self.logger.info(f"TRAINING_CONFIG: Traffic group size: {config.traffic_group_size}, Regional group size: {config.regional_group_size}")
         self.logger.info(f"TRAINING_GPUS: Traffic GPU: {config.traffic_gpu}, Regional GPU: {config.regional_gpu}")
         self.logger.info(f"TRAINING_QUEUE: Queue available: {self.training_queue is not None}")
@@ -1440,6 +1677,21 @@ class TrainingManager:
         except Exception as e:
             self.logger.error(f"HISTORICAL_DATA_ERROR: {e}")
             return {'traffic': 0, 'regional': 0}
+    
+    def set_total_autonomous_vehicles(self, total_vehicles: int):
+        """Set the total number of autonomous vehicles for accurate progress calculation."""
+        try:
+            self.total_autonomous_vehicles = total_vehicles
+            self.logger.info(f"AUTONOMOUS_VEHICLES_SET: Total autonomous vehicles updated to {total_vehicles}")
+            
+            # Update visualization settings based on vehicle count
+            if total_vehicles > 0:
+                # Adjust visualization interval based on vehicle count
+                self.visualization_update_interval = max(1, total_vehicles // 50)  # Update every ~2% of vehicles
+                self.logger.info(f"VISUALIZATION_INTERVAL: Updated to {self.visualization_update_interval} based on {total_vehicles} vehicles")
+            
+        except Exception as e:
+            self.logger.error(f"SET_AUTONOMOUS_VEHICLES_ERROR: {e}")
 
     def _setup_logger(self) -> logging.Logger:
         """Setup main training manager logger."""
@@ -1466,8 +1718,8 @@ class TrainingManager:
         
         return logger
     
-    def _generate_local_charts(self):
-        """Generate and save local charts for RL training visualization."""
+    def _initialize_persistent_figures(self):
+        """Initialize persistent matplotlib figures for real-time updates."""
         try:
             # Create charts directory
             charts_dir = os.path.join(self.config.log_dir, "charts")
@@ -1477,168 +1729,321 @@ class TrainingManager:
             plt.style.use('seaborn-v0_8')
             sns.set_palette("husl")
             
-            # Use fixed file names for chart updates
-            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            # Enable interactive mode for real-time updates
+            plt.ion()
             
-            # Figure 1: Cumulative Rewards Over Time
-            fig1, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
-            fig1.suptitle(f'MAGRPO Dual-LLM Training Progress - Updated: {current_time}', fontsize=16, fontweight='bold')
+            # Figure 1: Training Loss Convergence Analysis
+            self.fig1, self.axes1 = plt.subplots(2, 2, figsize=(16, 12))
+            self.fig1.suptitle('MAGRPO Training Loss & Convergence Analysis - Live Updates', 
+                              fontsize=16, fontweight='bold')
             
-            # Traffic LLM Rewards
-            ax1.plot(self.att_improvement_history, 'b-', linewidth=2, label='ATT Improvement', alpha=0.8)
-            ax1.set_title('Traffic LLM: ATT Improvement Over Time', fontweight='bold')
+            # Initialize empty plots and store line objects for efficient updates
+            ax1, ax2, ax3, ax4 = self.axes1.flatten()
+            
+            # Plot 1: Loss History Trends
+            self.line_objects['traffic_loss'], = ax1.plot([], [], 'b-', linewidth=2, label='Traffic LLM Loss', alpha=0.8)
+            self.line_objects['regional_loss'], = ax1.plot([], [], 'r-', linewidth=2, label='Regional LLM Loss', alpha=0.8)
+            self.line_objects['traffic_loss_ma'], = ax1.plot([], [], 'b--', linewidth=3, label='Traffic MA', alpha=0.6)
+            self.line_objects['regional_loss_ma'], = ax1.plot([], [], 'r--', linewidth=3, label='Regional MA', alpha=0.6)
+            
+            ax1.set_title('Training Loss Convergence Analysis', fontweight='bold')
             ax1.set_xlabel('Training Steps')
-            ax1.set_ylabel('Improvement Score')
+            ax1.set_ylabel('Loss Value')
+            ax1.set_yscale('log')
             ax1.grid(True, alpha=0.3)
             ax1.legend()
             
-            # Regional LLM Rewards
-            if len(self.cooperation_quality_history) > 0:
-                ax2.plot(self.cooperation_quality_history, 'g-', linewidth=2, label='Cooperation Quality', alpha=0.8)
-                ax2.set_title('Regional LLM: Cooperation Quality Over Time', fontweight='bold')
-                ax2.set_xlabel('Training Steps')
-                ax2.set_ylabel('Quality Score')
-                ax2.grid(True, alpha=0.3)
-                ax2.legend()
+            # Plot 2: Reward Evolution
+            self.line_objects['traffic_reward'], = ax2.plot([], [], 'g-', linewidth=2, label='Traffic LLM Reward', alpha=0.8)
+            self.line_objects['regional_reward'], = ax2.plot([], [], 'm-', linewidth=2, label='Regional LLM Reward', alpha=0.8)
+            self.line_objects['traffic_reward_fill'] = ax2.fill_between([], [], [], alpha=0.2, color='green', label='Traffic Reward Area')
+            self.line_objects['regional_reward_fill'] = ax2.fill_between([], [], [], alpha=0.2, color='magenta', label='Regional Reward Area')
             
-            # Cumulative Rewards Comparison
-            traffic_total = (self.cumulative_rewards['traffic']['att_reward'] + 
-                           self.cumulative_rewards['traffic']['cooperation_reward'])
-            regional_total = (self.cumulative_rewards['regional']['efficiency_reward'] + 
-                            self.cumulative_rewards['regional']['protection_reward'] +
-                            self.cumulative_rewards['regional']['cooperation_reward'])
+            ax2.set_title('Reward Evolution & Accumulation', fontweight='bold')
+            ax2.set_xlabel('Training Steps')
+            ax2.set_ylabel('Reward Value')
+            ax2.grid(True, alpha=0.3)
+            ax2.legend()
             
-            rewards_comparison = ['Traffic LLM', 'Regional LLM']
-            rewards_values = [traffic_total, regional_total]
-            colors = ['skyblue', 'lightgreen']
+            # Plot 3: Learning Rate Scheduling
+            self.line_objects['traffic_lr'], = ax3.plot([], [], 'orange', linewidth=2, label='Traffic LLM LR', alpha=0.8)
+            self.line_objects['regional_lr'], = ax3.plot([], [], 'purple', linewidth=2, label='Regional LLM LR', alpha=0.8)
             
-            bars = ax3.bar(rewards_comparison, rewards_values, color=colors, alpha=0.7, edgecolor='black')
-            ax3.set_title('Cumulative Rewards Comparison', fontweight='bold')
-            ax3.set_ylabel('Total Reward')
-            ax3.grid(True, alpha=0.3, axis='y')
+            ax3.set_title('Learning Rate Schedule', fontweight='bold')
+            ax3.set_xlabel('Training Steps')
+            ax3.set_ylabel('Learning Rate')
+            ax3.set_yscale('log')
+            ax3.grid(True, alpha=0.3)
+            ax3.legend()
             
-            # Add value labels on bars
-            for bar, value in zip(bars, rewards_values):
-                height = bar.get_height()
-                ax3.text(bar.get_x() + bar.get_width()/2., height + 0.01,
-                        f'{value:.3f}', ha='center', va='bottom', fontweight='bold')
+            # Plot 4: Phase Transitions
+            ax4.set_title('Training Phase Transitions Timeline', fontweight='bold')
+            ax4.set_xlabel('Training Steps')
+            ax4.set_ylabel('Phase Events')
+            ax4.grid(True, alpha=0.3)
+            self.line_objects['phase_lines'] = []  # Store phase transition lines
             
-            # Phase Transitions
+            plt.tight_layout()
+            
+            # Figure 2: Detailed RL Performance Metrics
+            self.fig2, self.axes2 = plt.subplots(2, 2, figsize=(16, 12))
+            self.fig2.suptitle('Detailed RL Performance & Convergence Metrics - Live Updates', 
+                              fontsize=16, fontweight='bold')
+            
+            ax5, ax6, ax7, ax8 = self.axes2.flatten()
+            
+            # Plot 5: ATT Improvement & Cooperation Quality
+            self.line_objects['att_improvement'], = ax5.plot([], [], 'b-', linewidth=2, 
+                                                           label='ATT Improvement', alpha=0.8, marker='o', markersize=3)
+            self.line_objects['cooperation_quality'], = ax5.plot([], [], 'g-', linewidth=2, 
+                                                               label='Cooperation Quality', alpha=0.8, marker='s', markersize=3)
+            
+            ax5.set_title('ATT Improvement & Cooperation Quality Evolution', fontweight='bold')
+            ax5.set_xlabel('Sample Points')
+            ax5.set_ylabel('Quality Score')
+            ax5.grid(True, alpha=0.3)
+            ax5.legend()
+            
+            # Plot 6: Reward Components (will be updated with stackplot)
+            ax6.set_title('Traffic LLM: Reward Components Evolution', fontweight='bold')
+            ax6.set_xlabel('Training Steps')
+            ax6.set_ylabel('Cumulative Reward')
+            ax6.grid(True, alpha=0.3)
+            
+            # Plot 7: Training Throughput
+            self.line_objects['sample_throughput'], = ax7.plot([], [], 'darkgreen', linewidth=2, 
+                                                              label='Sample Throughput', alpha=0.8)
+            
+            ax7.set_title('Training Throughput & Sample Processing Rate', fontweight='bold')
+            ax7.set_xlabel('Training Steps')
+            ax7.set_ylabel('Samples Processed')
+            ax7.grid(True, alpha=0.3)
+            ax7.legend()
+            
+            # Plot 8: Model Convergence Indicators
+            self.line_objects['traffic_loss_diff'], = ax8.plot([], [], 'red', linewidth=2, 
+                                                              label='Traffic Loss Δ', alpha=0.8)
+            self.line_objects['regional_loss_diff'], = ax8.plot([], [], 'blue', linewidth=2, 
+                                                               label='Regional Loss Δ', alpha=0.8)
+            ax8.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+            
+            ax8.set_title('Loss Convergence Indicators (Δ Loss)', fontweight='bold')
+            ax8.set_xlabel('Training Steps')
+            ax8.set_ylabel('Loss Change')
+            ax8.grid(True, alpha=0.3)
+            ax8.legend()
+            
+            plt.tight_layout()
+            
+            self.figures_initialized = True
+            self.logger.info("CHARTS_INITIALIZED: Persistent figures initialized for real-time updates")
+            
+        except Exception as e:
+            self.logger.error(f"CHART_INIT_ERROR: Failed to initialize persistent figures: {e}")
+            self.figures_initialized = False
+
+    def _update_persistent_charts(self):
+        """Update persistent charts with new data for real-time visualization."""
+        try:
+            if not self.figures_initialized:
+                self._initialize_persistent_figures()
+                if not self.figures_initialized:
+                    return None, None
+            
+            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Only update if we have data
+            if len(self.training_history['steps']) == 0:
+                return self.chart_files['main'], self.chart_files['detailed']
+            
+            steps = self.training_history['steps']
+            
+            # Update Figure 1 - Training Analysis
+            ax1, ax2, ax3, ax4 = self.axes1.flatten()
+            
+            # Update Plot 1: Loss History Trends
+            if len(self.training_history['traffic_loss']) > 0:
+                traffic_loss = self.training_history['traffic_loss']
+                regional_loss = self.training_history['regional_loss']
+                
+                # Update main loss lines
+                self.line_objects['traffic_loss'].set_data(steps, traffic_loss)
+                self.line_objects['regional_loss'].set_data(steps, regional_loss)
+                
+                # Update moving averages if enough data
+                if len(traffic_loss) >= self.moving_avg_window:
+                    traffic_ma = np.convolve(traffic_loss, np.ones(self.moving_avg_window)/self.moving_avg_window, mode='valid')
+                    regional_ma = np.convolve(regional_loss, np.ones(self.moving_avg_window)/self.moving_avg_window, mode='valid')
+                    ma_steps = steps[self.moving_avg_window-1:]
+                    
+                    self.line_objects['traffic_loss_ma'].set_data(ma_steps, traffic_ma)
+                    self.line_objects['regional_loss_ma'].set_data(ma_steps, regional_ma)
+                
+                # Auto-scale axes
+                ax1.relim()
+                ax1.autoscale_view()
+            
+            # Update Plot 2: Reward Evolution
+            if len(self.training_history['traffic_reward']) > 0:
+                traffic_reward = self.training_history['traffic_reward']
+                regional_reward = self.training_history['regional_reward']
+                
+                self.line_objects['traffic_reward'].set_data(steps, traffic_reward)
+                self.line_objects['regional_reward'].set_data(steps, regional_reward)
+                
+                # Remove old fill_between and add new ones
+                self.line_objects['traffic_reward_fill'].remove()
+                self.line_objects['regional_reward_fill'].remove()
+                
+                self.line_objects['traffic_reward_fill'] = ax2.fill_between(steps, 0, traffic_reward, 
+                                                                           alpha=0.2, color='green', label='Traffic Reward Area')
+                self.line_objects['regional_reward_fill'] = ax2.fill_between(steps, 0, regional_reward, 
+                                                                            alpha=0.2, color='magenta', label='Regional Reward Area')
+                
+                ax2.relim()
+                ax2.autoscale_view()
+            
+            # Update Plot 3: Learning Rate
+            if len(self.training_history['traffic_lr']) > 0:
+                traffic_lr = self.training_history['traffic_lr']
+                regional_lr = self.training_history['regional_lr']
+                
+                self.line_objects['traffic_lr'].set_data(steps, traffic_lr)
+                self.line_objects['regional_lr'].set_data(steps, regional_lr)
+                
+                ax3.relim()
+                ax3.autoscale_view()
+            
+            # Update Plot 4: Phase Transitions
             if len(self.phase_transition_events) > 0:
-                phases = [event['phase'] for event in self.phase_transition_events]
-                phase_counts = defaultdict(int)
-                for phase in phases:
-                    phase_counts[phase] += 1
+                # Clear previous phase lines
+                for line in self.line_objects['phase_lines']:
+                    line.remove()
+                self.line_objects['phase_lines'].clear()
                 
-                ax4.pie(phase_counts.values(), labels=phase_counts.keys(), autopct='%1.1f%%',
-                       startangle=90, colors=['#ff9999', '#66b3ff', '#99ff99'])
-                ax4.set_title('Training Phase Distribution', fontweight='bold')
+                # Add current phase transitions
+                phase_steps = [event['step'] for event in self.phase_transition_events]
+                phase_names = [event['phase'] for event in self.phase_transition_events]
+                
+                unique_phases = list(set(phase_names))
+                colors = plt.cm.Set3(np.linspace(0, 1, len(unique_phases)))
+                phase_colors = {phase: colors[i] for i, phase in enumerate(unique_phases)}
+                
+                added_labels = set()
+                for step, phase in zip(phase_steps, phase_names):
+                    label = phase if phase not in added_labels else ""
+                    if label:
+                        added_labels.add(phase)
+                    
+                    line = ax4.axvline(x=step, color=phase_colors[phase], alpha=0.7, linewidth=3, label=label)
+                    self.line_objects['phase_lines'].append(line)
+                
+                # Update current phase text
+                ax4.text(0.02, 0.98, f'Current Phase: {self.global_training_phase}\nUpdated: {current_time}', 
+                        transform=ax4.transAxes, verticalalignment='top', 
+                        bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8), fontsize=10)
+                
+                ax4.legend()
             
-            plt.tight_layout()
+            # Update Figure 2 - Detailed Metrics  
+            ax5, ax6, ax7, ax8 = self.axes2.flatten()
             
-            # Save the main chart with fixed filename for in-place update
+            # Update Plot 5: ATT & Cooperation
+            if len(self.att_improvement_history) > 0:
+                att_steps = list(range(len(self.att_improvement_history)))
+                self.line_objects['att_improvement'].set_data(att_steps, self.att_improvement_history)
+                ax5.relim()
+                ax5.autoscale_view()
+            
+            if len(self.cooperation_quality_history) > 0:
+                coop_steps = list(range(len(self.cooperation_quality_history)))
+                self.line_objects['cooperation_quality'].set_data(coop_steps, self.cooperation_quality_history)
+                ax5.relim()
+                ax5.autoscale_view()
+            
+            # Update Plot 6: Reward Components (recreate stackplot)
+            if len(self.training_history['steps']) > 0:
+                ax6.clear()  # Clear and recreate stackplot
+                
+                traffic_att = [self.cumulative_rewards['traffic']['att_reward'] * (i+1) / len(steps) 
+                              for i in range(len(steps))]
+                traffic_coop = [self.cumulative_rewards['traffic']['cooperation_reward'] * (i+1) / len(steps) 
+                               for i in range(len(steps))]
+                
+                if len(traffic_att) > 0:
+                    ax6.stackplot(steps, traffic_att, traffic_coop, 
+                                 labels=['ATT Reward', 'Cooperation Reward'],
+                                 colors=['skyblue', 'lightcoral'], alpha=0.7)
+                    ax6.set_title('Traffic LLM: Reward Components Evolution', fontweight='bold')
+                    ax6.set_xlabel('Training Steps')
+                    ax6.set_ylabel('Cumulative Reward')
+                    ax6.grid(True, alpha=0.3)
+                    ax6.legend(loc='upper left')
+            
+            # Update Plot 7: Sample Throughput
+            if len(self.training_history['steps']) > 0:
+                sample_throughput = [self.total_samples_processed * (i+1) / len(steps) 
+                                   for i in range(len(steps))]
+                self.line_objects['sample_throughput'].set_data(steps, sample_throughput)
+                ax7.relim()
+                ax7.autoscale_view()
+            
+            # Update Plot 8: Loss Convergence
+            if len(self.training_history['traffic_loss']) > 1:
+                traffic_loss_diff = np.diff(self.training_history['traffic_loss'])
+                regional_loss_diff = np.diff(self.training_history['regional_loss'])
+                diff_steps = steps[1:]
+                
+                self.line_objects['traffic_loss_diff'].set_data(diff_steps, traffic_loss_diff)
+                self.line_objects['regional_loss_diff'].set_data(diff_steps, regional_loss_diff)
+                
+                # Update convergence status
+                recent_traffic_trend = np.mean(traffic_loss_diff[-5:]) if len(traffic_loss_diff) >= 5 else 0
+                recent_regional_trend = np.mean(regional_loss_diff[-5:]) if len(regional_loss_diff) >= 5 else 0
+                
+                convergence_status = "Converging" if abs(recent_traffic_trend) < 0.01 and abs(recent_regional_trend) < 0.01 else "Training"
+                ax8.text(0.02, 0.98, f'Status: {convergence_status}\nUpdated: {current_time}', 
+                        transform=ax8.transAxes, verticalalignment='top', 
+                        bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8), fontsize=10)
+                
+                ax8.relim()
+                ax8.autoscale_view()
+            
+            # Save updated figures to same files (overwrite)
             chart_path = self.chart_files['main']
-            plt.savefig(chart_path, dpi=300, bbox_inches='tight', facecolor='white')
-            self.logger.info(f"CHART_UPDATED: Main progress chart updated at {chart_path}")
-            plt.close(fig1)
-            
-            # Figure 2: Detailed RL Metrics
-            fig2, ((ax5, ax6), (ax7, ax8)) = plt.subplots(2, 2, figsize=(16, 12))
-            fig2.suptitle(f'Detailed RL Training Metrics - Updated: {current_time}', fontsize=16, fontweight='bold')
-            
-            # Traffic LLM Detailed Breakdown
-            traffic_rewards = self.cumulative_rewards['traffic']
-            if traffic_rewards['total_reward'] > 0:
-                traffic_labels = ['ATT Reward', 'Cooperation Reward']
-                traffic_values = [traffic_rewards['att_reward'], traffic_rewards['cooperation_reward']]
-                ax5.pie(traffic_values, labels=traffic_labels, autopct='%1.1f%%', 
-                       colors=['#ffcc99', '#ff99cc'], startangle=45)
-                ax5.set_title('Traffic LLM: Reward Breakdown', fontweight='bold')
-            
-            # Regional LLM Detailed Breakdown
-            regional_rewards = self.cumulative_rewards['regional']
-            if regional_rewards['total_reward'] > 0:
-                regional_labels = ['Efficiency', 'Protection', 'Cooperation']
-                regional_values = [regional_rewards['efficiency_reward'], 
-                                 regional_rewards['protection_reward'],
-                                 regional_rewards['cooperation_reward']]
-                ax6.pie(regional_values, labels=regional_labels, autopct='%1.1f%%', 
-                       colors=['#99ffcc', '#ccff99', '#ffccff'], startangle=45)
-                ax6.set_title('Regional LLM: Reward Breakdown', fontweight='bold')
-            
-            # Training Statistics
-            stats_labels = ['Traffic Steps', 'Regional Steps', 'Total Samples']
-            stats_values = [self.training_stats['traffic']['total_steps'],
-                          self.training_stats['regional']['total_steps'], 
-                          self.total_samples_processed]
-            
-            bars2 = ax7.bar(stats_labels, stats_values, color=['steelblue', 'darkorange', 'forestgreen'], 
-                          alpha=0.7, edgecolor='black')
-            ax7.set_title('Training Volume Statistics', fontweight='bold')
-            ax7.set_ylabel('Count')
-            ax7.grid(True, alpha=0.3, axis='y')
-            
-            # Add value labels
-            for bar, value in zip(bars2, stats_values):
-                height = bar.get_height()
-                ax7.text(bar.get_x() + bar.get_width()/2., height + max(stats_values)*0.01,
-                        f'{value}', ha='center', va='bottom', fontweight='bold')
-            
-            # Loss Trends - Show both current and average
-            if (self.training_stats['traffic']['total_steps'] > 0 and 
-                self.training_stats['regional']['total_steps'] > 0):
-                
-                traffic_avg_loss = (self.training_stats['traffic']['total_loss'] / 
-                                  self.training_stats['traffic']['total_steps'])
-                regional_avg_loss = (self.training_stats['regional']['total_loss'] / 
-                                   self.training_stats['regional']['total_steps'])
-                
-                traffic_current_loss = self.training_stats['traffic']['last_loss']
-                regional_current_loss = self.training_stats['regional']['last_loss']
-                
-                loss_types = ['Traffic\nAverage', 'Traffic\nCurrent', 'Regional\nAverage', 'Regional\nCurrent']
-                loss_values = [traffic_avg_loss, traffic_current_loss, regional_avg_loss, regional_current_loss]
-                colors = ['crimson', 'lightcoral', 'darkviolet', 'mediumpurple']
-                
-                bars3 = ax8.bar(loss_types, loss_values, color=colors, alpha=0.7, edgecolor='black')
-                ax8.set_title('Training Loss Comparison', fontweight='bold')
-                ax8.set_ylabel('Loss Value')
-                ax8.grid(True, alpha=0.3, axis='y')
-                ax8.tick_params(axis='x', rotation=45)
-                
-                # Add value labels
-                for bar, value in zip(bars3, loss_values):
-                    height = bar.get_height()
-                    ax8.text(bar.get_x() + bar.get_width()/2., height + max(loss_values)*0.01,
-                            f'{value:.3f}', ha='center', va='bottom', fontweight='bold', fontsize=9)
-                
-                # Add parameter update status as text annotation
-                traffic_updated = "Updated" if self.training_stats['traffic']['parameters_updated'] else "No Update"
-                regional_updated = "Updated" if self.training_stats['regional']['parameters_updated'] else "No Update"
-                
-                ax8.text(0.02, 0.98, f'Parameter Status:\nTraffic: {traffic_updated}\nRegional: {regional_updated}', 
-                        transform=ax8.transAxes, verticalalignment='top', bbox=dict(boxstyle='round', 
-                        facecolor='lightgray', alpha=0.8), fontsize=9)
-            
-            plt.tight_layout()
-            
-            # Save the detailed metrics chart with fixed filename for in-place update
             detailed_chart_path = self.chart_files['detailed']
-            plt.savefig(detailed_chart_path, dpi=300, bbox_inches='tight', facecolor='white')
-            self.logger.info(f"CHART_UPDATED: Detailed metrics chart updated at {detailed_chart_path}")
-            plt.close(fig2)
+            
+            self.fig1.savefig(chart_path, dpi=300, bbox_inches='tight', facecolor='white')
+            self.fig2.savefig(detailed_chart_path, dpi=300, bbox_inches='tight', facecolor='white')
+            
+            # Force display update
+            self.fig1.canvas.draw()
+            self.fig2.canvas.draw()
+            plt.pause(0.01)  # Small pause to allow GUI update
+            
+            self.logger.info(f"CHARTS_UPDATED: Real-time charts updated at {current_time}")
             
             return chart_path, detailed_chart_path
             
         except Exception as e:
-            self.logger.error(f"LOCAL_CHART_ERROR: Failed to generate charts: {e}")
+            self.logger.error(f"REAL_TIME_CHART_ERROR: Failed to update persistent charts: {e}")
             return None, None
+
+    def _generate_local_charts(self):
+        """Generate or update local charts with real-time updates."""
+        return self._update_persistent_charts()
     
     def _update_rl_metrics(self, trainer_type: str, metrics: Dict[str, float], 
                           vehicle_sample: Dict[str, Any] = None):
-        """Update RL metrics for visualization and tracking."""
+        """Update RL metrics for visualization and tracking with historical data collection."""
         try:
-            # Update cumulative rewards
+            current_step = self.training_stats[trainer_type]['total_steps']
+            
+            # Update training history for line plots
+            if current_step not in self.training_history['steps']:
+                self.training_history['steps'].append(current_step)
+            
+            # Update cumulative rewards and historical data
             if trainer_type == 'traffic':
                 att_reward = metrics.get('relative_reward_mean', 0.0) * 0.6  # ATT component
                 coop_reward = metrics.get('relative_reward_mean', 0.0) * 0.4  # Cooperation component
@@ -1647,7 +2052,13 @@ class TrainingManager:
                 self.cumulative_rewards['traffic']['cooperation_reward'] += coop_reward
                 self.cumulative_rewards['traffic']['total_reward'] += att_reward + coop_reward
                 
-                # Track ATT improvement history
+                # Update historical data for line plots
+                self.training_history['traffic_loss'].append(metrics.get('loss', 0.0))
+                self.training_history['traffic_reward'].append(att_reward + coop_reward)
+                self.training_history['traffic_lr'].append(metrics.get('learning_rate', 0.0))
+                self.training_history['att_improvement'].append(att_reward)
+                
+                # Track ATT improvement history (for compatibility)
                 if len(self.att_improvement_history) == 0 or len(self.att_improvement_history) % 10 == 0:
                     # Sample every 10 steps to reduce memory usage
                     self.att_improvement_history.append(att_reward)
@@ -1663,7 +2074,13 @@ class TrainingManager:
                 total = efficiency_reward + protection_reward + coop_reward
                 self.cumulative_rewards['regional']['total_reward'] += total
                 
-                # Track cooperation quality history
+                # Update historical data for line plots
+                self.training_history['regional_loss'].append(metrics.get('loss', 0.0))
+                self.training_history['regional_reward'].append(total)
+                self.training_history['regional_lr'].append(metrics.get('learning_rate', 0.0))
+                self.training_history['cooperation_quality'].append(coop_reward)
+                
+                # Track cooperation quality history (for compatibility)
                 if len(self.cooperation_quality_history) == 0 or len(self.cooperation_quality_history) % 10 == 0:
                     self.cooperation_quality_history.append(coop_reward)
             
@@ -1672,11 +2089,22 @@ class TrainingManager:
             if (len(self.phase_transition_events) == 0 or 
                 self.phase_transition_events[-1]['phase'] != current_phase):
                 
-                self.phase_transition_events.append({
-                    'step': self.training_stats[trainer_type]['total_steps'],
+                phase_event = {
+                    'step': current_step,
                     'phase': current_phase,
                     'timestamp': time.time()
-                })
+                }
+                self.phase_transition_events.append(phase_event)
+                self.training_history['phase_transitions'].append(phase_event)
+            
+            # Maintain reasonable history size (keep last 1000 points)
+            max_history_size = 1000
+            if len(self.training_history['steps']) > max_history_size:
+                # Remove oldest entries to maintain size
+                excess_count = len(self.training_history['steps']) - max_history_size
+                for key in self.training_history:
+                    if isinstance(self.training_history[key], list):
+                        self.training_history[key] = self.training_history[key][excess_count:]
             
             # Log to W&B if available
             if self.wandb_enabled:
@@ -1766,14 +2194,24 @@ class TrainingManager:
                 # Heartbeat logging for debugging  
                 if current_time - last_heartbeat_time >= heartbeat_interval:
                     runtime = current_time - self.start_time
-                    progress = min(100.0, (self.total_samples_processed / self.total_simulation_steps) * 100)
+                    
+                    # Calculate progress based on autonomous vehicles if available, otherwise use simulation steps
+                    if self.total_autonomous_vehicles and self.total_autonomous_vehicles > 0:
+                        progress = min(100.0, (self.total_samples_processed / self.total_autonomous_vehicles) * 100)
+                        progress_text = f"{self.total_samples_processed}/{self.total_autonomous_vehicles}"
+                    else:
+                        progress = min(100.0, (self.total_samples_processed / self.total_simulation_steps) * 100)
+                        progress_text = f"{self.total_samples_processed}/{self.total_simulation_steps}"
                     
                     self.logger.info(f"PROGRESSIVE_HEARTBEAT: Runtime: {runtime:.1f}s, "
-                                   f"Progress: {progress:.1f}% ({self.total_samples_processed}/{self.total_simulation_steps}), "
+                                   f"Progress: {progress:.1f}% ({progress_text}), "
                                    f"Traffic buffer: {self.traffic_buffer.size()}, "
                                    f"Regional buffer: {self.regional_buffer.size()}, "
                                    f"Global phase: {self.global_training_phase}")
                     last_heartbeat_time = current_time
+                
+                # Process pending adapter queue (try to load previously failed adapters)
+                self._process_trainer_adapter_queues()
                 
                 # Phase transition management
                 self._manage_global_phase_transitions()
@@ -1970,6 +2408,56 @@ class TrainingManager:
                 
         except Exception as e:
             self.logger.error(f"HISTORICAL_DATA_SAVE_ERROR: {e}")
+
+    def _process_trainer_adapter_queues(self):
+        """Process pending adapters for both Traffic and Regional LLM trainers."""
+        try:
+            # Process pending adapters for Traffic LLM
+            if hasattr(self.traffic_trainer, '_process_pending_adapters'):
+                self.traffic_trainer._process_pending_adapters()
+                
+            # Process pending adapters for Regional LLM  
+            if hasattr(self.regional_trainer, '_process_pending_adapters'):
+                self.regional_trainer._process_pending_adapters()
+                
+            # Log queue statistics periodically (every 5 minutes)
+            if not hasattr(self, 'last_queue_stats_log'):
+                self.last_queue_stats_log = 0
+                
+            current_time = time.time()
+            if current_time - self.last_queue_stats_log > 300:  # 5 minutes
+                self.last_queue_stats_log = current_time
+                self._log_adapter_queue_statistics()
+                
+        except Exception as e:
+            self.logger.error(f"ADAPTER_QUEUE_PROCESSING_ERROR: {e}")
+
+    def _log_adapter_queue_statistics(self):
+        """Log comprehensive statistics about adapter queues."""
+        try:
+            # Get stats from both trainers
+            traffic_stats = getattr(self.traffic_trainer, 'get_adapter_queue_stats', lambda: {})()
+            regional_stats = getattr(self.regional_trainer, 'get_adapter_queue_stats', lambda: {})()
+            
+            # Calculate total queue metrics
+            total_queued = traffic_stats.get('queue_size', 0) + regional_stats.get('queue_size', 0)
+            total_pending = traffic_stats.get('total_pending', 0) + regional_stats.get('total_pending', 0)
+            total_failed = traffic_stats.get('total_failed', 0) + regional_stats.get('total_failed', 0)
+            
+            if total_queued > 0:
+                self.logger.info(f"ADAPTER_QUEUE_STATS: Total queued={total_queued}, "
+                               f"Pending={total_pending}, Failed={total_failed}")
+                self.logger.info(f"  Traffic LLM: queued={traffic_stats.get('queue_size', 0)}, "
+                               f"pending={traffic_stats.get('total_pending', 0)}, "
+                               f"failed={traffic_stats.get('total_failed', 0)}")
+                self.logger.info(f"  Regional LLM: queued={regional_stats.get('queue_size', 0)}, "
+                               f"pending={regional_stats.get('total_pending', 0)}, "
+                               f"failed={regional_stats.get('total_failed', 0)}")
+            else:
+                self.logger.debug("ADAPTER_QUEUE_EMPTY: No adapters in queue")
+                
+        except Exception as e:
+            self.logger.error(f"QUEUE_STATS_LOG_ERROR: {e}")
     
     def _log_progressive_training_status(self):
         """Log detailed progressive training status with RL metrics."""
@@ -1983,7 +2471,12 @@ class TrainingManager:
             regional_stats = self.regional_buffer.get_stats()
             
             runtime = time.time() - self.start_time
-            progress = min(100.0, (self.total_samples_processed / self.total_simulation_steps) * 100)
+            
+            # Calculate progress based on autonomous vehicles if available
+            if self.total_autonomous_vehicles and self.total_autonomous_vehicles > 0:
+                progress = min(100.0, (self.total_samples_processed / self.total_autonomous_vehicles) * 100)
+            else:
+                progress = min(100.0, (self.total_samples_processed / self.total_simulation_steps) * 100)
             
             self.logger.info(f"PROGRESSIVE_STATUS: Runtime: {runtime:.1f}s, Progress: {progress:.1f}%")
             self.logger.info(f"  Global Phase: {self.global_training_phase}, Phase Steps: {self.phase_step_count}")
@@ -2011,10 +2504,25 @@ class TrainingManager:
         """Process incoming training data from the queue."""
         try:
             data_received_this_cycle = 0
+            control_messages_received = 0
             while True:
                 try:
                     # Non-blocking get with timeout
                     sample = self.training_queue.get(timeout=0.1)
+                    
+                    # Check if this is a control message
+                    if isinstance(sample, dict) and sample.get('message_type') == 'autonomous_vehicle_count':
+                        # Handle autonomous vehicle count message
+                        total_autonomous = sample.get('total_autonomous_vehicles', 0)
+                        total_vehicles = sample.get('total_vehicles', 0)
+                        
+                        self.set_total_autonomous_vehicles(total_autonomous)
+                        control_messages_received += 1
+                        
+                        self.logger.info(f"CONTROL_MESSAGE: Received autonomous vehicle count - {total_autonomous}/{total_vehicles}")
+                        continue
+                    
+                    # Regular training sample processing
                     self.total_samples_processed += 1
                     data_received_this_cycle += 1
                     
@@ -2032,8 +2540,8 @@ class TrainingManager:
                     break
             
             # Log if we processed data this cycle
-            if data_received_this_cycle > 0:
-                self.logger.info(f"TRAINING_DATA_CYCLE: Processed {data_received_this_cycle} samples this cycle")
+            if data_received_this_cycle > 0 or control_messages_received > 0:
+                self.logger.info(f"TRAINING_DATA_CYCLE: Processed {data_received_this_cycle} samples and {control_messages_received} control messages this cycle")
                     
         except Exception as e:
             self.logger.error(f"TRAINING_DATA_PROCESSING_ERROR: {e}")
@@ -2099,6 +2607,16 @@ class TrainingManager:
             # Save final checkpoints
             self.traffic_trainer._save_checkpoint()
             self.regional_trainer._save_checkpoint()
+            
+            # Close persistent figures to free memory
+            if self.figures_initialized:
+                try:
+                    plt.close(self.fig1)
+                    plt.close(self.fig2)
+                    plt.ioff()  # Turn off interactive mode
+                    self.logger.info("CHARTS_CLOSED: Persistent figures closed successfully")
+                except Exception as fig_error:
+                    self.logger.error(f"CHART_CLOSE_ERROR: {fig_error}")
             
             # Log final statistics
             self._log_training_status()

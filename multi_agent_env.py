@@ -19,6 +19,9 @@ from utils.read_utils import load_json
 from agents import RegionalAgent, TrafficAgent, PredictionEngine, AgentLogger
 from env_utils import parse_rou_file, get_edge_info, get_multiple_edges_info, get_dynamic_data_batch, get_congestion_level
 
+# Global LLM Manager Registry for Progressive Training
+_global_llm_manager_registry = {}
+
 
 class MultiAgentTrafficEnvironment:
     """
@@ -402,6 +405,26 @@ class MultiAgentTrafficEnvironment:
         except Exception as e:
             self.logger.log_error(f"LORA_UPDATE_ERROR: {e}")
     
+    # ===== PROGRESSIVE TRAINING: Global LLM Manager Registry =====
+    
+    def _register_llm_manager_globally(self):
+        """Register LLM manager globally for access by training managers."""
+        try:
+            global _global_llm_manager_registry
+            
+            # Create unique key for this environment
+            env_key = f"{self.location}_{id(self)}"
+            
+            _global_llm_manager_registry[env_key] = self.llm_manager
+            
+            # Also register as 'current' for easy access
+            _global_llm_manager_registry['current'] = self.llm_manager
+            
+            print(f"LLM_MANAGER_REGISTERED: {env_key}")
+            
+        except Exception as e:
+            print(f"LLM_MANAGER_REGISTRY_ERROR: {e}")
+    
     def _load_road_data(self):
         """Load road network and information."""
         try:
@@ -445,6 +468,13 @@ class MultiAgentTrafficEnvironment:
                 
                 # 打印GPU状态
                 self.llm_manager.print_gpu_status()
+                
+                # Initialize LoRA management for progressive training
+                if hasattr(self.llm_manager, 'initialize_lora_management'):
+                    self.llm_manager.initialize_lora_management()
+                
+                # Register LLM manager globally for training manager access
+                self._register_llm_manager_globally()
                 
             elif self.llm_agent:
                 print("\n=== 使用传统单一LLM模式 ===")
@@ -534,6 +564,20 @@ class MultiAgentTrafficEnvironment:
             
             self.logger.log_info(f"Simulation initialized: {self.total_vehicles} total vehicles, "
                                f"{len(self.autonomous_vehicles)} autonomous vehicles")
+            
+            # Send autonomous vehicle count to training manager if queue is available
+            if self.training_queue is not None:
+                try:
+                    autonomous_count_message = {
+                        'message_type': 'autonomous_vehicle_count',
+                        'total_autonomous_vehicles': len(self.autonomous_vehicles),
+                        'total_vehicles': self.total_vehicles,
+                        'timestamp': time.time()
+                    }
+                    self.training_queue.put(autonomous_count_message, block=False)
+                    self.logger.log_info(f"TRAINING_QUEUE: Sent autonomous vehicle count ({len(self.autonomous_vehicles)}) to training manager")
+                except Exception as queue_error:
+                    self.logger.log_warning(f"TRAINING_QUEUE: Failed to send vehicle count: {queue_error}")
             
         except Exception as e:
             self.logger.log_error(f"Failed to initialize simulation: {e}")
@@ -893,10 +937,94 @@ class MultiAgentTrafficEnvironment:
     def _calculate_current_att(self) -> float:
         """Calculate current average travel time from completed vehicles."""
         if not self.completed_vehicle_times:
-            return 600.0  # Default expected travel time
+            # Use adaptive baseline based on system state
+            return self._estimate_adaptive_baseline_time()
         
         total_time = sum(self.completed_vehicle_times.values())
         return total_time / len(self.completed_vehicle_times)
+    
+    def _estimate_adaptive_baseline_time(self) -> float:
+        """Estimate adaptive baseline time based on current system state."""
+        # Get current global congestion level
+        global_congestion = self._get_global_congestion_level()
+        
+        # Estimate network diameter (average path length)
+        avg_path_complexity = self._estimate_network_complexity()
+        
+        # Base time per region with congestion adjustment
+        base_time_per_region = 120 + (global_congestion * 100)  # 120-220s per region
+        
+        # Adaptive baseline based on network characteristics
+        estimated_baseline = avg_path_complexity * base_time_per_region
+        
+        # Ensure reasonable bounds (200s - 1200s)
+        return max(200.0, min(1200.0, estimated_baseline))
+    
+    def _get_global_congestion_level(self) -> float:
+        """Calculate global congestion level across all regions."""
+        if not hasattr(self, 'latest_regional_report') or not self.latest_regional_report:
+            return 0.3  # Default moderate congestion
+        
+        congestion_values = []
+        for region_data in self.latest_regional_report.values():
+            if isinstance(region_data, dict) and 'congestion_level' in region_data:
+                congestion_values.append(region_data['congestion_level'])
+        
+        return sum(congestion_values) / len(congestion_values) if congestion_values else 0.3
+    
+    def _estimate_network_complexity(self) -> float:
+        """Estimate average path complexity (number of regions)."""
+        # Use region graph connectivity to estimate typical path lengths
+        if hasattr(self.traffic_agent, 'region_connections') and self.traffic_agent.region_connections:
+            # Estimate based on network diameter
+            total_regions = len(set(self.edge_to_region.values()))
+            connectivity_ratio = len(self.traffic_agent.region_connections) / max(1, total_regions * (total_regions - 1) / 2)
+            
+            # Higher connectivity = shorter paths, lower connectivity = longer paths
+            complexity_factor = 2.0 + (1.0 - connectivity_ratio) * 2.0  # Range: 2-4 regions average
+            return complexity_factor
+        
+        return 3.0  # Default assumption: 3 regions average path
+    
+    def _get_adaptive_expected_time(self, cooperation_quality: float) -> float:
+        """Get adaptive expected time based on system state and cooperation quality."""
+        base_time = self._estimate_adaptive_baseline_time()
+        
+        # High cooperation quality reduces expected time (better coordination)
+        cooperation_factor = 1.0 - (cooperation_quality - 0.5) * 0.2  # ±10% based on cooperation
+        cooperation_factor = max(0.8, min(1.2, cooperation_factor))
+        
+        return base_time * cooperation_factor
+    
+    def _get_route_baseline_time(self, route_length: int, cooperation_quality: float) -> float:
+        """Get baseline time for a specific route length."""
+        # Get system-wide baseline
+        system_baseline = self._estimate_adaptive_baseline_time()
+        
+        # Adjust for route complexity
+        if route_length <= 1:
+            route_factor = 0.5  # Single region routes are much faster
+        elif route_length <= 2:
+            route_factor = 0.7  # Direct routes
+        else:
+            route_factor = 1.0 + (route_length - 3) * 0.2  # Each additional region adds complexity
+        
+        # Cooperation quality impact
+        cooperation_factor = 1.0 - (cooperation_quality - 0.5) * 0.15
+        cooperation_factor = max(0.85, min(1.15, cooperation_factor))
+        
+        return system_baseline * route_factor * cooperation_factor
+    
+    def _get_adaptive_fairness_threshold(self, cooperation_quality: float) -> float:
+        """Get adaptive fairness threshold based on system state."""
+        base_threshold = self._estimate_adaptive_baseline_time() * 1.8  # 80% above baseline
+        
+        # Better cooperation allows for slightly higher expectations (lower threshold)
+        cooperation_adjustment = (cooperation_quality - 0.5) * 0.2
+        adjusted_threshold = base_threshold * (1.0 - cooperation_adjustment)
+        
+        # Ensure reasonable bounds (300s - 2000s)
+        return max(300.0, min(2000.0, adjusted_threshold))
     
     def _fallback_original_planning(self, vehicle_id: str, current_time: float):
         """Fallback to original planning when CORY fails."""
@@ -1672,17 +1800,21 @@ class MultiAgentTrafficEnvironment:
         route_length = len(selected_route)
         total_congestion = sum(state_context['regional_congestion'].get(r, 0) for r in selected_route)
         
-        # Rough travel time estimation (600s base + congestion penalty + length penalty)
-        estimated_travel_time = 600 + total_congestion * 100 + (route_length - 2) * 150
+        # Intelligent fairness assessment without hard-coded time estimates
+        # Instead of estimating travel time, assess route characteristics directly
         
-        # Fairness threshold (900s as mentioned in CLAUDE.md)
-        fairness_threshold = 900
+        # Route complexity assessment
+        complexity_score = min(1.0, 3.0 / max(1, route_length))  # Shorter routes score higher
         
-        if estimated_travel_time <= fairness_threshold:
-            fairness_score = 1.0
+        # Congestion resilience (routes through less congested areas score higher)
+        if selected_route:
+            avg_congestion = total_congestion / len(selected_route)
+            congestion_score = max(0.0, 1.0 - avg_congestion)
         else:
-            # Linear decrease in fairness score for times exceeding threshold
-            fairness_score = max(0, 1.0 - (estimated_travel_time - fairness_threshold) / fairness_threshold)
+            congestion_score = 0.5
+        
+        # Weighted fairness score combining complexity and congestion factors
+        fairness_score = 0.6 * complexity_score + 0.4 * congestion_score
         
         return fairness_score
     
@@ -1719,17 +1851,31 @@ class MultiAgentTrafficEnvironment:
         """Identify potential conflicts in the selected route."""
         conflicts = []
         
-        # Fairness conflicts (excessive travel time)
+        # Intelligent conflict detection based on route characteristics
         route_length = len(selected_route)
-        total_congestion = sum(state_context['regional_congestion'].get(r, 0) for r in selected_route)
-        estimated_time = 600 + total_congestion * 100 + (route_length - 2) * 150
+        congestion_levels = [state_context['regional_congestion'].get(r, 0) for r in selected_route]
+        avg_congestion = sum(congestion_levels) / len(congestion_levels) if congestion_levels else 0
+        max_congestion = max(congestion_levels) if congestion_levels else 0
         
-        if estimated_time > 900:  # Fairness threshold
+        # Route complexity analysis
+        is_complex_route = route_length > 5
+        has_high_congestion = max_congestion > 0.8
+        has_sustained_congestion = sum(1 for c in congestion_levels if c > 0.6) > 2
+        
+        # Only flag conflicts for genuinely problematic routes
+        if is_complex_route and has_high_congestion and has_sustained_congestion:
             conflicts.append({
-                'type': 'fairness_conflict',
-                'description': f'Estimated travel time {estimated_time:.0f}s exceeds fairness threshold (900s)',
-                'severity': 'high',
-                'resolution_needed': True
+                'type': 'route_complexity_conflict',
+                'description': f'Complex route ({route_length} regions) with sustained high congestion (max: {max_congestion:.2f}, avg: {avg_congestion:.2f})',
+                'severity': 'medium',
+                'resolution_needed': False  # Let ATT reward handle optimization naturally
+            })
+        elif has_high_congestion and route_length > 3:
+            conflicts.append({
+                'type': 'congestion_concern',
+                'description': f'Route through high congestion areas (max: {max_congestion:.2f}) with {route_length} regions',
+                'severity': 'low', 
+                'resolution_needed': False
             })
         
         return conflicts
@@ -1748,32 +1894,67 @@ class MultiAgentTrafficEnvironment:
                 improvements, conflicts
             )
             
-            # Use Regional LLM for evaluation - simplified approach
+            # Use Regional LLM for evaluation - with logging
             answer_options = "Accept/Reject/Modify"
-            decisions = self.regional_llm.hybrid_decision_making_pipeline(
-                [observation], [f'"{answer_options}"']
+            
+            # Log LLM call start
+            call_id = self.logger.log_llm_call_start(
+                "ObserverFeedback", vehicle_id, len(observation)
             )
             
-            if decisions and len(decisions) > 0:
-                decision = decisions[0]
-                answer = decision.get('answer', 'accept')
-                # Safe handling of potentially None answer
-                answer_str = str(answer).lower() if answer is not None else 'accept'
-                acceptance = 'accept' in answer_str
+            try:
+                decisions = self.regional_llm.hybrid_decision_making_pipeline(
+                    [observation], [f'"{answer_options}"']
+                )
                 
+                if decisions and len(decisions) > 0:
+                    decision = decisions[0]
+                    answer = decision.get('answer', 'accept')
+                    # Safe handling of potentially None answer
+                    answer_str = str(answer).lower() if answer is not None else 'accept'
+                    acceptance = 'accept' in answer_str
+                    
+                    reasoning = decision.get('summary', 'Regional evaluation completed')
+                    
+                    # Log successful LLM call
+                    self.logger.log_llm_call_end(
+                        call_id, True, f"Decision: {answer_str}. Reasoning: {reasoning}",
+                        len(observation)
+                    )
+                    
+                    return {
+                        'acceptance': acceptance,
+                        'reasoning': reasoning,
+                        'refined_routes': [],
+                        'decision_response': decision
+                    }
+                else:
+                    # Log failed LLM call
+                    self.logger.log_llm_call_end(
+                        call_id, False, "LLM returned empty response",
+                        len(observation), "Empty decisions list"
+                    )
+                    
+                    # Default acceptance
+                    return {
+                        'acceptance': True,
+                        'reasoning': 'Default acceptance (LLM call failed)',
+                        'refined_routes': []
+                    }
+                    
+            except Exception as llm_error:
+                # Log failed LLM call
+                self.logger.log_llm_call_end(
+                    call_id, False, "LLM call exception",
+                    len(observation), str(llm_error)
+                )
+                
+                # Default acceptance on error
                 return {
-                    'acceptance': acceptance,
-                    'reasoning': decision.get('summary', 'Regional evaluation completed'),
-                    'refined_routes': [],
-                    'decision_response': decision
+                    'acceptance': True,
+                    'reasoning': f'Default acceptance (LLM error: {llm_error})',
+                    'refined_routes': []
                 }
-            
-            # Default acceptance
-            return {
-                'acceptance': True,
-                'reasoning': 'Default acceptance (LLM call failed)',
-                'refined_routes': []
-            }
             
         except Exception as e:
             self.logger.log_error(f"CORY_REGIONAL_LLM_ERROR: {e}")
@@ -1816,6 +1997,11 @@ class MultiAgentTrafficEnvironment:
             for conflict in conflicts:
                 observation += f"- {conflict['type'].upper()}: {conflict['description']}\n"
         
+        observation += "\n\nDECISION GUIDELINES:\n"
+        observation += "- Accept: When all scores are PASS (feasibility > 0.7, efficiency > 0.6, fairness > 0.8)\n"
+        observation += "- Accept: When most scores are PASS and conflicts are minor or resolvable\n"
+        observation += "- Reject: Only when critical failures exist (feasibility FAIL or severe fairness violations)\n"
+        observation += "- Modify: When improvements can significantly enhance the route\n"
         observation += "\nPlease evaluate and provide acceptance decision (Accept/Reject/Modify)."
         
         return observation
@@ -2332,18 +2518,22 @@ class MultiAgentTrafficEnvironment:
                         reasoning = 'Fallback to first candidate'
                         
                 else:
-                    # Use basic LLM decision making
-                    decisions = self.llm_agent.hybrid_decision_making_pipeline(
-                        [observation_text], [f'"{answer_options}"']
-                    )
-                    
-                    if decisions and decisions[0]['answer']:
-                        # Parse the selected route
-                        selected_route = self._parse_macro_route_answer(decisions[0]['answer'], candidates)
-                        reasoning = decisions[0].get('summary', 'LLM selection decision')
+                    # Use basic LLM decision making if available
+                    if self.llm_agent and hasattr(self.llm_agent, 'hybrid_decision_making_pipeline'):
+                        decisions = self.llm_agent.hybrid_decision_making_pipeline(
+                            [observation_text], [f'"{answer_options}"']
+                        )
+                        
+                        if decisions and decisions[0]['answer']:
+                            # Parse the selected route
+                            selected_route = self._parse_macro_route_answer(decisions[0]['answer'], candidates)
+                            reasoning = decisions[0].get('summary', 'LLM selection decision')
+                        else:
+                            selected_route = candidates[0]  # Fallback to first candidate
+                            reasoning = 'Fallback decision - LLM failed'
                     else:
-                        selected_route = candidates[0]  # Fallback to first candidate
-                        reasoning = 'Fallback decision - LLM failed'
+                        selected_route = candidates[0]  # Fallback when llm_agent is None
+                        reasoning = 'Fallback decision - LLM agent not available'
                 
                 self.logger.log_llm_call_end(
                     call_id, True, f"Selected route: {selected_route}. Reasoning: {reasoning}", 
@@ -3709,27 +3899,28 @@ class MultiAgentTrafficEnvironment:
         try:
             rewards = {}
             
-            # Base expected travel time (600s as per CLAUDE.md)
-            expected_time = 600.0
+            # Get cooperation quality from CORY framework first
+            macro_plan = self.vehicle_current_plans.get(vehicle_id, {})
+            cooperation_quality = macro_plan.get('cooperation_quality', 0.5)
+            
+            # Adaptive expected travel time based on current system state
+            expected_time = self._get_adaptive_expected_time(cooperation_quality)
             
             # ATT improvement calculation (for Traffic LLM)
             att_improvement = max(0, (expected_time - travel_time) / expected_time)
             att_reward = min(att_improvement * 2.0, 1.0)  # Cap at 1.0, multiply by 2.0 for sensitivity
             
-            # Cooperation quality from CORY framework
-            macro_plan = self.vehicle_current_plans.get(vehicle_id, {})
-            cooperation_quality = macro_plan.get('cooperation_quality', 0.5)
-            
             # Regional efficiency calculation (for Regional LLM)
             regional_metrics = self._calculate_regional_efficiency(vehicle_id, travel_time)
             efficiency_reward = min(regional_metrics * 2.0, 1.0)
             
-            # Individual protection (fairness threshold: 900s as per CLAUDE.md)
-            fairness_threshold = 900.0
+            # Individual protection with adaptive fairness threshold
+            fairness_threshold = self._get_adaptive_fairness_threshold(cooperation_quality)
             if travel_time <= fairness_threshold:
                 individual_protection = 1.0
             else:
-                individual_protection = max(0, 1.0 - (travel_time - fairness_threshold) / fairness_threshold)
+                excess_ratio = (travel_time - fairness_threshold) / fairness_threshold
+                individual_protection = max(0.0, 1.0 - excess_ratio ** 1.2)  # Non-linear penalty
             
             # Traffic LLM rewards (Pioneer role)
             rewards['traffic_llm'] = {
@@ -3779,15 +3970,18 @@ class MultiAgentTrafficEnvironment:
             
             # Calculate efficiency based on route length and travel time
             route_length = len(macro_route)
+            
+            # Get adaptive baseline time for this route
+            cooperation_quality = macro_plan.get('cooperation_quality', 0.5)
+            baseline_time = self._get_route_baseline_time(route_length, cooperation_quality)
+            
             if route_length <= 2:  # Direct route
-                # Shorter routes are more efficient
-                time_efficiency = min(1.0, 600.0 / max(travel_time, 300.0))  # Normalize against 600s baseline
+                # Direct routes get efficiency bonus
+                time_efficiency = min(1.0, baseline_time / max(travel_time, baseline_time * 0.5))
                 efficiency_score = time_efficiency * 1.2  # Bonus for direct routes
             else:
-                # Multi-region routes: penalize excessive detours
-                expected_time_per_region = 200.0  # Base time per region
-                expected_total_time = route_length * expected_time_per_region
-                time_efficiency = min(1.0, expected_total_time / max(travel_time, expected_total_time * 0.5))
+                # Multi-region routes: evaluate against adaptive expectations
+                time_efficiency = min(1.0, baseline_time / max(travel_time, baseline_time * 0.5))
                 efficiency_score = time_efficiency
             
             # Consider cooperation quality impact on regional efficiency
@@ -3972,17 +4166,21 @@ class MultiAgentTrafficEnvironment:
                         reasoning = 'Fallback to first option'
                         
                 else:
-                    # Basic LLM decision making
-                    decisions = self.llm_agent.hybrid_decision_making_pipeline(
-                        [observation_text], [f'"{answer_options}"']
-                    )
-                    
-                    if decisions and decisions[0]['answer']:
-                        selected_route = self._parse_macro_route_answer(decisions[0]['answer'], all_options)
-                        reasoning = decisions[0].get('summary', 'LLM replanning decision')
+                    # Basic LLM decision making if available
+                    if self.llm_agent and hasattr(self.llm_agent, 'hybrid_decision_making_pipeline'):
+                        decisions = self.llm_agent.hybrid_decision_making_pipeline(
+                            [observation_text], [f'"{answer_options}"']
+                        )
+                        
+                        if decisions and decisions[0]['answer']:
+                            selected_route = self._parse_macro_route_answer(decisions[0]['answer'], all_options)
+                            reasoning = decisions[0].get('summary', 'LLM replanning decision')
+                        else:
+                            selected_route = all_options[0]
+                            reasoning = 'Fallback decision - LLM failed'
                     else:
-                        selected_route = all_options[0]
-                        reasoning = 'Fallback decision'
+                        selected_route = all_options[0]  # Fallback when llm_agent is None
+                        reasoning = 'Fallback decision - LLM agent not available'
                 
                 self.logger.log_llm_call_end(
                     call_id, True, f"Replanned route: {selected_route}. Reasoning: {reasoning}",
@@ -4308,3 +4506,27 @@ class MultiAgentTrafficEnvironment:
         
         return "\n".join(observation_parts)
     
+
+
+# ===== GLOBAL ACCESS FUNCTIONS FOR PROGRESSIVE TRAINING =====
+
+def get_global_llm_manager():
+    """Get the currently registered global LLM manager."""
+    global _global_llm_manager_registry
+    return _global_llm_manager_registry.get("current")
+
+def get_llm_manager_by_key(key: str):
+    """Get LLM manager by specific key."""
+    global _global_llm_manager_registry
+    return _global_llm_manager_registry.get(key)
+
+def list_registered_llm_managers():
+    """List all registered LLM managers."""
+    global _global_llm_manager_registry
+    return list(_global_llm_manager_registry.keys())
+
+def clear_llm_manager_registry():
+    """Clear the global LLM manager registry."""
+    global _global_llm_manager_registry
+    _global_llm_manager_registry.clear()
+

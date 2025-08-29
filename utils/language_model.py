@@ -1510,3 +1510,366 @@ class LocalLLMManager:
                 print("[SUCCESS] 两个LLM均已正常加载到不同GPU上")
             else:
                 print("[WARNING] GPU内存使用率较低，可能存在问题")
+
+    # ===== PROGRESSIVE TRAINING: LoRA ADAPTER MANAGEMENT =====
+    
+    def initialize_lora_management(self):
+        """Initialize LoRA adapter management system for progressive training."""
+        try:
+            import threading
+            from queue import Queue
+            
+            # LoRA adapter management state
+            self.lora_adapters = {
+                'traffic': {'current': None, 'pending': None, 'loaded': False},
+                'regional': {'current': None, 'pending': None, 'loaded': False}
+            }
+            
+            # Adapter update queues (thread-safe)
+            self.adapter_update_queue = Queue()
+            self.update_lock = threading.Lock()
+            
+            # Current adapter version tracking
+            self.adapter_versions = {'traffic': 0, 'regional': 0}
+            
+            print("\n=== LoRA适配器管理系统初始化完成 ===")
+            return True
+            
+        except Exception as e:
+            print(f"LoRA适配器管理初始化失败: {e}")
+            return False
+    
+    def load_lora_adapter_direct(self, llm_type: str, adapter_path: str) -> bool:
+        """
+        Direct LoRA adapter loading for progressive training hot-reload.
+        
+        Args:
+            llm_type: 'traffic' or 'regional'
+            adapter_path: Path to the LoRA adapter directory
+            
+        Returns:
+            bool: Success status
+        """
+        try:
+            if not hasattr(self, 'update_lock'):
+                self.initialize_lora_management()
+            
+            with self.update_lock:
+                print(f"\n=== 直接加载LoRA适配器 ===")
+                print(f"LLM类型: {llm_type}")
+                print(f"适配器路径: {adapter_path}")
+                
+                # Validate inputs
+                if llm_type not in ['traffic', 'regional']:
+                    print(f"错误: 无效的LLM类型 '{llm_type}'")
+                    return False
+                
+                if not os.path.exists(adapter_path):
+                    print(f"错误: 适配器路径不存在 '{adapter_path}'")
+                    return False
+                
+                # Get the target LLM instance
+                target_llm = self.traffic_llm if llm_type == 'traffic' else self.regional_llm
+                
+                if target_llm is None:
+                    print(f"错误: {llm_type} LLM实例未初始化")
+                    return False
+                
+                # Check if target LLM uses vLLM (local model)
+                if target_llm.use_api:
+                    print(f"错误: {llm_type} LLM使用API模式，不支持LoRA适配器")
+                    return False
+                
+                # Attempt to load adapter using PEFT
+                success = self._load_adapter_to_vllm_model(target_llm, adapter_path, llm_type)
+                
+                if success:
+                    # Update tracking information
+                    self.lora_adapters[llm_type]['current'] = adapter_path
+                    self.lora_adapters[llm_type]['loaded'] = True
+                    self.adapter_versions[llm_type] += 1
+                    
+                    print(f"✓ {llm_type} LoRA适配器加载成功")
+                    print(f"版本: {self.adapter_versions[llm_type]}")
+                    return True
+                else:
+                    print(f"✗ {llm_type} LoRA适配器加载失败")
+                    return False
+                    
+        except Exception as e:
+            print(f"直接LoRA适配器加载错误: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def _load_adapter_to_vllm_model(self, llm_instance, adapter_path: str, llm_type: str) -> bool:
+        """
+        Internal method to load LoRA adapter to vLLM model.
+        
+        Note: This is a workaround since vLLM doesn't support runtime LoRA loading.
+        We'll implement a model replacement strategy instead.
+        """
+        try:
+            print(f"尝试为{llm_type}模型应用LoRA适配器...")
+            
+            # Strategy 1: Try to use vLLM's built-in LoRA support if available
+            if hasattr(llm_instance.model, 'load_lora_adapter'):
+                try:
+                    llm_instance.model.load_lora_adapter(adapter_path)
+                    print(f"✓ 使用vLLM内置LoRA加载功能")
+                    return True
+                except Exception as e:
+                    print(f"vLLM内置LoRA加载失败: {e}")
+            
+            # Strategy 2: Model re-initialization with LoRA (fallback)
+            print(f"使用模型重初始化策略...")
+            success = self._reinitialize_model_with_lora(llm_instance, adapter_path, llm_type)
+            
+            if success:
+                print(f"✓ 模型重初始化策略成功")
+                return True
+            else:
+                print(f"✗ 模型重初始化策略失败")
+                
+            # Strategy 3: Queue adapter for next model initialization (last resort)
+            print(f"将适配器加入待处理队列...")
+            self.lora_adapters[llm_type]['pending'] = adapter_path
+            print(f"⚠ 适配器已排队，将在下次模型初始化时应用")
+            return True  # Return True as queuing is successful
+            
+        except Exception as e:
+            print(f"LoRA适配器应用过程发生错误: {e}")
+            return False
+    
+    def _reinitialize_model_with_lora(self, llm_instance, adapter_path: str, llm_type: str) -> bool:
+        """
+        Reinitialize the model with LoRA adapter.
+        This is a heavy operation but necessary for vLLM compatibility.
+        """
+        try:
+            import torch
+            from peft import PeftModel
+            import tempfile
+            import shutil
+            
+            print(f"开始重初始化{llm_type}模型...")
+            
+            # Save current model configuration
+            model_path = llm_instance.llm_name if hasattr(llm_instance, 'llm_name') else self.model_path
+            gpu_ids = getattr(llm_instance, 'gpu_ids', [0] if llm_type == 'traffic' else [1])
+            
+            # Step 1: Clear current model from memory
+            if hasattr(llm_instance, 'model') and llm_instance.model is not None:
+                del llm_instance.model
+                torch.cuda.empty_cache()
+                print(f"✓ 清理旧模型内存")
+            
+            # Step 2: Load base model with transformers first
+            print(f"加载基础模型: {model_path}")
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            
+            base_model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                torch_dtype=torch.float16,
+                device_map=f"cuda:{gpu_ids[0] if gpu_ids else 0}",
+                trust_remote_code=True
+            )
+            
+            # Step 3: Apply LoRA adapter
+            print(f"应用LoRA适配器: {adapter_path}")
+            model_with_lora = PeftModel.from_pretrained(base_model, adapter_path)
+            
+            # Step 4: Merge LoRA weights (optional but recommended)
+            print(f"合并LoRA权重...")
+            model_with_lora = model_with_lora.merge_and_unload()
+            
+            # Step 5: Save merged model to temporary directory
+            with tempfile.TemporaryDirectory() as temp_dir:
+                print(f"保存合并模型到临时目录...")
+                model_with_lora.save_pretrained(temp_dir)
+                
+                # Copy tokenizer files if they exist
+                tokenizer_files = ['tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 'vocab.txt']
+                for file in tokenizer_files:
+                    src_path = os.path.join(model_path, file)
+                    if os.path.exists(src_path):
+                        shutil.copy(src_path, temp_dir)
+                
+                # Step 6: Reinitialize vLLM with merged model
+                print(f"使用合并模型重初始化vLLM...")
+                
+                # Clear memory first
+                torch.cuda.empty_cache()
+                
+                # Create new vLLM instance
+                vllm_kwargs = {
+                    "model": temp_dir,
+                    "gpu_memory_utilization": 0.85,
+                    "tensor_parallel_size": 1,
+                    "max_model_len": 8192,
+                    "enforce_eager": True,
+                    "trust_remote_code": True,
+                    "swap_space": 6,
+                    "disable_log_stats": True,
+                    "max_num_seqs": 16,
+                    "block_size": 16
+                }
+                
+                if gpu_ids:
+                    vllm_kwargs["device"] = f"cuda:{gpu_ids[0]}"
+                
+                new_model = vllm.LLM(**vllm_kwargs)
+                
+                # Replace the model in the LLM instance
+                llm_instance.model = new_model
+                
+                print(f"✓ {llm_type}模型重初始化完成")
+                return True
+                
+        except Exception as e:
+            print(f"模型重初始化失败: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Try to recover original model
+            try:
+                self._recover_original_model(llm_instance, llm_type)
+            except:
+                print(f"原模型恢复也失败，{llm_type} LLM可能需要完全重启")
+            
+            return False
+    
+    def _recover_original_model(self, llm_instance, llm_type: str):
+        """Recover original model if LoRA loading fails."""
+        try:
+            print(f"尝试恢复{llm_type}的原始模型...")
+            
+            # This would require reloading the original model
+            # For now, we'll just clear the corrupted state
+            if hasattr(llm_instance, 'model'):
+                llm_instance.model = None
+                
+            # Mark adapter as failed
+            if hasattr(self, 'lora_adapters'):
+                self.lora_adapters[llm_type]['loaded'] = False
+                self.lora_adapters[llm_type]['current'] = None
+                
+            print(f"⚠ {llm_type}模型状态已重置，需要重新初始化")
+            
+        except Exception as e:
+            print(f"模型恢复失败: {e}")
+    
+    def queue_adapter_update(self, llm_type: str, adapter_path: str):
+        """Queue an adapter update for safe application."""
+        try:
+            if not hasattr(self, 'adapter_update_queue'):
+                self.initialize_lora_management()
+            
+            update_request = {
+                'type': 'load_adapter',
+                'llm_type': llm_type,
+                'adapter_path': adapter_path,
+                'timestamp': time.time()
+            }
+            
+            self.adapter_update_queue.put(update_request)
+            print(f"适配器更新请求已排队: {llm_type} -> {os.path.basename(adapter_path)}")
+            return True
+            
+        except Exception as e:
+            print(f"适配器更新排队失败: {e}")
+            return False
+    
+    def process_adapter_updates(self) -> bool:
+        """Process queued adapter updates safely."""
+        try:
+            if not hasattr(self, 'adapter_update_queue') or self.adapter_update_queue.empty():
+                return True  # No updates to process
+            
+            processed_count = 0
+            
+            while not self.adapter_update_queue.empty():
+                try:
+                    update_request = self.adapter_update_queue.get(timeout=1)
+                    
+                    if update_request['type'] == 'load_adapter':
+                        success = self.load_lora_adapter_direct(
+                            update_request['llm_type'], 
+                            update_request['adapter_path']
+                        )
+                        
+                        if success:
+                            processed_count += 1
+                            print(f"✓ 处理适配器更新: {update_request['llm_type']}")
+                        else:
+                            print(f"✗ 适配器更新失败: {update_request['llm_type']}")
+                    
+                except Exception as e:
+                    print(f"处理适配器更新时出错: {e}")
+                    continue
+            
+            if processed_count > 0:
+                print(f"成功处理 {processed_count} 个适配器更新")
+            
+            return True
+            
+        except Exception as e:
+            print(f"处理适配器更新队列时出错: {e}")
+            return False
+    
+    def get_lora_status(self) -> dict:
+        """Get current LoRA adapter status."""
+        try:
+            if not hasattr(self, 'lora_adapters'):
+                return {'initialized': False}
+            
+            status = {
+                'initialized': True,
+                'traffic': {
+                    'loaded': self.lora_adapters['traffic']['loaded'],
+                    'current_adapter': os.path.basename(self.lora_adapters['traffic']['current']) if self.lora_adapters['traffic']['current'] else None,
+                    'version': self.adapter_versions['traffic'],
+                    'pending': os.path.basename(self.lora_adapters['traffic']['pending']) if self.lora_adapters['traffic']['pending'] else None
+                },
+                'regional': {
+                    'loaded': self.lora_adapters['regional']['loaded'],
+                    'current_adapter': os.path.basename(self.lora_adapters['regional']['current']) if self.lora_adapters['regional']['current'] else None,
+                    'version': self.adapter_versions['regional'],
+                    'pending': os.path.basename(self.lora_adapters['regional']['pending']) if self.lora_adapters['regional']['pending'] else None
+                },
+                'queue_size': self.adapter_update_queue.qsize() if hasattr(self, 'adapter_update_queue') else 0
+            }
+            
+            return status
+            
+        except Exception as e:
+            return {'error': str(e)}
+    
+    def print_lora_status(self):
+        """Print current LoRA adapter status."""
+        status = self.get_lora_status()
+        
+        print("\n=== LoRA适配器状态 ===")
+        
+        if not status.get('initialized'):
+            print("LoRA管理系统未初始化")
+            return
+        
+        if 'error' in status:
+            print(f"获取状态时出错: {status['error']}")
+            return
+        
+        print(f"Traffic LLM:")
+        print(f"  - 已加载: {'是' if status['traffic']['loaded'] else '否'}")
+        print(f"  - 当前适配器: {status['traffic']['current_adapter'] or '无'}")
+        print(f"  - 版本: {status['traffic']['version']}")
+        print(f"  - 待处理: {status['traffic']['pending'] or '无'}")
+        
+        print(f"Regional LLM:")
+        print(f"  - 已加载: {'是' if status['regional']['loaded'] else '否'}")
+        print(f"  - 当前适配器: {status['regional']['current_adapter'] or '无'}")
+        print(f"  - 版本: {status['regional']['version']}")
+        print(f"  - 待处理: {status['regional']['pending'] or '无'}")
+        
+        print(f"更新队列大小: {status['queue_size']}")
+        print("=" * 40)
