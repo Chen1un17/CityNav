@@ -14,6 +14,21 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Set, Optional, Tuple, Any
 import networkx as nx
 import traci
+import numpy as np
+import matplotlib
+# Set backend for server environments without display
+import os
+if os.environ.get('DISPLAY') is None or os.environ.get('SSH_CLIENT') is not None:
+    matplotlib.use('Agg')  # Headless mode
+else:
+    try:
+        import tkinter
+        matplotlib.use('TkAgg')
+    except ImportError:
+        matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+import matplotlib.gridspec as gridspec
 
 from utils.read_utils import load_json
 from agents import RegionalAgent, TrafficAgent, PredictionEngine, AgentLogger
@@ -159,6 +174,204 @@ class MultiAgentTrafficEnvironment:
         self.att_calculation = 0.0
         self.system_throughput = 0.0
         
+        # Visualization state variables
+        self._initialize_visualization_system()
+        
+    def _initialize_visualization_system(self):
+        """Initialize visualization components for real-time monitoring."""
+        # Visualization update interval (every 3600 steps)
+        self.vis_update_interval = 3600
+        self.total_time_slots = 86400 // self.vis_update_interval  # 24 time slots
+        self.current_time_slot = 0
+        
+        # Regional congestion data (39 regions x time_slots)
+        self.congestion_matrix = np.zeros((39, self.total_time_slots))
+        self.region_labels = [f"Region {i}" for i in range(39)]
+        self.time_labels = [f"T{i}" for i in range(self.total_time_slots)]
+        
+        # Metrics for line plots
+        self.att_history = []
+        self.throughput_history = []
+        self.co2_history = []
+        self.time_history = []
+        
+        # Matplotlib figure setup
+        self.fig = None
+        self.axes = None
+        self.heatmap_im = None
+        self.line_plots = {}
+        
+        # Initialize plots
+        self._setup_visualization_plots()
+        
+    def _setup_visualization_plots(self):
+        """Setup matplotlib plots for real-time visualization."""
+        plt.ion()  # Enable interactive mode
+        
+        # Create figure with subplots
+        self.fig = plt.figure(figsize=(15, 8))
+        gs = gridspec.GridSpec(2, 3, figure=self.fig, height_ratios=[2, 1])
+        
+        # Heatmap for regional congestion
+        self.axes = {
+            'heatmap': self.fig.add_subplot(gs[0, :]),
+            'att': self.fig.add_subplot(gs[1, 0]),
+            'throughput': self.fig.add_subplot(gs[1, 1]),
+            'co2': self.fig.add_subplot(gs[1, 2])
+        }
+        
+        # Initialize heatmap
+        self.heatmap_im = self.axes['heatmap'].imshow(
+            self.congestion_matrix, 
+            cmap='hot', 
+            aspect='auto',
+            vmin=0, vmax=1
+        )
+        self.axes['heatmap'].set_title('Regional Traffic Congestion Heatmap')
+        self.axes['heatmap'].set_xlabel('Time Slots')
+        self.axes['heatmap'].set_ylabel('Regions')
+        self.axes['heatmap'].set_yticks(range(0, 39, 5))
+        self.axes['heatmap'].set_yticklabels([f"R{i}" for i in range(0, 39, 5)])
+        plt.colorbar(self.heatmap_im, ax=self.axes['heatmap'])
+        
+        # Initialize line plots
+        self.line_plots['att'], = self.axes['att'].plot([], [], 'b-', linewidth=2)
+        self.axes['att'].set_title('Average Travel Time (ATT)')
+        self.axes['att'].set_xlabel('Time Slots')
+        self.axes['att'].set_ylabel('ATT (seconds)')
+        self.axes['att'].grid(True)
+        
+        self.line_plots['throughput'], = self.axes['throughput'].plot([], [], 'g-', linewidth=2)
+        self.axes['throughput'].set_title('System Throughput')
+        self.axes['throughput'].set_xlabel('Time Slots')
+        self.axes['throughput'].set_ylabel('Vehicles/hour')
+        self.axes['throughput'].grid(True)
+        
+        self.line_plots['co2'], = self.axes['co2'].plot([], [], 'r-', linewidth=2)
+        self.axes['co2'].set_title('Average CO2 Emission')
+        self.axes['co2'].set_xlabel('Time Slots')
+        self.axes['co2'].set_ylabel('CO2 Volume')
+        self.axes['co2'].grid(True)
+        
+        plt.tight_layout()
+        plt.show(block=False)
+        
+    def _update_visualization(self, current_time):
+        """Update visualization plots with current data."""
+        try:
+            # Calculate current time slot
+            time_slot = min(int(current_time // self.vis_update_interval), self.total_time_slots - 1)
+            self.current_time_slot = time_slot
+            
+            # Update congestion matrix
+            self._update_congestion_matrix(time_slot)
+            
+            # Calculate current metrics
+            current_att = self._calculate_current_att()
+            current_throughput = self._calculate_current_throughput()
+            current_co2 = self._calculate_current_co2()
+            
+            # Update history
+            if len(self.att_history) <= time_slot:
+                self.att_history.extend([0] * (time_slot - len(self.att_history) + 1))
+                self.throughput_history.extend([0] * (time_slot - len(self.throughput_history) + 1))
+                self.co2_history.extend([0] * (time_slot - len(self.co2_history) + 1))
+                self.time_history.extend(list(range(len(self.time_history), time_slot + 1)))
+            
+            self.att_history[time_slot] = current_att
+            self.throughput_history[time_slot] = current_throughput
+            self.co2_history[time_slot] = current_co2
+            
+            # Update plots
+            self._refresh_plots()
+            
+            self.logger.log_info(f"VISUALIZATION: Updated plots at time slot {time_slot}")
+            
+        except Exception as e:
+            self.logger.log_error(f"VISUALIZATION_ERROR: {e}")
+    
+    def _update_congestion_matrix(self, time_slot):
+        """Update congestion matrix with current regional data."""
+        for region_id in range(39):
+            region_edges = [edge for edge, reg in self.edge_to_region.items() if reg == region_id]
+            if region_edges:
+                total_congestion = 0
+                valid_edges = 0
+                
+                for edge in region_edges[:10]:  # Sample first 10 edges for performance
+                    try:
+                        occupancy = traci.edge.getLastStepOccupancy(edge)
+                        total_congestion += occupancy
+                        valid_edges += 1
+                    except:
+                        continue
+                
+                avg_congestion = total_congestion / max(valid_edges, 1)
+                self.congestion_matrix[region_id, time_slot] = avg_congestion
+    
+    def _calculate_current_att(self):
+        """Calculate current average travel time."""
+        if self.vehicle_end_times and self.vehicle_start_times:
+            completed_times = []
+            for veh_id in self.vehicle_end_times:
+                if veh_id in self.vehicle_start_times:
+                    travel_time = self.vehicle_end_times[veh_id] - self.vehicle_start_times[veh_id]
+                    completed_times.append(travel_time)
+            
+            if completed_times:
+                return sum(completed_times) / len(completed_times)
+        return 0
+    
+    def _calculate_current_throughput(self):
+        """Calculate current system throughput."""
+        return len(self.vehicle_end_times) / max(self.current_sim_time / 3600, 0.1)  # vehicles per hour
+    
+    def _calculate_current_co2(self):
+        """Calculate current average CO2 emission."""
+        total_co2 = 0
+        vehicle_count = 0
+        
+        try:
+            for veh_id in traci.vehicle.getIDList():
+                try:
+                    co2_emission = traci.vehicle.getCO2Emission(veh_id)
+                    total_co2 += co2_emission
+                    vehicle_count += 1
+                except:
+                    continue
+            
+            return total_co2 / max(vehicle_count, 1)
+        except:
+            return 0
+    
+    def _refresh_plots(self):
+        """Refresh all visualization plots."""
+        try:
+            # Update heatmap
+            self.heatmap_im.set_array(self.congestion_matrix)
+            
+            # Update line plots
+            valid_indices = list(range(len(self.att_history)))
+            
+            if valid_indices:
+                self.line_plots['att'].set_data(valid_indices, self.att_history)
+                self.axes['att'].relim()
+                self.axes['att'].autoscale_view()
+                
+                self.line_plots['throughput'].set_data(valid_indices, self.throughput_history)
+                self.axes['throughput'].relim()
+                self.axes['throughput'].autoscale_view()
+                
+                self.line_plots['co2'].set_data(valid_indices, self.co2_history)
+                self.axes['co2'].relim()
+                self.axes['co2'].autoscale_view()
+            
+            # Refresh display
+            self.fig.canvas.draw()
+            self.fig.canvas.flush_events()
+        except Exception as e:
+            self.logger.log_error(f"PLOT_REFRESH_ERROR: {e}")
+    
     def _initialize_async_llm_system(self):
         """Initialize asynchronous LLM calling system."""
         from concurrent.futures import Future
@@ -3599,6 +3812,10 @@ class MultiAgentTrafficEnvironment:
                 # Increment step for next iteration
                 step += self.step_size
                 
+                # Update visualization every 3600 steps
+                if int(step) % self.vis_update_interval == 0:
+                    self._update_visualization(current_time)
+                
                 # Display progress
                 self.logger.display_progress(current_time)
                 
@@ -3635,6 +3852,10 @@ class MultiAgentTrafficEnvironment:
             
             # Close logger and generate reports
             self.logger.close_session()
+            
+            # Close visualization
+            if self.fig:
+                plt.close(self.fig)
             
             # Shutdown executor
             self.executor.shutdown(wait=True)
