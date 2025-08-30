@@ -525,23 +525,49 @@ class LLM(object):
 
                 collected_response = "<think>\n"
                 reasoning_finish_flag = False
+                
+                # Add streaming timeout mechanism
+                stream_start_time = time.time()
+                timeout_seconds = 120  # 2 minutes timeout
+                chunk_timeout = 30     # 30 seconds timeout between chunks
+                last_chunk_time = time.time()
+                
                 for chunk in stream:
+                    current_time = time.time()
+                    
+                    # Check overall timeout
+                    if current_time - stream_start_time > timeout_seconds:
+                        print(f"Stream timeout after {timeout_seconds}s for request [{m_id}]")
+                        response_list[m_id] = "Stream timeout - using fallback response"
+                        return
+                    
+                    # Check chunk timeout
+                    if current_time - last_chunk_time > chunk_timeout:
+                        print(f"Chunk timeout after {chunk_timeout}s for request [{m_id}]")
+                        response_list[m_id] = "Chunk timeout - using fallback response"
+                        return
+                    
                     if hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content:
                         if not reasoning_finish_flag:
                             collected_response += "</think>\n"
                             reasoning_finish_flag = True
                         token = chunk.choices[0].delta.content
                         collected_response += token
+                        last_chunk_time = current_time
                     elif hasattr(chunk.choices[0].delta, 'reasoning_content') and chunk.choices[0].delta.reasoning_content:
                         token = chunk.choices[0].delta.reasoning_content
                         collected_response += token
+                        last_chunk_time = current_time
+                        
                 response_list[m_id] = collected_response
                 print(f"\nSuccess [{m_id}].")
                 break
 
             except Exception as e:
                 retry_count += 1
-                print(e)
+                print(f"Error in request [{m_id}]: {e}")
+                if retry_count >= 2:
+                    response_list[m_id] = "Exception fallback - request failed after retries"
 
     def data_analysis_type_selection(self, data_text):
         query = copy.copy(self.overall_template)

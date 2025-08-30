@@ -280,15 +280,15 @@ def main(llm_path_or_name, batch_size, location, use_reflection=True, step_size=
         enable_training: Whether to enable MAGRPO online training (default: False)
     """
     # File paths - updated to use new data structure
-    sumo_config = f"/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_sumo_config.sumocfg"
-    route_file = f"/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_od_0.01.rou.alt.xml"
-    road_info_file = f"/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_road_info.json"
-    adjacency_file = f"/data/zhouyuping/LLMNavigation/Data/Region_1/edge_adjacency_alpha_1.json"
+    sumo_config = f"/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_sumo_config.sumocfg"
+    route_file = f"/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_od_0.1.rou.alt.xml"
+    road_info_file = f"/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_road_info.json"
+    adjacency_file = f"/data/zhouyuping/LLMNavigation/Data/NYC/Region_1/edge_adjacency_alpha_1.json"
     task_info_file = "/data/zhouyuping/LLMNavigation/Data/task_info.json"
     
     if multi_agent:
         # Use multi-agent architecture
-        region_data_dir = f"/data/zhouyuping/LLMNavigation/Data/Region_1/regions"  # Region partition data directory
+        region_data_dir = f"/data/zhouyuping/LLMNavigation/Data/NYC/Region_1"  # Region partition data directory
         
         # Check if region data exists
         if not os.path.exists(region_data_dir):

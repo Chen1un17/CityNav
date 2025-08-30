@@ -1,0 +1,5 @@
+<configuration>
+    <input>
+        <net-file value="/data/zhouyuping/LLMNavigation/Data/NYC/NewYork.net.xml"/>
+    </input>
+</configuration>

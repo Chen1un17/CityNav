@@ -544,15 +544,52 @@ class MultiAgentTrafficEnvironment:
                        "--ignore-route-errors"]
             traci.start(sumo_cmd)
             
-            # Parse route file and select autonomous vehicles
-            all_vehicles = parse_rou_file(self.route_file)
-            all_vehicle_ids = [veh_id for veh_id, _, _ in all_vehicles]
-            self.total_vehicles = len(all_vehicles)
+            # Parse only the first route file for autonomous vehicle selection
+            # This ensures only taxi vehicles from NewYork_od_0.1.rou.alt.xml can be autonomous
+            # The second file NYC_routes_0.1_20250830_111509.alt.xml is loaded as environment traffic only
+            first_route_vehicles = parse_rou_file(self.route_file)
+            first_route_vehicle_ids = [veh_id for veh_id, _, _ in first_route_vehicles]
             
-            # Select 2% of vehicles as autonomous
+            # Get total vehicles from SUMO simulation (includes both route files)
+            # We need to wait a bit for SUMO to load all vehicles
+            import time
+            time.sleep(0.1)  # Small delay to ensure all vehicles are loaded
+            
+            # Count total vehicles that will be in simulation
+            self.total_vehicles = len(first_route_vehicles)  # Base count from first file
+            
+            # Try to get additional vehicles from the simulation
+            try:
+                # Get all vehicle IDs that SUMO knows about (including from both files)
+                all_sumo_vehicles = set()
+                for _ in range(10):  # Try multiple times to get all vehicles
+                    current_vehicles = set(traci.vehicle.getIDList())
+                    # Also get vehicles that are loaded but not yet departed
+                    loaded_vehicles = set(traci.simulation.getLoadedIDList())
+                    all_sumo_vehicles.update(current_vehicles)
+                    all_sumo_vehicles.update(loaded_vehicles)
+                    traci.simulationStep()  # Step forward to load more vehicles
+                
+                # Reset simulation to start
+                traci.load(sumo_cmd[2:])  # Reload with same config
+                
+                # Update total count with environment vehicles
+                environment_vehicles = all_sumo_vehicles - set(first_route_vehicle_ids)
+                self.total_vehicles = len(all_sumo_vehicles)
+                
+                self.logger.log_info(f"Vehicle loading: {len(first_route_vehicle_ids)} from primary route file, "
+                                   f"{len(environment_vehicles)} from environment route file, "
+                                   f"{self.total_vehicles} total vehicles")
+                
+            except Exception as count_error:
+                self.logger.log_warning(f"Could not count environment vehicles: {count_error}")
+                # Fall back to just the first route file count
+                pass
+            
+            # Select 2% of vehicles as autonomous - ONLY from the first route file
             import random
-            self.autonomous_vehicles = set(random.sample(all_vehicle_ids, 
-                                                       int(0.02 * self.total_vehicles)))
+            self.autonomous_vehicles = set(random.sample(first_route_vehicle_ids, 
+                                                       int(0.02 * len(first_route_vehicle_ids))))
             
             # Initialize edge information
             print("MULTI_AGENT_ENV: Initializing edge list from SUMO")
