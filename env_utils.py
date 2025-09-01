@@ -620,14 +620,40 @@ def get_congestion_level(congestion_rate):
 
 
 def parse_rou_file(file_path):
+    """
+    解析路由文件(.rou.xml 或 .rou.alt.xml)，提取车辆的起终点信息
+    支持两种格式：
+    1. 标准路由文件(.rou.xml): 包含vehicle标签，其中有routeDistribution
+    2. 替代路由文件(.rou.alt.xml): 包含vehicle标签，其中有routeDistribution
+    """
     trips = []
     tree = ET.parse(file_path)
     root = tree.getroot()
+    
+    # 调试信息：输出根元素和车辆数量
+    print(f"DEBUG: 解析文件 {file_path}")
+    print(f"DEBUG: 根元素标签: {root.tag}")
+    vehicles = root.findall('vehicle')
+    print(f"DEBUG: 找到 {len(vehicles)} 个vehicle标签")
 
-    for vehicle in root.findall('vehicle'):
+    vehicle_count = 0
+    debug_limit = 5  # 只对前5个车辆输出详细调试信息
+    
+    for vehicle in vehicles:
+        vehicle_count += 1
         vehicle_id = vehicle.get('id')  # 获取 vehicle 的 ID
+        
+        # 只对前几个车辆输出详细调试信息
+        debug_output = vehicle_count <= debug_limit
+        
+        if debug_output:
+            print(f"DEBUG: 处理车辆 {vehicle_count}: {vehicle_id}")
+        
+        # 查找路由信息，支持routeDistribution结构
         route_distribution = vehicle.find('routeDistribution')
         if route_distribution is not None:
+            if debug_output:
+                print(f"DEBUG: 找到routeDistribution")
             route = route_distribution.find('route')
             if route is not None:
                 edges = route.get('edges')  # 获取 edges 属性
@@ -636,6 +662,42 @@ def parse_rou_file(file_path):
                     start_edge = edge_list[0]  # 起点 edge_id
                     end_edge = edge_list[-1]  # 终点 edge_id
                     trips.append((vehicle_id, start_edge, end_edge))
+                    if debug_output:
+                        print(f"DEBUG: 成功解析车辆 {vehicle_id}: {start_edge} -> {end_edge}")
+                else:
+                    if debug_output:
+                        print(f"DEBUG: routeDistribution中的route没有edges属性")
+            else:
+                if debug_output:
+                    print(f"DEBUG: routeDistribution中没有找到route")
+        else:
+            # 如果没有routeDistribution，尝试直接查找route标签
+            if debug_output:
+                print(f"DEBUG: 没有找到routeDistribution，查找直接route")
+            route = vehicle.find('route')
+            if route is not None:
+                if debug_output:
+                    print(f"DEBUG: 找到直接route标签")
+                edges = route.get('edges')  # 获取 edges 属性
+                if edges:
+                    edge_list = edges.split()
+                    start_edge = edge_list[0]  # 起点 edge_id
+                    end_edge = edge_list[-1]  # 终点 edge_id
+                    trips.append((vehicle_id, start_edge, end_edge))
+                    if debug_output:
+                        print(f"DEBUG: 成功解析车辆 {vehicle_id}: {start_edge} -> {end_edge}")
+                else:
+                    if debug_output:
+                        print(f"DEBUG: 直接route没有edges属性")
+            else:
+                if debug_output:
+                    print(f"DEBUG: 没有找到直接route标签")
+        
+        # 在调试限制处输出提示
+        if vehicle_count == debug_limit and len(vehicles) > debug_limit:
+            print(f"DEBUG: 继续处理剩余 {len(vehicles) - debug_limit} 个车辆（不输出详细信息）...")
+    
+    print(f"从路由文件 {file_path} 解析到 {len(trips)} 个车辆路径")
     return trips
 
 

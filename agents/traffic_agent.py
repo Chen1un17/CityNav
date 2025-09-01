@@ -830,20 +830,21 @@ class TrafficAgent:
         """Create observation text for macro route planning."""
         observation_parts = []
         
-        observation_parts.append(f"Macro Route Planning: Region {start_region} → Region {end_region}")
+        observation_parts.append(f"Macro Route Planning: Region {start_region} -> Region {end_region}")
         observation_parts.append("")
         
-        # Current regional congestion (compressed format: R[id]:[congestion])
+        # Current regional congestion - 限制显示区域数量
         regional_congestion = context.get('regional_congestion', {})
         congestion_list = []
-        for region_id in range(context['num_regions']):
+        limited_regions = min(context['num_regions'], 20)  # 限制最多20个区域
+        for region_id in range(limited_regions):
             congestion = regional_congestion.get(region_id, 0)
             congestion_list.append(f"R{region_id}:{congestion:.1f}")
         observation_parts.append("Regional_Congestion: " + "|".join(congestion_list))
         observation_parts.append("")
         
-        # Possible routes (compressed format: Rt[n]:R[id]>R[id]>[cong:x.x,bdry:x.x])
-        possible_routes = self._get_possible_regional_routes(start_region, end_region)
+        # Possible routes - 限制最多3条路径
+        possible_routes = self._get_possible_regional_routes(start_region, end_region, max_routes=3)
         route_list = []
         
         for i, route in enumerate(possible_routes):
@@ -857,7 +858,7 @@ class TrafficAgent:
                 regional_congestion.get(region, 0) for region in route[1:]  # Exclude start
             ])
             
-            # Get boundary information
+            # Get boundary information - 简化计算
             boundary_congestion = context.get('boundary_congestion', {})
             avg_boundary_cong = 0
             boundary_count = 0
@@ -878,17 +879,17 @@ class TrafficAgent:
             observation_parts.append("Routes: " + " | ".join(route_list))
             observation_parts.append("")
         
-        # Traffic predictions (compressed format: edge_id:forecast)
+        # Traffic predictions - 限制显示数量
         congestion_forecast = context.get('congestion_forecast', {})
         if congestion_forecast:
             forecast_list = []
-            for edge_id, forecast in list(congestion_forecast.items())[:5]:  # Show top 5
+            for edge_id, forecast in list(congestion_forecast.items())[:3]:  # 只显示前3个
                 avg_forecast = np.mean(forecast) if forecast else 0
                 forecast_list.append(f"{edge_id}:{avg_forecast:.1f}")
             observation_parts.append("Forecast_30min: " + "|".join(forecast_list))
             observation_parts.append("")
         
-        # Current performance (compressed format: metric:value)
+        # Current performance - 简化显示
         performance = context.get('performance_metrics', {})
         if performance:
             perf_list = [
@@ -898,7 +899,13 @@ class TrafficAgent:
             observation_parts.append("Performance: " + "|".join(perf_list))
             observation_parts.append("")
         
-        return "\n".join(observation_parts)
+        observation_text = "\n".join(observation_parts)
+        # 上下文长度控制 - 限制在2000字符以内
+        max_context_length = 2000
+        if len(observation_text) > max_context_length:
+            observation_text = observation_text[:max_context_length-3] + "..."
+        
+        return observation_text
     
     def _get_possible_regional_routes(self, start_region: int, 
                                     end_region: int, max_routes: int = 3) -> List[List[int]]:

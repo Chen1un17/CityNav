@@ -279,11 +279,11 @@ def main(llm_path_or_name, batch_size, location, use_reflection=True, step_size=
         use_local_llm: Whether to use local shared LLM architecture (default: True)
         enable_training: Whether to enable MAGRPO online training (default: False)
     """
-    # File paths - updated to use new data structure
-    sumo_config = f"/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_sumo_config.sumocfg"
-    route_file = f"/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_od_0.1.rou.alt.xml"
-    road_info_file = f"/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_road_info.json"
-    adjacency_file = f"/data/zhouyuping/LLMNavigation/Data/NYC/Region_1/edge_adjacency_alpha_1.json"
+    # File paths - updated to use Region_1 data structure
+    sumo_config = f"/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_sumo_config.sumocfg"
+    route_file = f"/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_od_0.01.rou.alt.xml"
+    road_info_file = f"/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_road_info.json"
+    adjacency_file = f"/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_adjacency_info.json"
     task_info_file = "/data/zhouyuping/LLMNavigation/Data/task_info.json"
     
     if multi_agent:

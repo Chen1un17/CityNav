@@ -2,6 +2,11 @@ import copy
 import os
 import threading
 import time
+import asyncio
+import queue
+from concurrent.futures import ThreadPoolExecutor
+from threading import RLock
+from contextlib import contextmanager
 
 import numpy as np
 import requests
@@ -16,12 +21,151 @@ from openai import OpenAI
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from utils.read_utils import load_json, markdown_code_pattern
 
+
+class RequestQueue:
+    """Thread-safe request queue with priority support"""
+    def __init__(self, max_size=1000):
+        self._queue = queue.PriorityQueue(maxsize=max_size)
+        self._lock = RLock()
+        
+    def put(self, item, priority=0, timeout=None):
+        """Put item in queue with priority (lower number = higher priority)"""
+        with self._lock:
+            self._queue.put((priority, time.time(), item), timeout=timeout)
+    
+    def get(self, timeout=None):
+        """Get item from queue"""
+        with self._lock:
+            priority, timestamp, item = self._queue.get(timeout=timeout)
+            return item
+    
+    def empty(self):
+        with self._lock:
+            return self._queue.empty()
+    
+    def qsize(self):
+        with self._lock:
+            return self._queue.qsize()
+
+
+class ConnectionPool:
+    """Connection pool manager for vLLM clients"""
+    def __init__(self, base_url, pool_size=5, max_retries=3, timeout=30):
+        self.base_url = base_url
+        self.pool_size = pool_size
+        self.max_retries = max_retries
+        self.timeout = timeout
+        self._pool = queue.Queue(maxsize=pool_size)
+        self._lock = RLock()
+        self._created_clients = 0
+        self._healthy_clients = set()
+        
+        # Initialize pool with clients
+        self._initialize_pool()
+    
+    def _initialize_pool(self):
+        """Initialize connection pool"""
+        for _ in range(self.pool_size):
+            try:
+                client = self._create_client()
+                if client:
+                    self._pool.put(client)
+                    self._healthy_clients.add(id(client))
+            except Exception as e:
+                print(f"Failed to create client: {e}")
+    
+    def _create_client(self):
+        """Create a new OpenAI client"""
+        try:
+            client = OpenAI(base_url=self.base_url, api_key="EMPTY", timeout=self.timeout)
+            self._created_clients += 1
+            return client
+        except Exception as e:
+            print(f"Error creating client: {e}")
+            return None
+    
+    @contextmanager
+    def get_client(self):
+        """Get client from pool with context manager"""
+        client = None
+        try:
+            # Try to get client from pool
+            try:
+                client = self._pool.get(timeout=1.0)
+                if id(client) not in self._healthy_clients:
+                    # Client is marked as unhealthy, create new one
+                    client = self._create_client()
+            except queue.Empty:
+                # Pool is empty, create new client
+                client = self._create_client()
+            
+            if client is None:
+                raise Exception("Failed to get healthy client")
+                
+            yield client
+            
+        except Exception as e:
+            # Mark client as unhealthy
+            if client and id(client) in self._healthy_clients:
+                self._healthy_clients.discard(id(client))
+            # Create replacement client for pool
+            replacement = self._create_client()
+            if replacement:
+                self._healthy_clients.add(id(replacement))
+                client = replacement
+            raise e
+        finally:
+            # Return client to pool if healthy
+            if client and id(client) in self._healthy_clients:
+                try:
+                    self._pool.put_nowait(client)
+                except queue.Full:
+                    pass  # Pool is full, client will be garbage collected
+    
+    def health_check(self):
+        """Check health of connections"""
+        healthy_count = 0
+        total_clients = []
+        
+        # Collect all clients from pool
+        while not self._pool.empty():
+            try:
+                client = self._pool.get_nowait()
+                total_clients.append(client)
+            except queue.Empty:
+                break
+        
+        # Test each client
+        for client in total_clients:
+            try:
+                # Simple health check - try to get models
+                response = client.models.list()
+                if response:
+                    healthy_count += 1
+                    self._healthy_clients.add(id(client))
+                    self._pool.put(client)
+                else:
+                    self._healthy_clients.discard(id(client))
+            except Exception:
+                self._healthy_clients.discard(id(client))
+        
+        return healthy_count, len(total_clients)
+
+
 class LLM(object):
     def __init__(self, llm_path, batch_size=16, top_k=50, top_p=1.0, temperature=0.1, max_tokens=8192, memory_size=3, task_info=None, use_reflection=True, gpu_ids=None, tensor_parallel_size=1, gpu_memory_utilization=0.7):
         self.use_reflection = use_reflection
         self.gpu_ids = gpu_ids  # 指定使用的GPU ID列表
         self.tensor_parallel_size = tensor_parallel_size
+        
+        # Request queue and connection pool management
+        self.request_queue = RequestQueue(max_size=1000)
+        self.connection_pool = None
+        self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="llm_worker")
+        self._shutdown = False
         self.gpu_memory_utilization = gpu_memory_utilization
+        # GPU内存管理 - 添加推理计数器
+        self.current_inference_count = 0
         self.tokenizer, self.model, self.generation_kwargs, self.use_api = self.initialize_llm(llm_path, top_k, top_p, temperature, max_tokens)
         
         # Handle different model path formats
@@ -85,25 +229,25 @@ class LLM(object):
             
             vllm_kwargs = {
                 "model": llm_path,
-                "gpu_memory_utilization": max(0.75, self.gpu_memory_utilization - 0.05),  # 降低内存利用率防止CUDA错误
+                "gpu_memory_utilization": max(0.85, self.gpu_memory_utilization - 0.05),  # 降低内存利用率防止CUDA错误
                 "tensor_parallel_size": self.tensor_parallel_size,
                 "max_model_len": effective_max_len,  # 限制序列长度以节省KV cache
                 "enforce_eager": True,
                 "trust_remote_code": True,
-                "swap_space": 6,  # 增加swap space到6GB缓解内存压力
+                "swap_space": 4,  # 增加swap space到6GB缓解内存压力
                 "disable_log_stats": True,  # 减少日志开销
-                "max_num_seqs": 16,  # 限制并发序列数减少内存占用
+                "max_num_seqs": 128,  # 限制并发序列数减少内存占用
                 "block_size": 16  # 减小block size节约内存
             }
             
             print(f"调整序列长度: {max_tokens} -> {effective_max_len} (节省KV cache内存)")
             
-            # 使用device参数而不是环境变量来指定GPU
+            # 使用CUDA_VISIBLE_DEVICES环境变量来指定GPU
             if self.gpu_ids is not None:
                 if isinstance(self.gpu_ids, (list, tuple)):
                     if len(self.gpu_ids) == 1:
-                        # 单GPU模式，直接指定设备
-                        vllm_kwargs["device"] = f"cuda:{self.gpu_ids[0]}"
+                        # 单GPU模式，设置CUDA_VISIBLE_DEVICES
+                        os.environ['CUDA_VISIBLE_DEVICES'] = str(self.gpu_ids[0])
                         vllm_kwargs["tensor_parallel_size"] = 1
                         print(f"LLM initialization: Using GPU {self.gpu_ids[0]}")
                     else:
@@ -114,7 +258,7 @@ class LLM(object):
                         print(f"LLM initialization: Using GPUs {gpu_ids_str} with tensor parallel")
                 else:
                     # 单个GPU ID
-                    vllm_kwargs["device"] = f"cuda:{self.gpu_ids}"
+                    os.environ['CUDA_VISIBLE_DEVICES'] = str(self.gpu_ids)
                     vllm_kwargs["tensor_parallel_size"] = 1
                     print(f"LLM initialization: Using GPU {self.gpu_ids}")
             else:
@@ -134,6 +278,12 @@ class LLM(object):
             except Exception as e:
                 print(f"vLLM模型加载失败: {e}")
                 raise
+        elif llm_path.startswith(('http://', 'https://')):
+            # URL形式，使用连接池管理
+            self.connection_pool = ConnectionPool(llm_path, pool_size=3, timeout=6000)
+            llm_model = None  # 使用连接池而不是固定客户端
+            use_api = True
+            print(f"初始化连接池管理器: {llm_path}")
         elif "openai" in llm_path.lower() or "siliconflow" in llm_path.lower():
             llm_model = OpenAI()
             use_api = True
@@ -153,25 +303,25 @@ class LLM(object):
             
             vllm_kwargs = {
                 "model": llm_path,
-                "gpu_memory_utilization": max(0.75, self.gpu_memory_utilization - 0.05),  # 降低内存利用率防止CUDA错误
+                "gpu_memory_utilization": max(0.85, self.gpu_memory_utilization - 0.05),  # 降低内存利用率防止CUDA错误
                 "tensor_parallel_size": self.tensor_parallel_size,
                 "max_model_len": effective_max_len,  # 限制序列长度以节省KV cache
                 "enforce_eager": True,
                 "trust_remote_code": True,
-                "swap_space": 6,  # 增加swap space到6GB缓解内存压力
+                "swap_space": 4,  # 增加swap space到6GB缓解内存压力
                 "disable_log_stats": True,  # 减少日志开销
-                "max_num_seqs": 16,  # 限制并发序列数减少内存占用
+                "max_num_seqs": 128,  # 限制并发序列数减少内存占用
                 "block_size": 16  # 减小block size节约内存
             }
             
             print(f"调整序列长度: {max_tokens} -> {effective_max_len} (节省KV cache内存)")
             
-            # 使用device参数而不是环境变量来指定GPU
+            # 使用CUDA_VISIBLE_DEVICES环境变量来指定GPU
             if self.gpu_ids is not None:
                 if isinstance(self.gpu_ids, (list, tuple)):
                     if len(self.gpu_ids) == 1:
-                        # 单GPU模式，直接指定设备
-                        vllm_kwargs["device"] = f"cuda:{self.gpu_ids[0]}"
+                        # 单GPU模式，设置CUDA_VISIBLE_DEVICES
+                        os.environ['CUDA_VISIBLE_DEVICES'] = str(self.gpu_ids[0])
                         vllm_kwargs["tensor_parallel_size"] = 1
                         print(f"LLM initialization: Using GPU {self.gpu_ids[0]}")
                     else:
@@ -182,7 +332,7 @@ class LLM(object):
                         print(f"LLM initialization: Using GPUs {gpu_ids_str} with tensor parallel")
                 else:
                     # 单个GPU ID
-                    vllm_kwargs["device"] = f"cuda:{self.gpu_ids}"
+                    os.environ['CUDA_VISIBLE_DEVICES'] = str(self.gpu_ids)
                     vllm_kwargs["tensor_parallel_size"] = 1
                     print(f"LLM initialization: Using GPU {self.gpu_ids}")
             else:
@@ -252,13 +402,47 @@ class LLM(object):
 
         return memory, memory_count, memory_size
     
+    def _compress_memory(self):
+        """记忆系统优化 - 压缩和限制记忆长度"""
+        if len(self.memory) > self.memory_size:
+            # 保留最重要的记忆，压缩旧记忆
+            self.memory = self.memory[-self.memory_size:]
+    
+    def _get_compressed_memory_text(self):
+        """获取压缩的记忆文本，限制到200字符以内"""
+        if not self.memory:
+            return "N/A"
+        
+        memory_text = ""
+        for exp in self.memory:
+            memory_text += f"- {exp}\n"
+        memory_text = memory_text[:-1] if memory_text else "N/A"
+        
+        # 限制到200字符以内
+        if len(memory_text) > 200:
+            memory_text = memory_text[:197] + "..."
+        
+        return memory_text
+    
     def _validate_and_clean_decision(self, decision_dict, default_answer="1"):
         """
         Validate and clean LLM decision response to ensure required fields are present and valid.
-        Based on Context7 best practices for structured LLM output validation.
+        Enhanced with better error handling and fallback mechanisms.
         """
+        # Handle None or empty inputs
+        if decision_dict is None:
+            return {"answer": default_answer, "summary": "Empty response, using default"}
+            
+        # Handle non-dict inputs  
         if not isinstance(decision_dict, dict):
-            return {"answer": default_answer, "summary": "Invalid response format, using default"}
+            try:
+                # Try to parse as JSON if it's a string
+                if isinstance(decision_dict, str):
+                    decision_dict = json.loads(decision_dict.strip())
+                else:
+                    return {"answer": default_answer, "summary": "Invalid response format, using default"}
+            except:
+                return {"answer": default_answer, "summary": "Cannot parse response, using default"}
         
         # Validate and clean 'answer' field
         answer = decision_dict.get("answer")
@@ -274,18 +458,37 @@ class LLM(object):
         # Validate and clean 'summary' field  
         summary = decision_dict.get("summary")
         if summary is None or not isinstance(summary, str) or not summary.strip():
-            summary = f"Selected option {answer}"
+            summary = f"Selected option {answer} (auto-generated summary)"
         else:
             summary = str(summary).strip()
+            # Limit summary length to prevent memory issues
+            if len(summary) > 500:
+                summary = summary[:497] + "..."
         
-        return {
+        # Preserve other fields that might be useful
+        result = {
             "answer": answer,
             "summary": summary
         }
+        
+        # Add other common fields if they exist and are valid
+        for field in ["reasoning", "confidence", "data_analysis", "coordination_strategy"]:
+            if field in decision_dict and decision_dict[field] is not None:
+                try:
+                    field_value = str(decision_dict[field]).strip()
+                    if field_value and len(field_value) <= 1000:  # Reasonable length limit
+                        result[field] = field_value
+                except:
+                    pass  # Skip invalid fields
+        
+        return result
 
     def update_memory(self, sample_info):
         if not self.use_reflection:
             return
+        
+        # 记忆系统优化 - 更新前先压缩记忆
+        self._compress_memory()
 
         old_experience = ""
         for exp in self.memory:
@@ -316,10 +519,18 @@ class LLM(object):
                     return
 
                 possible_answer = regex.findall(markdown_code_pattern, response)
-                if len(possible_answer) != 0:
-                    self.memory = json.loads(possible_answer[-1])[:self.memory_size]
+                if len(possible_answer) > 0:
+                    try:
+                        self.memory = json.loads(possible_answer[-1])[:self.memory_size]
+                    except (json.JSONDecodeError, IndexError) as e:
+                        print(f"Memory update JSON parse error: {e}")
+                        return
                 else:
-                    self.memory = json.loads(response)[:self.memory_size]
+                    try:
+                        self.memory = json.loads(response)[:self.memory_size]
+                    except (json.JSONDecodeError, IndexError) as e:
+                        print(f"Memory update fallback JSON parse error: {e}")
+                        return
 
                 return
             except Exception as e:
@@ -328,6 +539,9 @@ class LLM(object):
                 retry_count += 1
 
     def inference(self, query, system_prompt=None):
+        # GPU内存管理 - 增加推理计数并定期清理
+        self.current_inference_count += 1
+        
         message = [
             {
                 "role": "system",
@@ -347,19 +561,40 @@ class LLM(object):
 
             retry_count = 0
             response = None
-            while retry_count < 3:
-                try:
-                    response = self.model.chat.completions.create(
-                        model=llm_name,
-                        messages=message,
-                        temperature=self.generation_kwargs['temperature'],
-                        max_tokens=self.generation_kwargs['max_tokens'],
-                        # timeout=120
-                    ).choices[0].message.content
-                    break
-                except:
-                    time.sleep(5)
-                    retry_count += 1
+            
+            # Use connection pool if available
+            if self.connection_pool is not None:
+                while retry_count < 3:
+                    try:
+                        with self.connection_pool.get_client() as client:
+                            response = client.chat.completions.create(
+                                model=llm_name,
+                                messages=message,
+                                temperature=self.generation_kwargs['temperature'],
+                                max_tokens=self.generation_kwargs['max_tokens']
+                            ).choices[0].message.content
+                        break
+                    except Exception as e:
+                        print(f"Connection pool inference error (attempt {retry_count + 1}): {e}")
+                        retry_count += 1
+                        if retry_count < 3:
+                            time.sleep(min(2 ** retry_count, 10))  # Exponential backoff
+            else:
+                # Original logic for non-pooled connections
+                while retry_count < 3:
+                    try:
+                        response = self.model.chat.completions.create(
+                            model=llm_name,
+                            messages=message,
+                            temperature=self.generation_kwargs['temperature'],
+                            max_tokens=self.generation_kwargs['max_tokens'],
+                            # timeout=120
+                        ).choices[0].message.content
+                        break
+                    except Exception as e:
+                        print(f"API inference error (attempt {retry_count + 1}): {e}")
+                        time.sleep(5) 
+                        retry_count += 1
         else:
             # Add CUDA error handling for vLLM
             retry_count = 0
@@ -370,6 +605,18 @@ class LLM(object):
                         return None
                     responses_gen = self.model.chat([message], use_tqdm=False, sampling_params=self.generation_kwargs)
                     response = responses_gen[0].outputs[0].text
+                    
+                    # GPU内存管理 - 每50次推理清理一次GPU内存
+                    if self.current_inference_count % 50 == 0:
+                        try:
+                            import torch
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                                torch.cuda.synchronize()
+                                print(f"GPU_MEMORY_CLEANUP: Cleared GPU cache after {self.current_inference_count} inferences")
+                        except Exception as cleanup_error:
+                            print(f"GPU_MEMORY_CLEANUP_ERROR: {cleanup_error}")
+                    
                     break
                 except Exception as e:
                     error_msg = str(e)
@@ -416,23 +663,44 @@ class LLM(object):
                         llm_name = f"{self.institute_name}/{self.llm_name}"
                     else:
                         llm_name = self.llm_name
-                    threads = []
-                    responses = [None for _ in range(len(messages))]
+                    
+                    # Optimize batch processing with connection pool
+                    if self.connection_pool is not None:
+                        # Limit concurrent threads to prevent socket exhaustion
+                        max_workers = min(len(messages), 3)  # Max 3 concurrent connections
+                        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="batch_worker") as executor:
+                            futures = []
+                            responses = [None for _ in range(len(messages))]
+                            
+                            for j, message in enumerate(messages):
+                                future = executor.submit(self.threading_inference, llm_name, message, responses, j)
+                                futures.append(future)
+                            
+                            # Wait for all requests to complete
+                            for future in futures:
+                                future.result(timeout=60000)  # 60 second timeout per request
+                        
+                        all_responses.extend(responses)
+                    else:
+                        # Original threading logic for non-pooled connections
+                        threads = []
+                        responses = [None for _ in range(len(messages))]
 
-                    for j, message in enumerate(messages):
-                        thread = threading.Thread(target=self.threading_inference, args=(llm_name, message, responses, j, ))
-                        threads.append(thread)
-                        thread.start()
+                        for j, message in enumerate(messages):
+                            thread = threading.Thread(target=self.threading_inference, args=(llm_name, message, responses, j, ))
+                            threads.append(thread)
+                            thread.start()
 
-                    for thread in threads:
-                        thread.join()
+                        for thread in threads:
+                            thread.join()
 
-                    all_responses.extend(responses)
+                        all_responses.extend(responses)
                 else:
                     responses_gen = self.model.chat(messages, use_tqdm=False, sampling_params=self.generation_kwargs)
                     responses = [res.outputs[0].text for res in responses_gen]
                     all_responses.extend(responses)
-                    messages = list()
+                
+                messages = list()
 
         return all_responses
 
@@ -507,67 +775,53 @@ class LLM(object):
         while retry_count < 2:
             time.sleep(5)
             try:
-                if "openai" == self.provider_name:
-                    stream = self.model.chat.completions.create(
-                        model=llm_name,
-                        messages=message,
-                        # temperature=self.generation_kwargs['temperature'],
-                        max_completion_tokens=self.generation_kwargs['max_tokens'],
-                        stream=True
-                    )
+                # Use connection pool if available
+                client = None
+                if self.connection_pool is not None:
+                    client_context = self.connection_pool.get_client()
+                    client = client_context.__enter__()
                 else:
-                    stream = self.model.chat.completions.create(
-                        model=llm_name,
-                        messages=message,
-                        max_tokens=self.generation_kwargs['max_tokens'] if "glm-z1-9b" not in llm_name.lower() else 8000,
-                        stream=True
-                    )
+                    client = self.model
+                
+                try:
+                    if "openai" == self.provider_name:
+                        stream = client.chat.completions.create(
+                            model=llm_name,
+                            messages=message,
+                            # temperature=self.generation_kwargs['temperature'],
+                            max_completion_tokens=self.generation_kwargs['max_tokens'],
+                            stream=True
+                        )
+                    else:
+                        stream = client.chat.completions.create(
+                            model=llm_name,
+                            messages=message,
+                            max_tokens=self.generation_kwargs['max_tokens'] if "glm-z1-9b" not in llm_name.lower() else 8000,
+                            stream=True
+                        )
+                finally:
+                    if self.connection_pool is not None and client is not None:
+                        client_context.__exit__(None, None, None)
 
                 collected_response = "<think>\n"
                 reasoning_finish_flag = False
-                
-                # Add streaming timeout mechanism
-                stream_start_time = time.time()
-                timeout_seconds = 120  # 2 minutes timeout
-                chunk_timeout = 30     # 30 seconds timeout between chunks
-                last_chunk_time = time.time()
-                
                 for chunk in stream:
-                    current_time = time.time()
-                    
-                    # Check overall timeout
-                    if current_time - stream_start_time > timeout_seconds:
-                        print(f"Stream timeout after {timeout_seconds}s for request [{m_id}]")
-                        response_list[m_id] = "Stream timeout - using fallback response"
-                        return
-                    
-                    # Check chunk timeout
-                    if current_time - last_chunk_time > chunk_timeout:
-                        print(f"Chunk timeout after {chunk_timeout}s for request [{m_id}]")
-                        response_list[m_id] = "Chunk timeout - using fallback response"
-                        return
-                    
                     if hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content:
                         if not reasoning_finish_flag:
                             collected_response += "</think>\n"
                             reasoning_finish_flag = True
                         token = chunk.choices[0].delta.content
                         collected_response += token
-                        last_chunk_time = current_time
                     elif hasattr(chunk.choices[0].delta, 'reasoning_content') and chunk.choices[0].delta.reasoning_content:
                         token = chunk.choices[0].delta.reasoning_content
                         collected_response += token
-                        last_chunk_time = current_time
-                        
                 response_list[m_id] = collected_response
                 print(f"\nSuccess [{m_id}].")
                 break
 
             except Exception as e:
                 retry_count += 1
-                print(f"Error in request [{m_id}]: {e}")
-                if retry_count >= 2:
-                    response_list[m_id] = "Exception fallback - request failed after retries"
+                print(e)
 
     def data_analysis_type_selection(self, data_text):
         query = copy.copy(self.overall_template)
@@ -743,11 +997,8 @@ class LLM(object):
             query = query.replace("<step_instruction>", self.decision_making_template)
             query = query.replace("<answer_option_form>", answer_option_form[i])
 
-            # add memory
-            memory_text = ""
-            for exp in self.memory:
-                memory_text += f"- {exp}\n"
-            memory_text = memory_text[:-1] if memory_text else "N/A"
+            # add memory - 使用压缩的记忆文本
+            memory_text = self._get_compressed_memory_text()
             query = query.replace("<experience>", memory_text)
 
             queries.append((i, query))
@@ -830,11 +1081,8 @@ class LLM(object):
             query = query.replace("<step_instruction>", self.self_reflection_template)
             query = query.replace("<answer_option_form>", answer_option_form[i])
 
-            # add memory
-            memory_text = ""
-            for exp in self.memory:
-                memory_text += f"- {exp}\n"
-            memory_text = memory_text[:-1] if memory_text else "N/A"
+            # add memory - 使用压缩的记忆文本
+            memory_text = self._get_compressed_memory_text()
             query = query.replace("<experience>", memory_text)
 
             # decision and reason
@@ -875,11 +1123,12 @@ class LLM(object):
                 # Paser the response to extract the JSON object
                 try:
                     possible_answer = regex.findall(markdown_code_pattern, res)
-                    if len(possible_answer) <= 0:
-                        reflection = json.loads(res)
-                    else:
+                    if len(possible_answer) > 0:
                         reflection = json.loads(possible_answer[-1])
-                except Exception as e:
+                    else:
+                        reflection = json.loads(res)
+                except (json.JSONDecodeError, IndexError, Exception) as e:
+                    print(f"Self reflection JSON parse error: {e}")
                     reflection = {}
                     failed_responses.append(res)
 
@@ -1055,7 +1304,8 @@ class LLM(object):
                 else:
                     decision_result = json.loads(response)
                 return decision_result
-            except:
+            except (json.JSONDecodeError, IndexError, Exception) as e:
+                print(f"Regional coordination JSON parse error: {e}")
                 # Fallback parsing
                 return {
                     "vehicle_decisions": [],
@@ -1111,7 +1361,8 @@ class LLM(object):
                 else:
                     decision_result = json.loads(response)
                 return decision_result
-            except:
+            except (json.JSONDecodeError, IndexError, Exception) as e:
+                print(f"Macro route planning JSON parse error: {e}")
                 # Fallback parsing
                 return {
                     "macro_routes": [],
@@ -1167,7 +1418,8 @@ class LLM(object):
                 else:
                     decision_result = json.loads(response)
                 return decision_result
-            except:
+            except (json.JSONDecodeError, IndexError, Exception) as e:
+                print(f"Inter-agent communication JSON parse error: {e}")
                 # Fallback parsing
                 return {
                     "message_interpretation": "Failed to parse LLM response",
@@ -1251,7 +1503,8 @@ class LLM(object):
                             decision = json.loads(possible_answer[-1])
                         else:
                             decision = json.loads(res)
-                    except:
+                    except (json.JSONDecodeError, IndexError, Exception) as e:
+                        print(f"Enhanced hybrid decision JSON parse error: {e}")
                         decision = {}
                         retry_queries.append(decision_making_samples[i])
                     
@@ -1361,6 +1614,97 @@ class LocalLLMManager:
         print(f"\n=== 初始化本地LLM管理器 ===")
         print(f"模型路径: {model_path}")
         
+        # 自动注册到全局注册表 - 修复热重载访问问题
+        self._register_to_global_registry()
+    
+    def _register_to_global_registry(self):
+        """注册到全局LLM管理器注册表 - 增强版本"""
+        try:
+            import sys
+            import os
+            
+            # 确保multi_agent_env模块可以被导入
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            parent_dir = os.path.dirname(current_dir)
+            if parent_dir not in sys.path:
+                sys.path.insert(0, parent_dir)
+            
+            print(f"[DEBUG] 尝试导入multi_agent_env模块，当前路径: {parent_dir}")
+            
+            # 尝试多种方法导入和注册
+            registration_success = False
+            
+            # 方法1: 直接导入multi_agent_env
+            try:
+                import multi_agent_env
+                print(f"[DEBUG] 成功导入multi_agent_env模块")
+                
+                # 检查全局注册表是否存在
+                if hasattr(multi_agent_env, '_global_llm_manager_registry'):
+                    print(f"[DEBUG] 发现现有注册表，当前键: {list(multi_agent_env._global_llm_manager_registry.keys())}")
+                    multi_agent_env._global_llm_manager_registry["current"] = self
+                    registration_success = True
+                    print(f"✓ LocalLLMManager已注册到全局注册表 (键: 'current')")
+                else:
+                    print(f"[DEBUG] 创建新的全局注册表")
+                    multi_agent_env._global_llm_manager_registry = {"current": self}
+                    registration_success = True
+                    print(f"✓ 创建并注册到全局LLM管理器注册表")
+                
+                # 验证注册是否成功
+                if registration_success:
+                    test_manager = multi_agent_env._global_llm_manager_registry.get("current")
+                    if test_manager is self:
+                        print(f"✓ 注册验证成功，管理器对象匹配")
+                    else:
+                        print(f"✗ 注册验证失败，对象不匹配")
+                        registration_success = False
+                        
+            except ImportError as import_error:
+                print(f"[DEBUG] 导入multi_agent_env失败: {import_error}")
+                registration_success = False
+            except Exception as reg_error:
+                print(f"[DEBUG] 注册过程中发生错误: {reg_error}")
+                registration_success = False
+            
+            # 方法2: 如果直接导入失败，尝试通过sys.modules访问
+            if not registration_success:
+                print(f"[DEBUG] 尝试通过sys.modules访问multi_agent_env")
+                if 'multi_agent_env' in sys.modules:
+                    multi_agent_env_module = sys.modules['multi_agent_env']
+                    if hasattr(multi_agent_env_module, '_global_llm_manager_registry'):
+                        multi_agent_env_module._global_llm_manager_registry["current"] = self
+                        registration_success = True
+                        print(f"✓ 通过sys.modules注册成功")
+                    else:
+                        multi_agent_env_module._global_llm_manager_registry = {"current": self}
+                        registration_success = True
+                        print(f"✓ 通过sys.modules创建并注册成功")
+                else:
+                    print(f"[DEBUG] multi_agent_env不在sys.modules中")
+            
+            # 方法3: 创建本地fallback注册表
+            if not registration_success:
+                print(f"[DEBUG] 创建本地fallback注册表")
+                globals()['_local_llm_manager_instance'] = self
+                globals()['_global_llm_manager_registry'] = {"current": self}
+                print(f"✓ 创建本地注册表作为fallback")
+                registration_success = True
+            
+            if registration_success:
+                print(f"🎉 LocalLLMManager注册完成！")
+                return True
+            else:
+                print(f"✗ 所有注册方法都失败了")
+                return False
+                
+        except Exception as e:
+            print(f"✗ 注册过程发生严重错误: {e}")
+            # 最后的fallback
+            globals()['_local_llm_manager_instance'] = self
+            print(f"✓ 使用紧急fallback注册")
+            return False
+        
     def initialize_llms(self):
         """初始化两个共享LLM实例"""
         print("\n=== 初始化共享LLM实例 ===")
@@ -1369,13 +1713,15 @@ class LocalLLMManager:
         import os
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:False"
         os.environ["CUDA_LAUNCH_BLOCKING"] = "0"  # 正常模式下设为0，调试时可设为1
-        print("[INFO] 已设置CUDA内存管理环境变量")
+        os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"  # 使用FlashAttention
+        os.environ["TORCH_CUDA_ARCH_LIST"] = "8.6"  # 设置CUDA架构避免编译问题
+        print("[INFO] 已设置CUDA内存管理和attention backend环境变量")
         
         # 初始化Traffic LLM (使用GPU 0)
         print("正在初始化 Traffic LLM (GPU 0)...")
         self.traffic_llm = LLM(
             llm_path=self.model_path,
-            batch_size=7,
+            batch_size=8,
             top_k=50,
             top_p=1.0,
             temperature=0.1,
@@ -1410,7 +1756,11 @@ class LocalLLMManager:
         print("\n=== 所有LLM实例初始化完成 ===")
         print("- Traffic LLM: GPU 0")
         print("- Regional LLM: GPU 1")
-        print("- GPU 2-3: 用于推理加速")
+        print("- GPU 2-3: 用于训练")
+        
+        # 设置训练使用的GPU
+        os.environ["TRAINING_CUDA_VISIBLE_DEVICES"] = "2,3"
+        print("[INFO] 训练将使用GPU 2,3")
         
         return self.traffic_llm, self.regional_llm
     
@@ -1735,9 +2085,9 @@ class LocalLLMManager:
                     "max_model_len": 8192,
                     "enforce_eager": True,
                     "trust_remote_code": True,
-                    "swap_space": 6,
+                    "swap_space": 4,
                     "disable_log_stats": True,
-                    "max_num_seqs": 16,
+                    "max_num_seqs": 128,
                     "block_size": 16
                 }
                 

@@ -59,6 +59,18 @@ class TrainingConfig:
     
     # Model Configuration
     model_path: str = "/data/zhouyuping/Qwen/"
+    
+    def __post_init__(self):
+        # 从环境变量读取训练GPU配置
+        training_gpus = os.getenv("TRAINING_CUDA_VISIBLE_DEVICES", "2,3").split(",")
+        if len(training_gpus) >= 2:
+            self.traffic_gpu = f"cuda:{training_gpus[0]}"
+            self.regional_gpu = f"cuda:{training_gpus[1]}"
+        else:
+            # 默认配置
+            self.traffic_gpu = "cuda:2"
+            self.regional_gpu = "cuda:3"
+    
     traffic_gpu: str = "cuda:2"  # GPU for Traffic LLM training
     regional_gpu: str = "cuda:3"  # GPU for Regional LLM training
     

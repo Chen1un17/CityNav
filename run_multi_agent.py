@@ -221,17 +221,17 @@ def check_requirements():
     
     required_files = [
         "/data/zhouyuping/LLMNavigation/Data/task_info.json",
-        "/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_sumo_config.sumocfg",
-        "/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_od_0.1.rou.alt.xml",
-        "/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_road_info.json",
-        "/data/zhouyuping/LLMNavigation/Data/NYC/Region_1/edge_adjacency_alpha_1.json",
-        "/data/zhouyuping/LLMNavigation/Data/NYC/Region_1/boundary_edges_alpha_1.json",
-        "/data/zhouyuping/LLMNavigation/Data/NYC/Region_1/edge_to_region_alpha_1.json",
+        "/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_sumo_config.sumocfg",
+        "/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_od_0.01.rou.alt.xml",
+        "/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_road_info.json",
+        "/data/zhouyuping/LLMNavigation/Data/Region_1/edge_adjacency_alpha_1.json",
+        "/data/zhouyuping/LLMNavigation/Data/Region_1/boundary_edges_alpha_1.json",
+        "/data/zhouyuping/LLMNavigation/Data/Region_1/edge_to_region_alpha_1.json",
     ]
     
     required_dirs = [
         "./Data",
-        "/data/zhouyuping/LLMNavigation/Data/NYC/Region_1",
+        "/data/zhouyuping/LLMNavigation/Data/Region_1",
         "./agents",
         "./utils",
     ]

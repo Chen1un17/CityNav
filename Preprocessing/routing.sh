@@ -1,6 +1,6 @@
-duarouter --trip-files ./data/zhouyuping/LLMNavigation/Data/NYC/traffic//data/zhouyuping/LLMNavigation/Data/NYC/ttan_od_0.1.trips.xml \
-          --net-file ./data/zhouyuping/LLMNavigation/Data/NYC/Maps//data/zhouyuping/LLMNavigation/Data/NYC/ttan.net.xml \
-          --output-file ./data/zhouyuping/LLMNavigation/Data/NYC/traffic//data/zhouyuping/LLMNavigation/Data/NYC/ttan_od_0.1.rou.xml \
+duarouter --route-files /data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_od_0.01.rou.alt.xml \
+          --net-file /data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan.net.xml \
+          --output-file /data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_od_0.01_processed.rou.xml \
           --ignore-errors \
           --repair \
           --routing-threads 10 \

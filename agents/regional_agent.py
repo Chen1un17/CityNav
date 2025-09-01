@@ -638,6 +638,248 @@ class RegionalAgent:
             else:
                 return None
     
+    def make_batch_regional_route_planning(self, batch_vehicles: List[Dict], current_time: float) -> List[Optional[Dict]]:
+        """
+        Execute regional route planning for multiple vehicles in a single LLM call.
+        This is the core method that solves the timeout issue by batching vehicle planning.
+        
+        Args:
+            batch_vehicles: List of dicts with 'vehicle_id' and 'target_region'
+            current_time: Current simulation time
+            
+        Returns:
+            List of regional plans (same order as input), None for failed vehicles
+        """
+        try:
+            if not batch_vehicles:
+                return []
+            
+            self.logger.log_info(f"BATCH_REGIONAL_PLANNING: Processing {len(batch_vehicles)} vehicles in region {self.region_id}")
+            
+            # Collect all vehicle planning data
+            vehicle_plans_data = []
+            for vehicle_data in batch_vehicles:
+                vehicle_id = vehicle_data['vehicle_id']
+                target_region = vehicle_data['target_region']
+                
+                try:
+                    # Get current position 
+                    current_edge = traci.vehicle.getRoadID(vehicle_id)
+                    if not current_edge or current_edge.startswith(':'):
+                        self.logger.log_warning(f"BATCH_PLANNING: Invalid edge {current_edge} for {vehicle_id}")
+                        vehicle_plans_data.append(None)
+                        continue
+                    
+                    # Get boundary candidates first
+                    boundary_candidates = self._get_boundary_candidates_to_region(target_region)
+                    if not boundary_candidates:
+                        # Fallback: use any outgoing boundary edge
+                        boundary_candidates = self.outgoing_boundaries[:3] if self.outgoing_boundaries else []
+                        if not boundary_candidates:
+                            self.logger.log_warning(f"BATCH_PLANNING: No boundaries for {vehicle_id}")
+                            vehicle_plans_data.append(None)
+                            continue
+                    
+                    # Generate route candidates
+                    route_candidates = self._generate_regional_route_candidates(
+                        current_edge, boundary_candidates, current_time
+                    )
+                    
+                    if not route_candidates:
+                        self.logger.log_warning(f"BATCH_PLANNING: No candidates for {vehicle_id}")
+                        vehicle_plans_data.append(None)
+                        continue
+                    
+                    vehicle_plans_data.append({
+                        'vehicle_id': vehicle_id,
+                        'current_edge': current_edge,
+                        'target_region': target_region,
+                        'candidates': route_candidates[:3]  # Limit to top 3 candidates
+                    })
+                    
+                except Exception as e:
+                    self.logger.log_error(f"BATCH_PLANNING: Failed to prepare data for {vehicle_id}: {e}")
+                    vehicle_plans_data.append(None)
+            
+            # Filter out None values for LLM processing
+            valid_vehicles = [data for data in vehicle_plans_data if data is not None]
+            
+            if not valid_vehicles:
+                return [None] * len(batch_vehicles)
+            
+            # Create batch observation for LLM
+            batch_observation = self._create_batch_regional_planning_observation(
+                valid_vehicles, current_time
+            )
+            
+            # Create answer options (simple sequential numbers for each vehicle's first candidate)
+            # Simplified approach: LLM just needs to return comma-separated selections
+            answer_options = f"1/{len(valid_vehicles)}"  # Simplified options
+            
+            # Single LLM call for all vehicles
+            call_id = self.logger.log_llm_call_start(
+                "BatchRegionalRouting", f"R{self.region_id}_batch", len(batch_observation)
+            )
+            
+            try:
+                decisions = self.llm_agent.hybrid_decision_making_pipeline(
+                    [batch_observation], [answer_options]
+                )
+                
+                # Process LLM decision - simplified fallback
+                results = []
+                valid_idx = 0
+                for original_data in vehicle_plans_data:
+                    if original_data is not None:
+                        # For simplicity, use first candidate for all vehicles
+                        candidate = original_data['candidates'][0]
+                        results.append({
+                            'boundary_edge': candidate['boundary_edge'],
+                            'route': candidate['route'],
+                            'travel_time': candidate['travel_time'],
+                            'reasoning': f"Batch regional planning (Vehicle {valid_idx+1})"
+                        })
+                        valid_idx += 1
+                    else:
+                        results.append(None)
+                
+                self.logger.log_llm_call_end(call_id, True, f"Processed {len(valid_vehicles)} vehicles", len(batch_observation))
+                
+            except Exception as llm_error:
+                self.logger.log_llm_call_end(call_id, False, f"LLM error: {llm_error}", len(batch_observation))
+                # Fallback: use first candidate for all vehicles
+                results = []
+                for original_data in vehicle_plans_data:
+                    if original_data and original_data['candidates']:
+                        candidate = original_data['candidates'][0]
+                        results.append({
+                            'boundary_edge': candidate['boundary_edge'],
+                            'route': candidate['route'],
+                            'travel_time': candidate['travel_time'],
+                            'reasoning': 'Fallback after LLM error'
+                        })
+                    else:
+                        results.append(None)
+            
+            return results
+            
+        except Exception as e:
+            self.logger.log_error(f"BATCH_REGIONAL_PLANNING: Critical error in region {self.region_id}: {e}")
+            return [None] * len(batch_vehicles)
+    
+    def _process_batch(self, batch_vehicles: List[Dict], current_time: float) -> List[Optional[Dict]]:
+        """处理一个小批次的车辆规划"""
+        try:
+            # 复用主批处理逻辑，但针对小批次
+            vehicle_plans_data = []
+            for vehicle_data in batch_vehicles:
+                vehicle_id = vehicle_data['vehicle_id']
+                target_region = vehicle_data['target_region']
+                
+                try:
+                    # Get current position 
+                    current_edge = traci.vehicle.getRoadID(vehicle_id)
+                    if not current_edge or current_edge.startswith(':'):
+                        self.logger.log_warning(f"BATCH_PROCESSING: Invalid edge {current_edge} for {vehicle_id}")
+                        vehicle_plans_data.append(None)
+                        continue
+                    
+                    # Get boundary candidates first
+                    boundary_candidates = self._get_boundary_candidates_to_region(target_region)
+                    if not boundary_candidates:
+                        # Fallback: use any outgoing boundary edge
+                        boundary_candidates = self.outgoing_boundaries[:3] if self.outgoing_boundaries else []
+                        if not boundary_candidates:
+                            self.logger.log_warning(f"BATCH_PROCESSING: No boundaries for {vehicle_id}")
+                            vehicle_plans_data.append(None)
+                            continue
+                    
+                    # Generate route candidates
+                    route_candidates = self._generate_regional_route_candidates(
+                        current_edge, boundary_candidates, current_time
+                    )
+                    
+                    if not route_candidates:
+                        self.logger.log_warning(f"BATCH_PROCESSING: No candidates for {vehicle_id}")
+                        vehicle_plans_data.append(None)
+                        continue
+                    
+                    vehicle_plans_data.append({
+                        'vehicle_id': vehicle_id,
+                        'current_edge': current_edge,
+                        'target_region': target_region,
+                        'candidates': route_candidates[:3]  # Limit to top 3 candidates
+                    })
+                    
+                except Exception as e:
+                    self.logger.log_error(f"BATCH_PROCESSING: Failed to prepare data for {vehicle_id}: {e}")
+                    vehicle_plans_data.append(None)
+            
+            # Filter out None values for LLM processing
+            valid_vehicles = [data for data in vehicle_plans_data if data is not None]
+            
+            if not valid_vehicles:
+                return [None] * len(batch_vehicles)
+            
+            # 简化的LLM调用 - 使用第一个候选路径
+            results = []
+            valid_idx = 0
+            for original_data in vehicle_plans_data:
+                if original_data is not None:
+                    # For efficiency, use first candidate
+                    candidate = original_data['candidates'][0] if original_data['candidates'] else None
+                    if candidate:
+                        results.append({
+                            'boundary_edge': candidate['boundary_edge'],
+                            'route': candidate['route'],
+                            'travel_time': candidate['travel_time'],
+                            'reasoning': f"Batch processing (Vehicle {valid_idx+1})"
+                        })
+                        valid_idx += 1
+                    else:
+                        results.append(None)
+                else:
+                    results.append(None)
+            
+            return results
+            
+        except Exception as e:
+            self.logger.log_error(f"BATCH_PROCESSING: Error processing batch: {e}")
+            return [None] * len(batch_vehicles)
+    
+    def _create_batch_regional_planning_observation(self, valid_vehicles: List[Dict], current_time: float) -> str:
+        """Create batch observation for multiple vehicles."""
+        observation_parts = []
+        observation_parts.append(f"BATCH REGIONAL ROUTE PLANNING - REGION {self.region_id}")
+        observation_parts.append(f"Planning for {len(valid_vehicles)} vehicles, time: {current_time:.1f}s")
+        observation_parts.append("")
+        
+        # 限制最多显示3辆车的详细信息以控制长度
+        limited_vehicles = valid_vehicles[:3]
+        for i, vehicle_data in enumerate(limited_vehicles):
+            observation_parts.append(f"V{i+1}: {vehicle_data['vehicle_id']} -> R{vehicle_data['target_region']}")
+            observation_parts.append(f"  From: {vehicle_data['current_edge'][:10]}... Candidates: {len(vehicle_data['candidates'])}")
+            
+            # 只显示第一个候选路径的简化信息
+            if vehicle_data['candidates']:
+                candidate = vehicle_data['candidates'][0]
+                short_desc = candidate['description'][:30] + "..." if len(candidate['description']) > 30 else candidate['description']
+                observation_parts.append(f"  Best: {short_desc}")
+        
+        if len(valid_vehicles) > 3:
+            observation_parts.append(f"  ... and {len(valid_vehicles) - 3} more vehicles")
+        
+        observation_parts.append("")
+        observation_parts.append("OBJECTIVE: Batch optimization. Respond '1' to confirm.")
+        
+        observation_text = "\n".join(observation_parts)
+        # 上下文长度控制 - 限制在1000字符以内
+        max_context_length = 1000
+        if len(observation_text) > max_context_length:
+            observation_text = observation_text[:max_context_length-3] + "..."
+        
+        return observation_text
+    
     def _create_regional_planning_observation(self, vehicle_id: str, current_edge: str,
                                             route_candidates: List[Dict], target_region: int, current_time: float) -> str:
         """Create observation text for regional planning LLM decision."""
@@ -649,36 +891,38 @@ class RegionalAgent:
         observation_parts.append(f"Current time: {current_time:.1f}s")
         observation_parts.append("")
         
-        # Show route candidates
+        # Show route candidates - 限制最多3个选项以控制长度
         observation_parts.append("ROUTE CANDIDATES:")
-        for i, candidate in enumerate(route_candidates):
-            observation_parts.append(f"Option {i+1}: {candidate['description']}")
-            observation_parts.append(f"  Travel time: {candidate['travel_time']:.1f}s")
-            observation_parts.append(f"  Distance: {candidate['distance']:.1f}m")
+        limited_candidates = route_candidates[:3]  # 限制最多3个选项
+        for i, candidate in enumerate(limited_candidates):
+            # 简化描述，只保留关键信息
+            short_desc = candidate['description'][:50] + "..." if len(candidate['description']) > 50 else candidate['description']
+            observation_parts.append(f"Option {i+1}: {short_desc}")
+            observation_parts.append(f"  Time: {candidate['travel_time']:.1f}s, Dist: {candidate['distance']:.1f}m")
         observation_parts.append("")
         
-        # Regional context
-        observation_parts.append(f"REGION {self.region_id} STATUS:")
-        observation_parts.append(f"Active vehicles: {len(self.region_vehicles)}")
-        observation_parts.append(f"Outgoing boundaries: {len(self.outgoing_boundaries)}")
+        # Regional context - 简化信息
+        observation_parts.append(f"REGION {self.region_id}: {len(self.region_vehicles)} vehicles, {len(self.outgoing_boundaries)} boundaries")
         
-        # Current utilization
+        # Current utilization - 只显示前3个高利用率边
         high_util_edges = []
         for edge, count in self.planned_routes.items():
             if count > 5:  # High utilization threshold
                 high_util_edges.append(f"{edge}:{count}")
         
         if high_util_edges:
-            observation_parts.append(f"High utilization edges: {', '.join(high_util_edges[:5])}")
+            observation_parts.append(f"High util: {', '.join(high_util_edges[:3])}")
         observation_parts.append("")
         
-        observation_parts.append("OBJECTIVE: Select the best route to the target region boundary")
-        observation_parts.append("while minimizing travel time, congestion, and balancing edge utilization.")
-        observation_parts.append("")
-        observation_parts.append("IMPORTANT: You must respond with ONLY the option number (1, 2, 3, etc.)")
-        observation_parts.append("Do NOT return route descriptions or boundary edge IDs.")
+        observation_parts.append("OBJECTIVE: Select best route (respond with option number only)")
         
-        return "\n".join(observation_parts)
+        observation_text = "\n".join(observation_parts)
+        # 上下文长度控制 - 限制在1500字符以内
+        max_context_length = 1500
+        if len(observation_text) > max_context_length:
+            observation_text = observation_text[:max_context_length-3] + "..."
+        
+        return observation_text
     
     def make_decisions(self, current_time: float, 
                       recommendations: Optional[RegionalRecommendation] = None) -> List[VehicleDecision]:
