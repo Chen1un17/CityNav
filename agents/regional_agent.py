@@ -239,7 +239,7 @@ class RegionalAgent:
             # Get current vehicle position using SUMO API
             try:
                 current_edge = traci.vehicle.getRoadID(vehicle_id)
-                if not current_edge or current_edge.startswith(':'):
+                if not self._is_valid_edge_for_planning(current_edge):
                     self.logger.log_warning(f"REGIONAL_PLANNING: Vehicle {vehicle_id} on invalid edge: {current_edge}")
                     return None
                     
@@ -387,6 +387,18 @@ class RegionalAgent:
         
         # Return top candidates optimized for travel time
         return candidates[:3]  # Reduced to 3 for faster LLM decision
+    
+    def _is_valid_edge_for_planning(self, edge_id: str) -> bool:
+        """判断边是否适合用于路径规划 - 允许cluster边，只排除junction内部连接边"""
+        if not edge_id:
+            return False
+        
+        # 允许cluster边和普通边，只排除真正的内部连接边（junction edges）
+        # cluster边格式如 :cluster_xxx 是SUMO合法的复合边，应该允许
+        if edge_id.startswith(':') and not edge_id.startswith(':cluster'):
+            return False  # 只排除junction内部连接边
+            
+        return True
     
     def _create_fallback_route(self, current_edge: str, boundary_edge: str) -> Optional[Dict]:
         """Create fallback route when normal route generation fails."""
@@ -665,7 +677,7 @@ class RegionalAgent:
                 try:
                     # Get current position 
                     current_edge = traci.vehicle.getRoadID(vehicle_id)
-                    if not current_edge or current_edge.startswith(':'):
+                    if not self._is_valid_edge_for_planning(current_edge):
                         self.logger.log_warning(f"BATCH_PLANNING: Invalid edge {current_edge} for {vehicle_id}")
                         vehicle_plans_data.append(None)
                         continue
@@ -712,9 +724,17 @@ class RegionalAgent:
                 valid_vehicles, current_time
             )
             
-            # Create answer options (simple sequential numbers for each vehicle's first candidate)
-            # Simplified approach: LLM just needs to return comma-separated selections
-            answer_options = f"1/{len(valid_vehicles)}"  # Simplified options
+            # Create answer options - 构建格式为 "1,2,3/1,2,3/1,2,3" 的选择格式
+            # 每个车辆的候选数量可能不同，所以为每辆车创建对应的选项
+            vehicle_options = []
+            for vehicle_data in valid_vehicles:
+                num_candidates = len(vehicle_data.get('candidates', []))
+                if num_candidates > 0:
+                    options = '/'.join([str(i+1) for i in range(num_candidates)])
+                    vehicle_options.append(options)
+                else:
+                    vehicle_options.append('1')  # 默认选项
+            answer_options = ','.join(vehicle_options)
             
             # Single LLM call for all vehicles
             call_id = self.logger.log_llm_call_start(
@@ -726,24 +746,62 @@ class RegionalAgent:
                     [batch_observation], [answer_options]
                 )
                 
-                # Process LLM decision - simplified fallback
+                # Process LLM decision - 正确解析LLM的选择结果
                 results = []
+                llm_selections = None
+                
+                # 解析LLM返回的选择
+                if decisions and len(decisions) > 0 and 'answer' in decisions[0]:
+                    llm_answer = decisions[0]['answer']
+                    if llm_answer:
+                        try:
+                            # LLM返回格式应该是 "1,2,1" (每个车辆选择的候选索引)
+                            if isinstance(llm_answer, str):
+                                llm_selections = [int(x.strip()) for x in llm_answer.split(',')]
+                            elif isinstance(llm_answer, list):
+                                llm_selections = [int(x) for x in llm_answer]
+                            elif isinstance(llm_answer, (int, float)):
+                                llm_selections = [int(llm_answer)]  # 单个选择
+                        except (ValueError, IndexError) as e:
+                            self.logger.log_warning(f"BATCH_PLANNING: Failed to parse LLM selection '{llm_answer}': {e}")
+                            llm_selections = None
+                
+                # 根据LLM选择或fallback处理每个车辆
                 valid_idx = 0
                 for original_data in vehicle_plans_data:
                     if original_data is not None:
-                        # For simplicity, use first candidate for all vehicles
-                        candidate = original_data['candidates'][0]
+                        candidates = original_data['candidates']
+                        selected_idx = 0  # 默认选择第一个候选
+                        
+                        # 如果有有效的LLM选择，使用它
+                        if llm_selections and valid_idx < len(llm_selections):
+                            llm_choice = llm_selections[valid_idx]
+                            if 1 <= llm_choice <= len(candidates):
+                                selected_idx = llm_choice - 1  # 转换为0-based索引
+                        
+                        # 返回选中的候选
+                        selected_candidate = candidates[selected_idx]
+                        reasoning = f"LLM batch selection: option {selected_idx + 1}"
+                        if not llm_selections:
+                            reasoning = f"Fallback: first candidate (LLM parsing failed)"
+                            
                         results.append({
-                            'boundary_edge': candidate['boundary_edge'],
-                            'route': candidate['route'],
-                            'travel_time': candidate['travel_time'],
-                            'reasoning': f"Batch regional planning (Vehicle {valid_idx+1})"
+                            'boundary_edge': selected_candidate['boundary_edge'],
+                            'route': selected_candidate['route'],
+                            'travel_time': selected_candidate['travel_time'],
+                            'reasoning': reasoning
                         })
                         valid_idx += 1
                     else:
                         results.append(None)
                 
-                self.logger.log_llm_call_end(call_id, True, f"Processed {len(valid_vehicles)} vehicles", len(batch_observation))
+                success_msg = f"Processed {len(valid_vehicles)} vehicles"
+                if llm_selections:
+                    success_msg += f" with LLM selections: {llm_selections}"
+                else:
+                    success_msg += " with fallback selections"
+                    
+                self.logger.log_llm_call_end(call_id, True, success_msg, len(batch_observation))
                 
             except Exception as llm_error:
                 self.logger.log_llm_call_end(call_id, False, f"LLM error: {llm_error}", len(batch_observation))
@@ -779,7 +837,7 @@ class RegionalAgent:
                 try:
                     # Get current position 
                     current_edge = traci.vehicle.getRoadID(vehicle_id)
-                    if not current_edge or current_edge.startswith(':'):
+                    if not self._is_valid_edge_for_planning(current_edge):
                         self.logger.log_warning(f"BATCH_PROCESSING: Invalid edge {current_edge} for {vehicle_id}")
                         vehicle_plans_data.append(None)
                         continue
@@ -848,33 +906,34 @@ class RegionalAgent:
             return [None] * len(batch_vehicles)
     
     def _create_batch_regional_planning_observation(self, valid_vehicles: List[Dict], current_time: float) -> str:
-        """Create batch observation for multiple vehicles."""
+        """Create batch observation for multiple vehicles with complete candidate information."""
         observation_parts = []
         observation_parts.append(f"BATCH REGIONAL ROUTE PLANNING - REGION {self.region_id}")
         observation_parts.append(f"Planning for {len(valid_vehicles)} vehicles, time: {current_time:.1f}s")
         observation_parts.append("")
         
-        # 限制最多显示3辆车的详细信息以控制长度
-        limited_vehicles = valid_vehicles[:3]
-        for i, vehicle_data in enumerate(limited_vehicles):
+        # 显示所有车辆的完整候选信息，但限制每辆车的候选数量
+        for i, vehicle_data in enumerate(valid_vehicles):
             observation_parts.append(f"V{i+1}: {vehicle_data['vehicle_id']} -> R{vehicle_data['target_region']}")
-            observation_parts.append(f"  From: {vehicle_data['current_edge'][:10]}... Candidates: {len(vehicle_data['candidates'])}")
+            observation_parts.append(f"  From: {vehicle_data['current_edge']}")
             
-            # 只显示第一个候选路径的简化信息
+            # 显示所有候选路径的关键信息
             if vehicle_data['candidates']:
-                candidate = vehicle_data['candidates'][0]
-                short_desc = candidate['description'][:30] + "..." if len(candidate['description']) > 30 else candidate['description']
-                observation_parts.append(f"  Best: {short_desc}")
-        
-        if len(valid_vehicles) > 3:
-            observation_parts.append(f"  ... and {len(valid_vehicles) - 3} more vehicles")
+                observation_parts.append(f"  Candidates:")
+                for j, candidate in enumerate(vehicle_data['candidates']):
+                    travel_time = candidate.get('travel_time', 'N/A')
+                    boundary = candidate.get('boundary_edge', 'Unknown')
+                    route_len = len(candidate.get('route', []))
+                    observation_parts.append(f"    {j+1}. To {boundary} | {travel_time}s | {route_len} edges")
+            else:
+                observation_parts.append(f"  No valid candidates")
         
         observation_parts.append("")
-        observation_parts.append("OBJECTIVE: Batch optimization. Respond '1' to confirm.")
+        observation_parts.append("SELECT: Choose best candidate for each vehicle (e.g., '1,2,1' for V1->option1, V2->option2, V3->option1)")
         
         observation_text = "\n".join(observation_parts)
-        # 上下文长度控制 - 限制在1000字符以内
-        max_context_length = 1000
+        # 适当放宽上下文长度限制以保证信息完整性
+        max_context_length = 2000
         if len(observation_text) > max_context_length:
             observation_text = observation_text[:max_context_length-3] + "..."
         
@@ -2662,6 +2721,84 @@ class RegionalAgent:
             self.logger.log_info(f"Regional Agent {self.region_id}: "
                                f"Executed {executed_count}/{len(decisions)} decisions")
     
+    def report_region_status(self, active_autonomous_vehicles: set) -> Dict:
+        """Report current region status for coordination with Traffic Agent.
+        
+        Args:
+            active_autonomous_vehicles: Set of active autonomous vehicle IDs in current step
+            
+        Returns:
+            Dictionary containing region status for coordination
+        """
+        try:
+            # Filter autonomous vehicles in this region
+            region_autonomous_vehicles = active_autonomous_vehicles.intersection(self.region_vehicles)
+            
+            if not region_autonomous_vehicles:
+                return {
+                    'region_id': self.region_id,
+                    'active_vehicles': {},
+                    'capacity_status': {
+                        'current_load': len(self.region_vehicles),
+                        'outgoing_boundary_availability': {b: 0 for b in self.outgoing_boundaries},
+                        'congestion_warning': False
+                    }
+                }
+            
+            # Get next target regions for autonomous vehicles
+            next_targets = {}
+            for vehicle_id in region_autonomous_vehicles:
+                if vehicle_id in self.vehicle_targets:
+                    target_edge = self.vehicle_targets[vehicle_id]
+                    if target_edge in self.edge_to_region:
+                        next_targets[vehicle_id] = self.edge_to_region[target_edge]
+            
+            # Calculate boundary availability using existing data
+            boundary_availability = {}
+            for boundary_edge in self.outgoing_boundaries:
+                planned_usage = self.planned_routes.get(boundary_edge, 0)
+                # Simple capacity estimation based on road info
+                if boundary_edge in self.road_info:
+                    road_len = self.road_info[boundary_edge].get('road_len', 100)
+                    lane_num = self.road_info[boundary_edge].get('lane_num', 1)
+                    estimated_capacity = max(1, int((road_len * lane_num) / 10))  # Simple estimation
+                    boundary_availability[boundary_edge] = max(0, estimated_capacity - planned_usage)
+                else:
+                    boundary_availability[boundary_edge] = 0
+            
+            # Check congestion warning using existing congestion calculation
+            avg_congestion = 0
+            if self.region_edges:
+                total_congestion = sum(self.road_info.get(edge, {}).get('congestion_level', 0) 
+                                     for edge in self.region_edges if edge in self.road_info)
+                edge_count = sum(1 for edge in self.region_edges if edge in self.road_info)
+                avg_congestion = total_congestion / max(1, edge_count)
+            
+            return {
+                'region_id': self.region_id,
+                'active_vehicles': {
+                    'current_count': len(region_autonomous_vehicles),
+                    'next_targets': next_targets
+                },
+                'capacity_status': {
+                    'current_load': len(self.region_vehicles),
+                    'outgoing_boundary_availability': boundary_availability,
+                    'congestion_warning': avg_congestion > 3.0
+                }
+            }
+            
+        except Exception as e:
+            self.logger.log_error(f"Region {self.region_id} status report failed: {e}")
+            return {
+                'region_id': self.region_id,
+                'active_vehicles': {},
+                'capacity_status': {
+                    'current_load': 0,
+                    'outgoing_boundary_availability': {},
+                    'congestion_warning': False
+                }
+            }
+
     def get_performance_metrics(self) -> Dict[str, float]:
         """Get performance metrics for this regional agent."""
         success_rate = (self.successful_decisions / max(1, self.total_decisions)) * 100

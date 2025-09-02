@@ -20,6 +20,10 @@ from openai import OpenAI
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from utils.read_utils import load_json, markdown_code_pattern
+from utils.concurrency_manager import (
+    ConcurrencyManager, EnhancedConnectionPool, 
+    create_enhanced_llm_wrapper, get_global_concurrency_manager
+)
 
 
 class RequestQueue:
@@ -153,12 +157,14 @@ class ConnectionPool:
 
 
 class LLM(object):
-    def __init__(self, llm_path, batch_size=16, top_k=50, top_p=1.0, temperature=0.1, max_tokens=8192, memory_size=3, task_info=None, use_reflection=True, gpu_ids=None, tensor_parallel_size=1, gpu_memory_utilization=0.7):
+    def __init__(self, llm_path, batch_size=16, top_k=50, top_p=1.0, temperature=0.1, max_tokens=8192, memory_size=3, task_info=None, use_reflection=True, gpu_ids=None, tensor_parallel_size=1, gpu_memory_utilization=0.7, agent_id="default"):
         self.use_reflection = use_reflection
         self.gpu_ids = gpu_ids  # 指定使用的GPU ID列表
         self.tensor_parallel_size = tensor_parallel_size
+        self.agent_id = agent_id  # Agent identifier for concurrency tracking
         
-        # Request queue and connection pool management
+        # Enhanced concurrency management
+        self.concurrency_manager = get_global_concurrency_manager()
         self.request_queue = RequestQueue(max_size=1000)
         self.connection_pool = None
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="llm_worker")
@@ -279,11 +285,16 @@ class LLM(object):
                 print(f"vLLM模型加载失败: {e}")
                 raise
         elif llm_path.startswith(('http://', 'https://')):
-            # URL形式，使用连接池管理
-            self.connection_pool = ConnectionPool(llm_path, pool_size=3, timeout=6000)
+            # URL形式，使用增强连接池管理
+            self.connection_pool = EnhancedConnectionPool(
+                llm_path, 
+                pool_size=3, 
+                timeout=60,  # Reduced from 6000 to reasonable timeout
+                concurrency_manager=self.concurrency_manager
+            )
             llm_model = None  # 使用连接池而不是固定客户端
             use_api = True
-            print(f"初始化连接池管理器: {llm_path}")
+            print(f"初始化增强连接池管理器: {llm_path}")
         elif "openai" in llm_path.lower() or "siliconflow" in llm_path.lower():
             llm_model = OpenAI()
             use_api = True
@@ -539,6 +550,18 @@ class LLM(object):
                 retry_count += 1
 
     def inference(self, query, system_prompt=None):
+        """Enhanced inference with concurrency management and improved error handling"""
+        try:
+            # Use concurrency manager for controlled access
+            with self.concurrency_manager.managed_request(self.agent_id) as request_id:
+                return self._internal_inference(query, system_prompt, request_id)
+        except Exception as e:
+            print(f"Concurrency managed inference failed for {self.agent_id}: {e}")
+            # Return fallback response instead of None
+            return '{"answer": "1", "summary": "Concurrency management failed, using fallback"}'
+    
+    def _internal_inference(self, query, system_prompt=None, request_id=None):
+        """Internal inference method with original logic but enhanced error handling"""
         # GPU内存管理 - 增加推理计数并定期清理
         self.current_inference_count += 1
         
@@ -562,25 +585,32 @@ class LLM(object):
             retry_count = 0
             response = None
             
-            # Use connection pool if available
+            # Use enhanced connection pool if available
             if self.connection_pool is not None:
                 while retry_count < 3:
                     try:
-                        with self.connection_pool.get_client() as client:
+                        with self.connection_pool.get_client(self.agent_id) as client:
                             response = client.chat.completions.create(
                                 model=llm_name,
                                 messages=message,
                                 temperature=self.generation_kwargs['temperature'],
                                 max_tokens=self.generation_kwargs['max_tokens']
                             ).choices[0].message.content
+                        
+                        # Validate response
+                        if response is None or not response.strip():
+                            raise Exception("Empty response from API")
+                        
                         break
                     except Exception as e:
                         print(f"Connection pool inference error (attempt {retry_count + 1}): {e}")
                         retry_count += 1
                         if retry_count < 3:
-                            time.sleep(min(2 ** retry_count, 10))  # Exponential backoff
+                            # Adaptive backoff
+                            backoff_delay = self.concurrency_manager.backoff.get_delay(self.agent_id)
+                            time.sleep(min(backoff_delay, 10))
             else:
-                # Original logic for non-pooled connections
+                # Original logic for non-pooled connections with enhanced error handling
                 while retry_count < 3:
                     try:
                         response = self.model.chat.completions.create(
@@ -588,26 +618,45 @@ class LLM(object):
                             messages=message,
                             temperature=self.generation_kwargs['temperature'],
                             max_tokens=self.generation_kwargs['max_tokens'],
-                            # timeout=120
                         ).choices[0].message.content
+                        
+                        # Validate response
+                        if response is None or not response.strip():
+                            raise Exception("Empty response from API")
+                        
                         break
                     except Exception as e:
                         print(f"API inference error (attempt {retry_count + 1}): {e}")
-                        time.sleep(5) 
                         retry_count += 1
+                        if retry_count < 3:
+                            backoff_delay = self.concurrency_manager.backoff.get_delay(self.agent_id)
+                            time.sleep(min(backoff_delay, 10))
         else:
-            # Add CUDA error handling for vLLM
+            # Enhanced vLLM handling with strict concurrency control
             retry_count = 0
             while retry_count < 2:
                 try:
                     if self.model is None:
                         print(f"ERROR: Model is None, cannot perform inference")
-                        return None
+                        return '{"answer": "1", "summary": "Model not available"}'
+                    
                     responses_gen = self.model.chat([message], use_tqdm=False, sampling_params=self.generation_kwargs)
+                    
+                    # Validate vLLM response structure
+                    if not responses_gen or len(responses_gen) == 0:
+                        raise Exception("Empty response list from vLLM")
+                    
+                    if not responses_gen[0].outputs or len(responses_gen[0].outputs) == 0:
+                        raise Exception("Empty outputs from vLLM response")
+                    
                     response = responses_gen[0].outputs[0].text
                     
-                    # GPU内存管理 - 每50次推理清理一次GPU内存
-                    if self.current_inference_count % 50 == 0:
+                    # Additional validation
+                    if response is None or not response.strip():
+                        raise Exception("Empty text content in vLLM response")
+                    
+                    # GPU内存管理 - 每30次推理清理一次GPU内存（降低频率）
+                    if self.current_inference_count % 30 == 0:
                         try:
                             import torch
                             if torch.cuda.is_available():
@@ -618,6 +667,7 @@ class LLM(object):
                             print(f"GPU_MEMORY_CLEANUP_ERROR: {cleanup_error}")
                     
                     break
+                    
                 except Exception as e:
                     error_msg = str(e)
                     if "CUDA error" in error_msg or "illegal memory access" in error_msg:
@@ -633,76 +683,235 @@ class LLM(object):
                         time.sleep(2)  # Wait for GPU to stabilize
                         retry_count += 1
                         if retry_count >= 2:
-                            print(f"CUDA_ERROR_FATAL: Multiple CUDA errors, returning None")
-                            return None
+                            print(f"CUDA_ERROR_FATAL: Multiple CUDA errors, returning fallback")
+                            return '{"answer": "1", "summary": "CUDA errors encountered, using fallback"}'
                     else:
-                        print(f"LLM_INFERENCE_ERROR: Non-CUDA error: {error_msg}")
-                        return None
+                        print(f"LLM_INFERENCE_ERROR: {error_msg}")
+                        retry_count += 1
+                        if retry_count >= 2:
+                            return '{"answer": "1", "summary": "LLM inference failed, using fallback"}'
 
+        # Final validation
+        if response is None or not response.strip():
+            print(f"WARNING: Got empty response for {self.agent_id}, using fallback")
+            return '{"answer": "1", "summary": "Empty response received, using fallback"}'
+        
         return response
 
     def batch_inference(self, queries, system_prompt=None):
+        """Enhanced batch inference with intelligent concurrency control"""
+        if not queries:
+            return []
+        
         all_responses = []
-        messages = list()
-
-        for i, q in enumerate(queries):
-            messages.append([
-                {
-                    "role": "system",
-                    "content": system_prompt if system_prompt is not None else self.system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": q
-                }
-            ])
-
-            if len(messages) == self.batch_size or i == len(queries) - 1:
+        
+        # Use smaller, controlled batch sizes to prevent vLLM overload
+        optimal_batch_size = min(4, len(queries))  # Reduced batch size for better control
+        
+        for batch_start in range(0, len(queries), optimal_batch_size):
+            batch_end = min(batch_start + optimal_batch_size, len(queries))
+            batch_queries = queries[batch_start:batch_end]
+            
+            # Prepare messages for this batch
+            messages = []
+            for q in batch_queries:
+                messages.append([
+                    {
+                        "role": "system",
+                        "content": system_prompt if system_prompt is not None else self.system_prompt,
+                    },
+                    {
+                        "role": "user",
+                        "content": q
+                    }
+                ])
+            
+            try:
                 if self.use_api:
-                    if self.provider_name == 'siliconflow':
-                        llm_name = f"{self.institute_name}/{self.llm_name}"
-                    else:
-                        llm_name = self.llm_name
-                    
-                    # Optimize batch processing with connection pool
-                    if self.connection_pool is not None:
-                        # Limit concurrent threads to prevent socket exhaustion
-                        max_workers = min(len(messages), 3)  # Max 3 concurrent connections
-                        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="batch_worker") as executor:
-                            futures = []
-                            responses = [None for _ in range(len(messages))]
-                            
-                            for j, message in enumerate(messages):
-                                future = executor.submit(self.threading_inference, llm_name, message, responses, j)
-                                futures.append(future)
-                            
-                            # Wait for all requests to complete
-                            for future in futures:
-                                future.result(timeout=60000)  # 60 second timeout per request
-                        
-                        all_responses.extend(responses)
-                    else:
-                        # Original threading logic for non-pooled connections
-                        threads = []
-                        responses = [None for _ in range(len(messages))]
-
-                        for j, message in enumerate(messages):
-                            thread = threading.Thread(target=self.threading_inference, args=(llm_name, message, responses, j, ))
-                            threads.append(thread)
-                            thread.start()
-
-                        for thread in threads:
-                            thread.join()
-
-                        all_responses.extend(responses)
+                    # API-based inference with enhanced connection pool
+                    batch_responses = self._batch_api_inference(messages)
                 else:
-                    responses_gen = self.model.chat(messages, use_tqdm=False, sampling_params=self.generation_kwargs)
-                    responses = [res.outputs[0].text for res in responses_gen]
-                    all_responses.extend(responses)
+                    # vLLM-based inference with concurrency control
+                    batch_responses = self._batch_vllm_inference(messages)
                 
-                messages = list()
-
+                all_responses.extend(batch_responses)
+                
+            except Exception as e:
+                print(f"Batch inference error for {self.agent_id}: {e}")
+                # Provide fallback responses for failed batch
+                fallback_responses = [
+                    '{"answer": "1", "summary": "Batch inference failed, using fallback"}'
+                    for _ in batch_queries
+                ]
+                all_responses.extend(fallback_responses)
+            
+            # Inter-batch delay to prevent overwhelming the server
+            if batch_end < len(queries):
+                time.sleep(0.2)  # Small delay between batches
+        
         return all_responses
+    
+    def _batch_api_inference(self, messages):
+        """Handle API-based batch inference with controlled concurrency"""
+        if self.provider_name == 'siliconflow':
+            llm_name = f"{self.institute_name}/{self.llm_name}"
+        else:
+            llm_name = self.llm_name
+        
+        responses = [None for _ in range(len(messages))]
+        
+        if self.connection_pool is not None:
+            # Use enhanced connection pool with strict concurrency
+            max_workers = min(len(messages), 2)  # Further reduced concurrent connections
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="enhanced_batch") as executor:
+                futures = []
+                
+                for j, message in enumerate(messages):
+                    future = executor.submit(self._enhanced_threading_inference, llm_name, message, responses, j)
+                    futures.append(future)
+                
+                # Wait for all requests with timeout
+                for future in futures:
+                    try:
+                        future.result(timeout=45)  # Reduced timeout
+                    except Exception as e:
+                        print(f"Batch request timeout or error: {e}")
+        else:
+            # Fallback to original logic but with delays
+            threads = []
+            for j, message in enumerate(messages):
+                thread = threading.Thread(
+                    target=self._enhanced_threading_inference, 
+                    args=(llm_name, message, responses, j)
+                )
+                threads.append(thread)
+                thread.start()
+                
+                # Stagger thread starts to reduce load
+                if j < len(messages) - 1:
+                    time.sleep(0.1)
+            
+            for thread in threads:
+                thread.join(timeout=45)
+        
+        # Validate and fix None responses
+        for i, response in enumerate(responses):
+            if response is None or not response.strip():
+                responses[i] = '{"answer": "1", "summary": "Individual request failed, using fallback"}'
+        
+        return responses
+    
+    def _batch_vllm_inference(self, messages):
+        """Handle vLLM batch inference with enhanced error checking"""
+        try:
+            with self.concurrency_manager.managed_request(f"{self.agent_id}_vllm_batch") as request_id:
+                if self.model is None:
+                    print(f"ERROR: vLLM model is None for {self.agent_id}")
+                    return [
+                        '{"answer": "1", "summary": "vLLM model unavailable"}'
+                        for _ in messages
+                    ]
+                
+                responses_gen = self.model.chat(messages, use_tqdm=False, sampling_params=self.generation_kwargs)
+                
+                # Enhanced validation for batch responses
+                if not responses_gen:
+                    raise Exception("Empty response generator from vLLM")
+                
+                responses = []
+                for i, res in enumerate(responses_gen):
+                    try:
+                        if not res.outputs or len(res.outputs) == 0:
+                            response_text = '{"answer": "1", "summary": "Empty vLLM output"}'
+                        else:
+                            response_text = res.outputs[0].text
+                            if not response_text or not response_text.strip():
+                                response_text = '{"answer": "1", "summary": "Empty vLLM text"}'
+                        responses.append(response_text)
+                    except Exception as e:
+                        print(f"Error processing vLLM response {i}: {e}")
+                        responses.append('{"answer": "1", "summary": "vLLM response processing error"}')
+                
+                return responses
+                
+        except Exception as e:
+            print(f"vLLM batch inference error for {self.agent_id}: {e}")
+            return [
+                '{"answer": "1", "summary": "vLLM batch inference failed"}'
+                for _ in messages
+            ]
+    
+    def _enhanced_threading_inference(self, llm_name, message, response_list, m_id):
+        """Enhanced threading inference with better error handling"""
+        retry_count = 0
+        response_list[m_id] = ""
+        
+        while retry_count < 2:  # Reduced retry count
+            try:
+                # Apply backoff delay
+                if retry_count > 0:
+                    backoff_delay = self.concurrency_manager.backoff.get_delay(self.agent_id)
+                    time.sleep(min(backoff_delay, 5))
+                
+                # Use connection pool if available
+                client = None
+                if self.connection_pool is not None:
+                    client_context = self.connection_pool.get_client(self.agent_id)
+                    client = client_context.__enter__()
+                else:
+                    client = self.model
+                
+                try:
+                    if "openai" == self.provider_name:
+                        stream = client.chat.completions.create(
+                            model=llm_name,
+                            messages=message,
+                            max_completion_tokens=self.generation_kwargs['max_tokens'],
+                            stream=True
+                        )
+                    else:
+                        stream = client.chat.completions.create(
+                            model=llm_name,
+                            messages=message,
+                            max_tokens=self.generation_kwargs['max_tokens'] if "glm-z1-9b" not in llm_name.lower() else 8000,
+                            stream=True
+                        )
+                finally:
+                    if self.connection_pool is not None and client is not None:
+                        client_context.__exit__(None, None, None)
+
+                collected_response = "<think>\n"
+                reasoning_finish_flag = False
+                
+                for chunk in stream:
+                    try:
+                        if hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content:
+                            if not reasoning_finish_flag:
+                                collected_response += "</think>\n"
+                                reasoning_finish_flag = True
+                            token = chunk.choices[0].delta.content
+                            collected_response += token
+                        elif hasattr(chunk.choices[0].delta, 'reasoning_content') and chunk.choices[0].delta.reasoning_content:
+                            token = chunk.choices[0].delta.reasoning_content
+                            collected_response += token
+                    except Exception as chunk_error:
+                        print(f"Error processing chunk: {chunk_error}")
+                        continue
+                
+                # Validate collected response
+                if not collected_response.strip() or collected_response == "<think>\n":
+                    raise Exception("Empty collected response")
+                
+                response_list[m_id] = collected_response
+                print(f"Success [{m_id}] for {self.agent_id}")
+                break
+
+            except Exception as e:
+                retry_count += 1
+                print(f"Threading inference error (attempt {retry_count}) for {self.agent_id}: {e}")
+                if retry_count >= 2:
+                    # Provide fallback response
+                    response_list[m_id] = '{"answer": "1", "summary": "Threading inference failed, using fallback"}'
 
     def batch_evaluation(self, llm_name, queries, system_prompt=None):
         messages = list()
@@ -769,59 +978,6 @@ class LLM(object):
 
         return valid_responses
 
-    def threading_inference(self, llm_name, message, response_list, m_id):
-        retry_count = 0
-        response_list[m_id] = ""
-        while retry_count < 2:
-            time.sleep(5)
-            try:
-                # Use connection pool if available
-                client = None
-                if self.connection_pool is not None:
-                    client_context = self.connection_pool.get_client()
-                    client = client_context.__enter__()
-                else:
-                    client = self.model
-                
-                try:
-                    if "openai" == self.provider_name:
-                        stream = client.chat.completions.create(
-                            model=llm_name,
-                            messages=message,
-                            # temperature=self.generation_kwargs['temperature'],
-                            max_completion_tokens=self.generation_kwargs['max_tokens'],
-                            stream=True
-                        )
-                    else:
-                        stream = client.chat.completions.create(
-                            model=llm_name,
-                            messages=message,
-                            max_tokens=self.generation_kwargs['max_tokens'] if "glm-z1-9b" not in llm_name.lower() else 8000,
-                            stream=True
-                        )
-                finally:
-                    if self.connection_pool is not None and client is not None:
-                        client_context.__exit__(None, None, None)
-
-                collected_response = "<think>\n"
-                reasoning_finish_flag = False
-                for chunk in stream:
-                    if hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content:
-                        if not reasoning_finish_flag:
-                            collected_response += "</think>\n"
-                            reasoning_finish_flag = True
-                        token = chunk.choices[0].delta.content
-                        collected_response += token
-                    elif hasattr(chunk.choices[0].delta, 'reasoning_content') and chunk.choices[0].delta.reasoning_content:
-                        token = chunk.choices[0].delta.reasoning_content
-                        collected_response += token
-                response_list[m_id] = collected_response
-                print(f"\nSuccess [{m_id}].")
-                break
-
-            except Exception as e:
-                retry_count += 1
-                print(e)
 
     def data_analysis_type_selection(self, data_text):
         query = copy.copy(self.overall_template)
@@ -1706,8 +1862,8 @@ class LocalLLMManager:
             return False
         
     def initialize_llms(self):
-        """初始化两个共享LLM实例"""
-        print("\n=== 初始化共享LLM实例 ===")
+        """初始化两个共享LLM实例，集成并发控制"""
+        print("\n=== 初始化共享LLM实例（增强版） ===")
         
         # 设置CUDA内存管理环境变量，防止多vLLM实例冲突
         import os
@@ -1717,50 +1873,66 @@ class LocalLLMManager:
         os.environ["TORCH_CUDA_ARCH_LIST"] = "8.6"  # 设置CUDA架构避免编译问题
         print("[INFO] 已设置CUDA内存管理和attention backend环境变量")
         
+        # Initialize global concurrency manager
+        concurrency_manager = get_global_concurrency_manager()
+        print(f"[INFO] 全局并发管理器已初始化 (最大并发: {concurrency_manager.max_concurrent_requests})")
+        
         # 初始化Traffic LLM (使用GPU 0)
         print("正在初始化 Traffic LLM (GPU 0)...")
-        self.traffic_llm = LLM(
+        traffic_llm_raw = LLM(
             llm_path=self.model_path,
-            batch_size=8,
+            batch_size=4,  # Reduced batch size for better control
             top_k=50,
             top_p=1.0,
             temperature=0.1,
-            max_tokens=10240,  # 保持在10k以上，但不会太高
+            max_tokens=8192,  # Reduced to match vLLM config
             memory_size=3,
-            task_info=self.task_info,     # 禁用CUDA图优化，解决多LLM实例内存冲突
+            task_info=self.task_info,
             use_reflection=True,
             gpu_ids=[0],  # 使用GPU 0
             tensor_parallel_size=1,
-            gpu_memory_utilization=0.85  # 稍微增加内存利用率
+            gpu_memory_utilization=0.85,
+            agent_id="traffic_llm"  # Add agent identifier
         )
-        print("[SUCCESS] Traffic LLM 初始化完成")
+        
+        # Wrap with concurrency control
+        self.traffic_llm = create_enhanced_llm_wrapper(traffic_llm_raw, "traffic_llm", concurrency_manager)
+        print("[SUCCESS] Traffic LLM 初始化完成（已集成并发控制）")
         
         # 初始化Regional LLM (使用GPU 1)
         print("正在初始化 Regional LLM (GPU 1)...")
-        self.regional_llm = LLM(
+        regional_llm_raw = LLM(
             llm_path=self.model_path,
-            batch_size=8,
+            batch_size=4,  # Reduced batch size for better control
             top_k=50,
             top_p=1.0,
             temperature=0.1,
-            max_tokens=10240,  # 保持在10k以上，但不会太高
+            max_tokens=8192,  # Reduced to match vLLM config
             memory_size=3,
             task_info=self.task_info,
-            use_reflection=True,     # 禁用CUDA图优化，解决多LLM实例内存冲突
+            use_reflection=True,
             gpu_ids=[1],  # 使用GPU 1
             tensor_parallel_size=1,
-            gpu_memory_utilization=0.85  # 稍微增加内存利用率
+            gpu_memory_utilization=0.85,
+            agent_id="regional_llm"  # Add agent identifier
         )
-        print("[SUCCESS] Regional LLM 初始化完成")
         
-        print("\n=== 所有LLM实例初始化完成 ===")
-        print("- Traffic LLM: GPU 0")
-        print("- Regional LLM: GPU 1")
+        # Wrap with concurrency control
+        self.regional_llm = create_enhanced_llm_wrapper(regional_llm_raw, "regional_llm", concurrency_manager)
+        print("[SUCCESS] Regional LLM 初始化完成（已集成并发控制）")
+        
+        print("\n=== 所有LLM实例初始化完成（增强版） ===")
+        print("- Traffic LLM: GPU 0 + 并发控制")
+        print("- Regional LLM: GPU 1 + 并发控制")
         print("- GPU 2-3: 用于训练")
+        print(f"- 并发管理器: 最大{concurrency_manager.max_concurrent_requests}并发")
         
         # 设置训练使用的GPU
         os.environ["TRAINING_CUDA_VISIBLE_DEVICES"] = "2,3"
         print("[INFO] 训练将使用GPU 2,3")
+        
+        # Print concurrency manager status
+        concurrency_manager.print_status()
         
         return self.traffic_llm, self.regional_llm
     

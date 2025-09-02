@@ -86,15 +86,15 @@ class TrainingConfig:
     
     # Training Configuration
     learning_rate: float = 1e-4
-    warmup_steps: int = 100
+    warmup_steps: int = 15
     max_grad_norm: float = 1.0
     weight_decay: float = 0.01
     gradient_accumulation_steps: int = 8  # Increased to reduce memory per step
     
     # Progressive Mixed Training Configuration
     enable_progressive_training: bool = True  # Enable progressive mixed training
-    offline_pretraining_steps: int = 200  # Steps for initial offline pretraining
-    online_steps_per_reinforcement: int = 150  # Online steps before triggering reinforcement
+    offline_pretraining_steps: int = 10  # Steps for initial offline pretraining
+    online_steps_per_reinforcement: int = 10  # Online steps before triggering reinforcement
     reinforcement_batch_multiplier: int = 3  # Multiplier for reinforcement batch size
     progressive_learning_rate_decay: float = 0.95  # LR decay during progressive phases
     historical_data_dir: str = "logs/training/historical_data"  # Directory for historical data
@@ -1878,18 +1878,30 @@ class TrainingManager:
                 traffic_loss = self.training_history['traffic_loss']
                 regional_loss = self.training_history['regional_loss']
                 
+                # Ensure steps and loss data have same length
+                min_len = min(len(steps), len(traffic_loss), len(regional_loss))
+                steps_sync = steps[:min_len]
+                traffic_loss_sync = traffic_loss[:min_len]
+                regional_loss_sync = regional_loss[:min_len]
+                
                 # Update main loss lines
-                self.line_objects['traffic_loss'].set_data(steps, traffic_loss)
-                self.line_objects['regional_loss'].set_data(steps, regional_loss)
+                self.line_objects['traffic_loss'].set_data(steps_sync, traffic_loss_sync)
+                self.line_objects['regional_loss'].set_data(steps_sync, regional_loss_sync)
                 
                 # Update moving averages if enough data
-                if len(traffic_loss) >= self.moving_avg_window:
-                    traffic_ma = np.convolve(traffic_loss, np.ones(self.moving_avg_window)/self.moving_avg_window, mode='valid')
-                    regional_ma = np.convolve(regional_loss, np.ones(self.moving_avg_window)/self.moving_avg_window, mode='valid')
-                    ma_steps = steps[self.moving_avg_window-1:]
+                if len(traffic_loss_sync) >= self.moving_avg_window:
+                    traffic_ma = np.convolve(traffic_loss_sync, np.ones(self.moving_avg_window)/self.moving_avg_window, mode='valid')
+                    regional_ma = np.convolve(regional_loss_sync, np.ones(self.moving_avg_window)/self.moving_avg_window, mode='valid')
+                    ma_steps = steps_sync[self.moving_avg_window-1:]
                     
-                    self.line_objects['traffic_loss_ma'].set_data(ma_steps, traffic_ma)
-                    self.line_objects['regional_loss_ma'].set_data(ma_steps, regional_ma)
+                    # Ensure ma_steps and ma arrays have same length
+                    min_ma_len = min(len(ma_steps), len(traffic_ma), len(regional_ma))
+                    ma_steps_sync = ma_steps[:min_ma_len]
+                    traffic_ma_sync = traffic_ma[:min_ma_len]
+                    regional_ma_sync = regional_ma[:min_ma_len]
+                    
+                    self.line_objects['traffic_loss_ma'].set_data(ma_steps_sync, traffic_ma_sync)
+                    self.line_objects['regional_loss_ma'].set_data(ma_steps_sync, regional_ma_sync)
                 
                 # Auto-scale axes
                 ax1.relim()
@@ -1900,16 +1912,22 @@ class TrainingManager:
                 traffic_reward = self.training_history['traffic_reward']
                 regional_reward = self.training_history['regional_reward']
                 
-                self.line_objects['traffic_reward'].set_data(steps, traffic_reward)
-                self.line_objects['regional_reward'].set_data(steps, regional_reward)
+                # Ensure steps and reward data have same length
+                min_len = min(len(steps), len(traffic_reward), len(regional_reward))
+                steps_sync = steps[:min_len]
+                traffic_reward_sync = traffic_reward[:min_len]
+                regional_reward_sync = regional_reward[:min_len]
+                
+                self.line_objects['traffic_reward'].set_data(steps_sync, traffic_reward_sync)
+                self.line_objects['regional_reward'].set_data(steps_sync, regional_reward_sync)
                 
                 # Remove old fill_between and add new ones
                 self.line_objects['traffic_reward_fill'].remove()
                 self.line_objects['regional_reward_fill'].remove()
                 
-                self.line_objects['traffic_reward_fill'] = ax2.fill_between(steps, 0, traffic_reward, 
+                self.line_objects['traffic_reward_fill'] = ax2.fill_between(steps_sync, 0, traffic_reward_sync, 
                                                                            alpha=0.2, color='green', label='Traffic Reward Area')
-                self.line_objects['regional_reward_fill'] = ax2.fill_between(steps, 0, regional_reward, 
+                self.line_objects['regional_reward_fill'] = ax2.fill_between(steps_sync, 0, regional_reward_sync, 
                                                                             alpha=0.2, color='magenta', label='Regional Reward Area')
                 
                 ax2.relim()
@@ -1920,8 +1938,14 @@ class TrainingManager:
                 traffic_lr = self.training_history['traffic_lr']
                 regional_lr = self.training_history['regional_lr']
                 
-                self.line_objects['traffic_lr'].set_data(steps, traffic_lr)
-                self.line_objects['regional_lr'].set_data(steps, regional_lr)
+                # Ensure steps and lr data have same length
+                min_len = min(len(steps), len(traffic_lr), len(regional_lr))
+                steps_sync = steps[:min_len]
+                traffic_lr_sync = traffic_lr[:min_len]
+                regional_lr_sync = regional_lr[:min_len]
+                
+                self.line_objects['traffic_lr'].set_data(steps_sync, traffic_lr_sync)
+                self.line_objects['regional_lr'].set_data(steps_sync, regional_lr_sync)
                 
                 ax3.relim()
                 ax3.autoscale_view()
@@ -1977,14 +2001,32 @@ class TrainingManager:
             if len(self.training_history['steps']) > 0:
                 ax6.clear()  # Clear and recreate stackplot
                 
-                traffic_att = [self.cumulative_rewards['traffic']['att_reward'] * (i+1) / len(steps) 
-                              for i in range(len(steps))]
-                traffic_coop = [self.cumulative_rewards['traffic']['cooperation_reward'] * (i+1) / len(steps) 
-                               for i in range(len(steps))]
+                # Use actual cumulative rewards instead of artificial scaling
+                cumulative_att = []
+                cumulative_coop = []
+                running_att = 0.0
+                running_coop = 0.0
                 
-                if len(traffic_att) > 0:
-                    ax6.stackplot(steps, traffic_att, traffic_coop, 
-                                 labels=['ATT Reward', 'Cooperation Reward'],
+                # Build cumulative reward series from traffic history
+                for i, step in enumerate(steps):
+                    if i < len(self.training_history['att_improvement']):
+                        running_att += self.training_history['att_improvement'][i]
+                    if i < len(self.training_history['cooperation_quality']):
+                        # Get cooperation from regional history but show in traffic plot for context
+                        if i < len(self.training_history['cooperation_quality']):
+                            running_coop += self.training_history['cooperation_quality'][i] * 0.4  # Weight for traffic
+                    
+                    cumulative_att.append(running_att)
+                    cumulative_coop.append(running_coop)
+                
+                if len(cumulative_att) > 0 and len(cumulative_coop) > 0:
+                    min_len = min(len(steps), len(cumulative_att), len(cumulative_coop))
+                    steps_sync = steps[:min_len]
+                    cumulative_att_sync = cumulative_att[:min_len]
+                    cumulative_coop_sync = cumulative_coop[:min_len]
+                    
+                    ax6.stackplot(steps_sync, cumulative_att_sync, cumulative_coop_sync, 
+                                 labels=['ATT Reward', 'Cooperation Impact'],
                                  colors=['skyblue', 'lightcoral'], alpha=0.7)
                     ax6.set_title('Traffic LLM: Reward Components Evolution', fontweight='bold')
                     ax6.set_xlabel('Training Steps')
@@ -1996,7 +2038,12 @@ class TrainingManager:
             if len(self.training_history['steps']) > 0:
                 sample_throughput = [self.total_samples_processed * (i+1) / len(steps) 
                                    for i in range(len(steps))]
-                self.line_objects['sample_throughput'].set_data(steps, sample_throughput)
+                # Ensure steps and sample_throughput have same length
+                min_len = min(len(steps), len(sample_throughput))
+                steps_sync = steps[:min_len]
+                sample_throughput_sync = sample_throughput[:min_len]
+                
+                self.line_objects['sample_throughput'].set_data(steps_sync, sample_throughput_sync)
                 ax7.relim()
                 ax7.autoscale_view()
             
@@ -2006,12 +2053,18 @@ class TrainingManager:
                 regional_loss_diff = np.diff(self.training_history['regional_loss'])
                 diff_steps = steps[1:]
                 
-                self.line_objects['traffic_loss_diff'].set_data(diff_steps, traffic_loss_diff)
-                self.line_objects['regional_loss_diff'].set_data(diff_steps, regional_loss_diff)
+                # Ensure diff_steps and loss_diff arrays have same length
+                min_len = min(len(diff_steps), len(traffic_loss_diff), len(regional_loss_diff))
+                diff_steps_sync = diff_steps[:min_len]
+                traffic_loss_diff_sync = traffic_loss_diff[:min_len]
+                regional_loss_diff_sync = regional_loss_diff[:min_len]
+                
+                self.line_objects['traffic_loss_diff'].set_data(diff_steps_sync, traffic_loss_diff_sync)
+                self.line_objects['regional_loss_diff'].set_data(diff_steps_sync, regional_loss_diff_sync)
                 
                 # Update convergence status
-                recent_traffic_trend = np.mean(traffic_loss_diff[-5:]) if len(traffic_loss_diff) >= 5 else 0
-                recent_regional_trend = np.mean(regional_loss_diff[-5:]) if len(regional_loss_diff) >= 5 else 0
+                recent_traffic_trend = np.mean(traffic_loss_diff_sync[-5:]) if len(traffic_loss_diff_sync) >= 5 else 0
+                recent_regional_trend = np.mean(regional_loss_diff_sync[-5:]) if len(regional_loss_diff_sync) >= 5 else 0
                 
                 convergence_status = "Converging" if abs(recent_traffic_trend) < 0.01 and abs(recent_regional_trend) < 0.01 else "Training"
                 ax8.text(0.02, 0.98, f'Status: {convergence_status}\nUpdated: {current_time}', 
@@ -2046,8 +2099,8 @@ class TrainingManager:
         return self._update_persistent_charts()
     
     def _update_rl_metrics(self, trainer_type: str, metrics: Dict[str, float], 
-                          vehicle_sample: Dict[str, Any] = None):
-        """Update RL metrics for visualization and tracking with historical data collection."""
+                          training_samples: List[Dict[str, Any]] = None):
+        """Update RL metrics for visualization and tracking using real sample data."""
         try:
             current_step = self.training_stats[trainer_type]['total_steps']
             
@@ -2055,46 +2108,113 @@ class TrainingManager:
             if current_step not in self.training_history['steps']:
                 self.training_history['steps'].append(current_step)
             
-            # Update cumulative rewards and historical data
-            if trainer_type == 'traffic':
-                att_reward = metrics.get('relative_reward_mean', 0.0) * 0.6  # ATT component
-                coop_reward = metrics.get('relative_reward_mean', 0.0) * 0.4  # Cooperation component
+            # Extract real reward data from training samples if available
+            if training_samples and len(training_samples) > 0:
+                # Calculate average rewards from the training batch
+                total_samples = len(training_samples)
                 
-                self.cumulative_rewards['traffic']['att_reward'] += att_reward
-                self.cumulative_rewards['traffic']['cooperation_reward'] += coop_reward
-                self.cumulative_rewards['traffic']['total_reward'] += att_reward + coop_reward
-                
-                # Update historical data for line plots
-                self.training_history['traffic_loss'].append(metrics.get('loss', 0.0))
-                self.training_history['traffic_reward'].append(att_reward + coop_reward)
-                self.training_history['traffic_lr'].append(metrics.get('learning_rate', 0.0))
-                self.training_history['att_improvement'].append(att_reward)
-                
-                # Track ATT improvement history (for compatibility)
-                if len(self.att_improvement_history) == 0 or len(self.att_improvement_history) % 10 == 0:
-                    # Sample every 10 steps to reduce memory usage
-                    self.att_improvement_history.append(att_reward)
-                
-            elif trainer_type == 'regional':
-                efficiency_reward = metrics.get('relative_reward_mean', 0.0) * 0.5
-                protection_reward = 0.3  # Placeholder - would come from vehicle_sample
-                coop_reward = metrics.get('relative_reward_mean', 0.0) * 0.5
-                
-                self.cumulative_rewards['regional']['efficiency_reward'] += efficiency_reward
-                self.cumulative_rewards['regional']['protection_reward'] += protection_reward
-                self.cumulative_rewards['regional']['cooperation_reward'] += coop_reward
-                total = efficiency_reward + protection_reward + coop_reward
-                self.cumulative_rewards['regional']['total_reward'] += total
-                
-                # Update historical data for line plots
-                self.training_history['regional_loss'].append(metrics.get('loss', 0.0))
-                self.training_history['regional_reward'].append(total)
-                self.training_history['regional_lr'].append(metrics.get('learning_rate', 0.0))
-                self.training_history['cooperation_quality'].append(coop_reward)
-                
-                # Track cooperation quality history (for compatibility)
-                if len(self.cooperation_quality_history) == 0 or len(self.cooperation_quality_history) % 10 == 0:
-                    self.cooperation_quality_history.append(coop_reward)
+                if trainer_type == 'traffic':
+                    att_rewards = []
+                    coop_rewards = []
+                    total_rewards = []
+                    
+                    for sample in training_samples:
+                        rewards = sample.get('rewards', {})
+                        traffic_rewards = rewards.get('traffic_llm', {})
+                        att_rewards.append(traffic_rewards.get('att_reward', 0.0))
+                        coop_rewards.append(traffic_rewards.get('cooperation_reward', 0.0))
+                        total_rewards.append(traffic_rewards.get('total_reward', 0.0))
+                    
+                    # Use average rewards from actual training data
+                    avg_att_reward = sum(att_rewards) / total_samples if att_rewards else 0.0
+                    avg_coop_reward = sum(coop_rewards) / total_samples if coop_rewards else 0.0
+                    avg_total_reward = sum(total_rewards) / total_samples if total_rewards else 0.0
+                    
+                    self.cumulative_rewards['traffic']['att_reward'] += avg_att_reward
+                    self.cumulative_rewards['traffic']['cooperation_reward'] += avg_coop_reward
+                    self.cumulative_rewards['traffic']['total_reward'] += avg_total_reward
+                    
+                    # Update historical data for line plots
+                    self.training_history['traffic_loss'].append(metrics.get('loss', 0.0))
+                    self.training_history['traffic_reward'].append(avg_total_reward)
+                    self.training_history['traffic_lr'].append(metrics.get('learning_rate', 0.0))
+                    self.training_history['att_improvement'].append(avg_att_reward)
+                    
+                    # Track ATT improvement history with real data
+                    if len(self.att_improvement_history) == 0 or current_step % 5 == 0:
+                        # Sample every 5 steps with real ATT data
+                        self.att_improvement_history.append(avg_att_reward)
+                    
+                elif trainer_type == 'regional':
+                    efficiency_rewards = []
+                    protection_rewards = []
+                    coop_rewards = []
+                    total_rewards = []
+                    
+                    for sample in training_samples:
+                        rewards = sample.get('rewards', {})
+                        regional_rewards = rewards.get('regional_llm', {})
+                        efficiency_rewards.append(regional_rewards.get('efficiency_reward', 0.0))
+                        protection_rewards.append(regional_rewards.get('individual_protection_reward', 0.0))
+                        coop_rewards.append(regional_rewards.get('cooperation_reward', 0.0))
+                        total_rewards.append(regional_rewards.get('total_reward', 0.0))
+                    
+                    # Use average rewards from actual training data
+                    avg_efficiency_reward = sum(efficiency_rewards) / total_samples if efficiency_rewards else 0.0
+                    avg_protection_reward = sum(protection_rewards) / total_samples if protection_rewards else 0.0
+                    avg_coop_reward = sum(coop_rewards) / total_samples if coop_rewards else 0.0
+                    avg_total_reward = sum(total_rewards) / total_samples if total_rewards else 0.0
+                    
+                    self.cumulative_rewards['regional']['efficiency_reward'] += avg_efficiency_reward
+                    self.cumulative_rewards['regional']['protection_reward'] += avg_protection_reward
+                    self.cumulative_rewards['regional']['cooperation_reward'] += avg_coop_reward
+                    self.cumulative_rewards['regional']['total_reward'] += avg_total_reward
+                    
+                    # Update historical data for line plots
+                    self.training_history['regional_loss'].append(metrics.get('loss', 0.0))
+                    self.training_history['regional_reward'].append(avg_total_reward)
+                    self.training_history['regional_lr'].append(metrics.get('learning_rate', 0.0))
+                    self.training_history['cooperation_quality'].append(avg_coop_reward)
+                    
+                    # Track cooperation quality history with real data
+                    if len(self.cooperation_quality_history) == 0 or current_step % 5 == 0:
+                        # Sample every 5 steps with real cooperation data
+                        self.cooperation_quality_history.append(avg_coop_reward)
+            
+            else:
+                # Fallback to relative reward mean when no training samples available
+                if trainer_type == 'traffic':
+                    relative_reward = metrics.get('relative_reward_mean', 0.0)
+                    # Use weights consistent with new reward system: 0.6 * att_reward + 0.4 * cooperation_quality
+                    estimated_att_reward = relative_reward * 0.6 / (0.6 + 0.4)  # Normalize by total weight
+                    estimated_coop_reward = relative_reward * 0.4 / (0.6 + 0.4)
+                    
+                    self.cumulative_rewards['traffic']['att_reward'] += estimated_att_reward
+                    self.cumulative_rewards['traffic']['cooperation_reward'] += estimated_coop_reward
+                    self.cumulative_rewards['traffic']['total_reward'] += relative_reward
+                    
+                    self.training_history['traffic_loss'].append(metrics.get('loss', 0.0))
+                    self.training_history['traffic_reward'].append(relative_reward)
+                    self.training_history['traffic_lr'].append(metrics.get('learning_rate', 0.0))
+                    self.training_history['att_improvement'].append(estimated_att_reward)
+                    
+                elif trainer_type == 'regional':
+                    relative_reward = metrics.get('relative_reward_mean', 0.0)
+                    # Use weights consistent with new reward system: 0.5 * efficiency + 0.2 * protection + 0.3 * cooperation
+                    total_weight = 0.5 + 0.2 + 0.3
+                    estimated_efficiency_reward = relative_reward * 0.5 / total_weight
+                    estimated_protection_reward = relative_reward * 0.2 / total_weight
+                    estimated_coop_reward = relative_reward * 0.3 / total_weight
+                    
+                    self.cumulative_rewards['regional']['efficiency_reward'] += estimated_efficiency_reward
+                    self.cumulative_rewards['regional']['protection_reward'] += estimated_protection_reward
+                    self.cumulative_rewards['regional']['cooperation_reward'] += estimated_coop_reward
+                    self.cumulative_rewards['regional']['total_reward'] += relative_reward
+                    
+                    self.training_history['regional_loss'].append(metrics.get('loss', 0.0))
+                    self.training_history['regional_reward'].append(relative_reward)
+                    self.training_history['regional_lr'].append(metrics.get('learning_rate', 0.0))
+                    self.training_history['cooperation_quality'].append(estimated_coop_reward)
             
             # Track phase transitions
             current_phase = metrics.get('training_phase', 'unknown')
@@ -2160,7 +2280,7 @@ class TrainingManager:
                         else:
                             metrics = self.traffic_trainer.train_step(training_group)
                         
-                        self._update_training_stats('traffic', metrics)
+                        self._update_training_stats('traffic', metrics, training_group)
                         
                         # Update phase in buffer
                         self.traffic_buffer.set_training_phase(metrics.get('training_phase', 'online'))
@@ -2176,7 +2296,7 @@ class TrainingManager:
                         else:
                             metrics = self.regional_trainer.train_step(training_group)
                         
-                        self._update_training_stats('regional', metrics)
+                        self._update_training_stats('regional', metrics, training_group)
                         
                         # Update phase in buffer
                         self.regional_buffer.set_training_phase(metrics.get('training_phase', 'online'))
@@ -2558,7 +2678,7 @@ class TrainingManager:
         except Exception as e:
             self.logger.error(f"TRAINING_DATA_PROCESSING_ERROR: {e}")
     
-    def _update_training_stats(self, trainer_type: str, metrics: Dict[str, float]):
+    def _update_training_stats(self, trainer_type: str, metrics: Dict[str, float], training_samples: List[Dict[str, Any]] = None):
         """Update training statistics and RL metrics."""
         try:
             # Update basic training statistics
@@ -2578,8 +2698,8 @@ class TrainingManager:
             # Update global phase step count
             self.phase_step_count += 1
             
-            # Update RL metrics for visualization
-            self._update_rl_metrics(trainer_type, metrics)
+            # Update RL metrics for visualization using real sample data
+            self._update_rl_metrics(trainer_type, metrics, training_samples)
             
         except Exception as e:
             self.logger.error(f"TRAINING_STATS_UPDATE_ERROR: {e}")
