@@ -1,0 +1,39 @@
+---
+alwaysApply: true
+---
+# 项目结构与入口指引
+
+本项目为多智能体交通控制系统（Multi-Agent Traffic Control System）。主要入口与运行方式：
+
+- 入口脚本：[main.py](mdc:main.py)
+- 多场景运行封装：[run_multi_agent.py](mdc:run_multi_agent.py)
+- 训练管理器与配置：[training_manager.py](mdc:training_manager.py)
+- 环境定义：[env.py](mdc:env.py)、[multi_agent_env.py](mdc:multi_agent_env.py)
+- Agent 目录：[agents/](mdc:agents)
+- 工具函数：[utils/](mdc:utils)
+- 预处理：[Preprocessing/](mdc:Preprocessing)
+- 提示词模板：[prompts/](mdc:prompts)
+- 运行与使用说明：[README.md](mdc:README.md)
+- 依赖列表：[requirements.txt](mdc:requirements.txt)
+
+常用命令：
+
+```bash
+# 快速检查环境/依赖/数据路径
+python run_multi_agent.py check
+
+# 快速测试（30分钟）
+python run_multi_agent.py quick
+
+# 完整仿真（12小时）
+python run_multi_agent.py full
+
+# 单/多智能体对比
+python run_multi_agent.py compare
+
+# 自定义参数运行
+python run_multi_agent.py custom --llm "/data/zhouyuping/Qwen/" --batch-size 16 --location Manhattan --step-size 180 --max-steps 43200
+```
+
+注意：本项目默认倾向于本地共享 LLM 架构（vLLM）。若需使用 API LLM，可在命令中指定 `--use-api-llm` 并确保相关 API Key 已配置。
+

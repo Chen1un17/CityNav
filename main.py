@@ -48,7 +48,8 @@ class MultiAgent_Route_Planning(object):
                 log_dir=f"logs/{location}_{llm_name}_local{'_rl' if enable_training else ''}",
                 task_info=task_info,
                 use_local_llm=True,
-                training_queue=self.training_queue  # Pass training queue for RL data collection
+                training_queue=self.training_queue,  # Pass training queue for RL data collection
+                use_time_sliced_training=False  # 关闭时间分片，单条立即入队
             )
         else:
             print(f"\n=== 初始化传统单一LLM模式 ===")
@@ -69,7 +70,8 @@ class MultiAgent_Route_Planning(object):
                 max_steps=max_steps,
                 log_dir=f"logs/{location}_{llm_name}",
                 use_local_llm=False,
-                training_queue=self.training_queue  # None for non-local LLM mode
+                training_queue=self.training_queue,  # None for non-local LLM mode
+                use_time_sliced_training=False  # 显式关闭，保持行为一致
             )
 
         wandb.init(
@@ -81,6 +83,10 @@ class MultiAgent_Route_Planning(object):
     def _initialize_training_manager(self, llm_path):
         """Initialize the MAGRPO training manager in a separate process."""
         try:
+            # 训练GPU隔离：在启动训练进程前显式设置训练可见GPU
+            os.environ["TRAINING_CUDA_VISIBLE_DEVICES"] = "2,3"
+            print(f"[INFO] 训练GPU绑定: TRAINING_CUDA_VISIBLE_DEVICES={os.environ.get('TRAINING_CUDA_VISIBLE_DEVICES')}")
+            
             # Create multiprocessing queue for training data
             self.training_queue = mp.Queue(maxsize=1000)
             print(f"创建训练数据队列 (max_size=1000)")
@@ -106,7 +112,19 @@ class MultiAgent_Route_Planning(object):
                 log_dir=f"logs/training_{self.location}",
                 vllm_inference_urls=vllm_urls,  # Pass vLLM server URLs
                 adapter_sync_dir="lora_adapters",
-                enable_hot_reload=True
+                enable_hot_reload=True,
+                # 默认：在线微调（可被环境变量 OBSERVATION_MODE 覆盖）
+                enable_progressive_training=False,
+                training_mode="online_only",
+                warmup_phase_enabled=False,
+                online_phase_enabled=True,
+                reinforcement_phase_enabled=False,
+                # 新增：可视化与token统计的默认开关
+                plot_loss_on_log_scale=False,
+                record_token_stats=True,
+                # 编码策略
+                use_dynamic_padding=True,
+                max_seq_length=512
             )
             
             print(f"训练配置:")

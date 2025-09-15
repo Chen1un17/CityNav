@@ -661,7 +661,8 @@ def parse_rou_file(file_path):
                     edge_list = edges.split()
                     start_edge = edge_list[0]  # 起点 edge_id
                     end_edge = edge_list[-1]  # 终点 edge_id
-                    trips.append((vehicle_id, start_edge, end_edge))
+                    depart_time = float(vehicle.get('depart', 0.0))
+                    trips.append((vehicle_id, start_edge, end_edge, depart_time))
                     if debug_output:
                         print(f"DEBUG: 成功解析车辆 {vehicle_id}: {start_edge} -> {end_edge}")
                 else:
@@ -683,7 +684,8 @@ def parse_rou_file(file_path):
                     edge_list = edges.split()
                     start_edge = edge_list[0]  # 起点 edge_id
                     end_edge = edge_list[-1]  # 终点 edge_id
-                    trips.append((vehicle_id, start_edge, end_edge))
+                    depart_time = float(vehicle.get('depart', 0.0))
+                    trips.append((vehicle_id, start_edge, end_edge, depart_time))
                     if debug_output:
                         print(f"DEBUG: 成功解析车辆 {vehicle_id}: {start_edge} -> {end_edge}")
                 else:

@@ -1,0 +1,22 @@
+---
+globs: *.py
+description: Python 代码风格、依赖与运行环境提示
+---
+# Python 风格与依赖提示
+
+代码风格：
+- 使用清晰的命名与类型注解（能推断的局部变量可省略注释）。
+- 控制流程优先早返回，避免过深嵌套；只在必要处使用 try/except，并提供有意义的处理。
+- 注释简洁，解释“为什么”，避免显而易见的注释；复杂逻辑前添加函数级文档字符串。
+
+依赖与环境：
+- 依赖来源：[requirements.txt](mdc:requirements.txt)，安装顺序：先安装 PyTorch（参考 [README.md](mdc:README.md)），再 `pip install -r requirements.txt`。
+- 本地共享 LLM 推荐 vLLM 推理服务，相关开关与端口探测逻辑参考 [main.py](mdc:main.py) 中 `_detect_vllm_inference_servers`。
+- 记录与可视化使用 `wandb`，默认在 [run_multi_agent.py](mdc:run_multi_agent.py) 设置离线模式，可按需修改。
+
+测试与运行：
+- CLI 统一通过 [run_multi_agent.py](mdc:run_multi_agent.py) 与 [main.py](mdc:main.py) 暴露；新增脚本时保持参数命名一致性（如 `--step-size`, `--max-steps`, `--no-reflection`）。
+- 长时间仿真任务需注意日志目录与磁盘容量（见 README 的日志文件说明）。
+
+提交规范：
+- 避免在代码中硬编码数据路径，集中在运行层传入；若必须保留默认路径，在 README 与规则中明确说明。

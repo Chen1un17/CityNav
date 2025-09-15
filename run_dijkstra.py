@@ -123,7 +123,7 @@ class DijkstraRoutePlanning(object):
         
         # Store route info for dynamic route computation
         self.route_lookup = {veh_id: (start_edge, end_edge) 
-                           for veh_id, start_edge, end_edge in all_vehicles}
+                           for veh_id, start_edge, end_edge, _ in all_vehicles}
         
         # Dynamic autonomous vehicle selection (will be populated during simulation)
         self.autonomous_vehicles = set()

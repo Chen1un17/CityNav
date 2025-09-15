@@ -47,7 +47,7 @@ class RegionalAgent:
     """
     
     def __init__(self, region_id: int, boundary_edges: Dict, edge_to_region: Dict,
-                 road_info: Dict, road_network: nx.DiGraph, llm_agent, logger, prediction_engine=None):
+                 road_info: Dict, road_network: nx.DiGraph, llm_agent, logger, prediction_engine=None, raw_llm_agent=None):
         """
         Initialize Regional Agent.
         
@@ -67,8 +67,12 @@ class RegionalAgent:
         self.road_info = road_info
         self.road_network = road_network
         self.llm_agent = llm_agent
+        # 使用原始 LLM（无并发封装）以避免双重并发控制导致的阻塞
+        self.raw_llm_agent = raw_llm_agent if raw_llm_agent is not None else llm_agent
         self.logger = logger
         self.prediction_engine = prediction_engine  # Store prediction engine for advanced lane optimization
+        # 允许从外部（环境）注入路由校验函数引用
+        self._validate_route_setting_ref = None
         
         # Identify edges and boundary edges for this region
         self._initialize_region_topology()
@@ -334,6 +338,13 @@ class RegionalAgent:
         
         for boundary_edge in boundary_candidates:
             try:
+                # Skip boundary edges that are blacklisted due to frequent stuck incidents
+                try:
+                    if hasattr(self, 'stuck_edge_blacklist') and boundary_edge in self.stuck_edge_blacklist:
+                        # Soft-penalize by skipping primary generation; fallback later will consider if necessary
+                        continue
+                except Exception:
+                    pass
                 # Use SUMO's findRoute for accurate travel time calculation
                 route_result = traci.simulation.findRoute(current_edge, boundary_edge)
                 
@@ -382,11 +393,53 @@ class RegionalAgent:
             self.logger.log_error(f"ROUTE_GENERATION: No valid candidates generated from {current_edge}")
             return []
         
-        # Sort by travel time first (primary objective), then by evaluation score
-        candidates.sort(key=lambda x: (x['travel_time'], -x['evaluation']['total_score']))
+        # Apply soft penalty for edges with high planned usage or blacklisted
+        def candidate_key(c):
+            base = c['travel_time']
+            # Strengthen negative feedback: penalize near-term 3 edges by usage count and low speed
+            util_penalty = sum(self.planned_routes.get(e, 0) for e in c['route'][:3]) * 10.0
+            try:
+                speed_penalty = 0.0
+                for e in c['route'][:3]:
+                    try:
+                        lanes = traci.edge.getLaneNumber(e)
+                        if lanes <= 0:
+                            continue
+                        lane_ids = [f"{e}_{i}" for i in range(lanes)]
+                        # Inverse of mean speed as penalty
+                        speeds = []
+                        for lid in lane_ids:
+                            try:
+                                v = traci.lane.getLastStepMeanSpeed(lid)
+                                if v >= 0:
+                                    speeds.append(v)
+                            except Exception:
+                                pass
+                        if speeds:
+                            mean_v = sum(speeds) / max(1, len(speeds))
+                            if mean_v < 2.0:
+                                speed_penalty += (2.0 - mean_v) * 20.0
+                    except Exception:
+                        pass
+            except Exception:
+                speed_penalty = 0.0
+            bl_penalty = 120.0 if hasattr(self, 'stuck_edge_blacklist') and c['boundary_edge'] in self.stuck_edge_blacklist else 0.0
+            return base + util_penalty + speed_penalty + bl_penalty
+        candidates.sort(key=candidate_key)
         
         # Return top candidates optimized for travel time
         return candidates[:3]  # Reduced to 3 for faster LLM decision
+
+    def update_stuck_edge_blacklist(self, edges: set, current_time: float):
+        """Update regional blacklist of edges prone to stuck events with cooldown semantics."""
+        try:
+            if not hasattr(self, 'stuck_edge_blacklist'):
+                self.stuck_edge_blacklist = set()
+            # Merge edges; cooldown expiry is handled at environment level; here we only track membership
+            for e in edges:
+                self.stuck_edge_blacklist.add(e)
+        except Exception as e:
+            self.logger.log_warning(f"REGIONAL_BLACKLIST_UPDATE: {self.region_id} -> {e}")
     
     def _is_valid_edge_for_planning(self, edge_id: str) -> bool:
         """判断边是否适合用于路径规划 - 允许cluster边，只排除junction内部连接边"""
@@ -412,7 +465,14 @@ class RegionalAgent:
                     'route': list(route_result.edges),
                     'travel_time': float(route_result.travelTime),  # Ensure numeric type
                     'distance': float(route_result.length),  # Ensure numeric type
-                    'evaluation': {'total_score': 0.0},
+                    'evaluation': {
+                        'avg_congestion': 0.0,
+                        'avg_speed': 0.0,
+                        'total_vehicles': 0,
+                        'boundary_congestion': 0.0,
+                        'planned_usage': 0,
+                        'edge_count': len(route_result.edges)
+                    },
                     'description': f"Fallback route to {boundary_edge}",
                     'reasoning': 'Emergency fallback route'
                 }
@@ -424,7 +484,14 @@ class RegionalAgent:
                     'route': [str(current_edge), str(boundary_edge)],  # Ensure string types
                     'travel_time': 60.0,  # Estimated 1 minute
                     'distance': 100.0,    # Estimated 100m
-                    'evaluation': {'total_score': 0.0},
+                    'evaluation': {
+                        'avg_congestion': 0.0,
+                        'avg_speed': 0.0,
+                        'total_vehicles': 0,
+                        'boundary_congestion': 0.0,
+                        'planned_usage': 0,
+                        'edge_count': 2
+                    },
                     'description': f"Direct fallback to {boundary_edge}",
                     'reasoning': 'Direct connection fallback'
                 }
@@ -436,64 +503,42 @@ class RegionalAgent:
             return None
     
     def _evaluate_regional_route_candidate(self, route: List[str], boundary_edge: str, current_time: float) -> Dict:
-        """Evaluate regional route candidate based on multiple factors."""
+        """收集该候选路线的原始路况数据（不做评分）。"""
         try:
-            evaluation = {
-                'congestion_score': 0.0,
-                'distance_score': 0.0,
-                'utilization_score': 0.0,
-                'boundary_score': 0.0,
-                'total_score': 0.0
-            }
-            
-            # Factor 1: Route congestion (lower is better)
             total_congestion = 0.0
+            total_speed = 0.0
+            total_vehicles = 0
             valid_edges = 0
-            
             for edge in route:
                 if edge in self.road_info:
-                    congestion = self.road_info[edge].get('congestion_level', 0)
-                    total_congestion += congestion
+                    edge_data = self.road_info[edge]
+                    total_congestion += edge_data.get('congestion_level', 0.0)
+                    total_speed += edge_data.get('avg_speed', 0.0)
+                    total_vehicles += int(edge_data.get('vehicle_num', 0))
                     valid_edges += 1
-            
-            if valid_edges > 0:
-                avg_congestion = total_congestion / valid_edges
-                evaluation['congestion_score'] = max(0, 5 - avg_congestion)  # 5 is max score when no congestion
-            
-            # Factor 2: Route length (shorter is better)
-            route_length = len(route)
-            evaluation['distance_score'] = max(0, 10 - route_length * 0.5)  # Penalty for longer routes
-            
-            # Factor 3: Current route utilization (avoid overused routes)
-            utilization_penalty = 0
-            for edge in route:
-                planned_usage = self.planned_routes.get(edge, 0)
-                utilization_penalty += planned_usage * 0.5
-            
-            evaluation['utilization_score'] = max(0, 5 - utilization_penalty)
-            
-            # Factor 4: Boundary edge quality
+            avg_congestion = (total_congestion / valid_edges) if valid_edges > 0 else 0.0
+            avg_speed = (total_speed / valid_edges) if valid_edges > 0 else 0.0
+            boundary_congestion = 0.0
             if boundary_edge in self.road_info:
-                boundary_congestion = self.road_info[boundary_edge].get('congestion_level', 0)
-                evaluation['boundary_score'] = max(0, 3 - boundary_congestion)
-            else:
-                evaluation['boundary_score'] = 1.5  # Neutral score
-            
-            # Calculate total score
-            evaluation['total_score'] = (
-                evaluation['congestion_score'] * 0.4 +
-                evaluation['distance_score'] * 0.2 +
-                evaluation['utilization_score'] * 0.3 +
-                evaluation['boundary_score'] * 0.1
-            )
-            
-            return evaluation
-            
+                boundary_congestion = float(self.road_info[boundary_edge].get('congestion_level', 0.0))
+            planned_usage = sum(self.planned_routes.get(e, 0) for e in route[:3])
+            return {
+                'avg_congestion': float(avg_congestion),
+                'avg_speed': float(avg_speed),
+                'total_vehicles': int(total_vehicles),
+                'boundary_congestion': float(boundary_congestion),
+                'planned_usage': int(planned_usage),
+                'edge_count': int(len(route))
+            }
         except Exception as e:
             self.logger.log_error(f"ROUTE_EVALUATION: Failed to evaluate route: {e}")
             return {
-                'congestion_score': 0.0, 'distance_score': 0.0,
-                'utilization_score': 0.0, 'boundary_score': 0.0, 'total_score': 0.0
+                'avg_congestion': 0.0,
+                'avg_speed': 0.0,
+                'total_vehicles': 0,
+                'boundary_congestion': 0.0,
+                'planned_usage': 0,
+                'edge_count': int(len(route))
             }
     
     def _create_route_description(self, route: List[str], boundary_edge: str, evaluation: Dict) -> str:
@@ -502,9 +547,8 @@ class RegionalAgent:
             parts = []
             parts.append(f"Route to {boundary_edge}")
             parts.append(f"Length: {len(route)} edges")
-            parts.append(f"Score: {evaluation['total_score']:.1f}")
-            parts.append(f"Congestion: {evaluation['congestion_score']:.1f}/5")
-            parts.append(f"Utilization: {evaluation['utilization_score']:.1f}/5")
+            parts.append(f"AvgCong: {evaluation.get('avg_congestion', 0.0):.2f}")
+            parts.append(f"BoundaryCong: {evaluation.get('boundary_congestion', 0.0):.2f}")
             
             return " | ".join(parts)
             
@@ -543,13 +587,14 @@ class RegionalAgent:
             
             # Use LLM for decision making
             call_id = self.logger.log_llm_call_start(
-                "RegionalRouting", f"R{self.region_id}_{vehicle_id}", len(observation_text)
+                "RegionalRouting", f"R{self.region_id}_{vehicle_id}", len(observation_text),
+                "decision", "", observation_text
             )
             
             try:
-                # Use the same LLM decision method as original single-vehicle system
-                # as required by user: "区域内规划需要和原系统的LLM参与的规划方式一样"
-                decisions = self.llm_agent.hybrid_decision_making_pipeline(
+                # Use the same LLM decision method, enforcing numeric-only answers
+                # 单车调用，强制走单次 inference 的 fast path（内部会触发 single-query 优化）
+                decisions = self.raw_llm_agent.hybrid_decision_making_pipeline(
                     [observation_text], [answer_options]
                 )
                 
@@ -637,7 +682,7 @@ class RegionalAgent:
                     len(observation_text), str(llm_error)
                 )
                 
-                # Fallback: return best scored candidate
+                # Fallback: return first candidate
                 if route_candidates:
                     return route_candidates[0]
                 else:
@@ -675,8 +720,34 @@ class RegionalAgent:
                 target_region = vehicle_data['target_region']
                 
                 try:
-                    # Get current position 
-                    current_edge = traci.vehicle.getRoadID(vehicle_id)
+                    # Get current position - different logic for pre-planning vs real-time
+                    current_edge = None
+                    
+                    # Check if vehicle_info with start_edge is provided (pre-planning)
+                    if 'vehicle_info' in vehicle_data:
+                        # Pre-planning phase: vehicle doesn't exist in simulation yet
+                        veh_info = vehicle_data['vehicle_info']
+                        current_edge = veh_info.get('start_edge')
+                        if current_edge:
+                            self.logger.log_info(f"BATCH_PLANNING: Pre-planning using start_edge {current_edge} for {vehicle_id}")
+                        else:
+                            # For pre-planning, try route data as fallback
+                            current_edge = self._get_vehicle_start_edge_from_data(vehicle_id)
+                            if current_edge:
+                                self.logger.log_info(f"BATCH_PLANNING: Pre-planning using route data edge {current_edge} for {vehicle_id}")
+                            else:
+                                self.logger.log_warning(f"BATCH_PLANNING: No start_edge available for pre-planning {vehicle_id}")
+                    else:
+                        # Real-time planning: vehicle should exist in simulation
+                        try:
+                            current_edge = traci.vehicle.getRoadID(vehicle_id)
+                            self.logger.log_info(f"BATCH_PLANNING: Real-time using TraCI edge {current_edge} for {vehicle_id}")
+                        except Exception as e:
+                            self.logger.log_warning(f"BATCH_PLANNING: Real-time TraCI failed for {vehicle_id}: {e}")
+                            # For real-time, try route data as fallback
+                            current_edge = self._get_vehicle_start_edge_from_data(vehicle_id)
+                            if current_edge:
+                                self.logger.log_info(f"BATCH_PLANNING: Real-time using route data edge {current_edge} for {vehicle_id}")
                     if not self._is_valid_edge_for_planning(current_edge):
                         self.logger.log_warning(f"BATCH_PLANNING: Invalid edge {current_edge} for {vehicle_id}")
                         vehicle_plans_data.append(None)
@@ -716,7 +787,10 @@ class RegionalAgent:
             # Filter out None values for LLM processing
             valid_vehicles = [data for data in vehicle_plans_data if data is not None]
             
+            self.logger.log_info(f"BATCH_REGIONAL_PLANNING: {len(vehicle_plans_data)} total, {len(valid_vehicles)} valid vehicles for LLM")
+            
             if not valid_vehicles:
+                self.logger.log_warning(f"BATCH_REGIONAL_PLANNING: No valid vehicles for LLM processing in region {self.region_id}")
                 return [None] * len(batch_vehicles)
             
             # Create batch observation for LLM
@@ -738,11 +812,13 @@ class RegionalAgent:
             
             # Single LLM call for all vehicles
             call_id = self.logger.log_llm_call_start(
-                "BatchRegionalRouting", f"R{self.region_id}_batch", len(batch_observation)
+                "BatchRegionalRouting", f"R{self.region_id}_batch", len(batch_observation),
+                "decision", "", batch_observation
             )
             
             try:
-                decisions = self.llm_agent.hybrid_decision_making_pipeline(
+                # 批量路径仍保留（需要多车合并决策）；但如果只有1辆有效车，上层构建会走单条，从而触发 single-query 优化
+                decisions = self.raw_llm_agent.hybrid_decision_making_pipeline(
                     [batch_observation], [answer_options]
                 )
                 
@@ -906,34 +982,44 @@ class RegionalAgent:
             return [None] * len(batch_vehicles)
     
     def _create_batch_regional_planning_observation(self, valid_vehicles: List[Dict], current_time: float) -> str:
-        """Create batch observation for multiple vehicles with complete candidate information."""
+        """Create compact batch observation inspired by traffic agent's efficient style."""
         observation_parts = []
-        observation_parts.append(f"BATCH REGIONAL ROUTE PLANNING - REGION {self.region_id}")
-        observation_parts.append(f"Planning for {len(valid_vehicles)} vehicles, time: {current_time:.1f}s")
+        observation_parts.append(f"REGIONAL R{self.region_id} | {len(valid_vehicles)} vehicles | T:{current_time:.0f}s")
         observation_parts.append("")
         
-        # 显示所有车辆的完整候选信息，但限制每辆车的候选数量
+        # Compact vehicle and candidate display (traffic agent style)
         for i, vehicle_data in enumerate(valid_vehicles):
-            observation_parts.append(f"V{i+1}: {vehicle_data['vehicle_id']} -> R{vehicle_data['target_region']}")
-            observation_parts.append(f"  From: {vehicle_data['current_edge']}")
+            vehicle_id = vehicle_data['vehicle_id'][-6:]  # Last 6 chars of ID for brevity
+            target_region = vehicle_data['target_region']
             
-            # 显示所有候选路径的关键信息
+            # Compact candidate info
+            candidate_info = []
             if vehicle_data['candidates']:
-                observation_parts.append(f"  Candidates:")
                 for j, candidate in enumerate(vehicle_data['candidates']):
-                    travel_time = candidate.get('travel_time', 'N/A')
-                    boundary = candidate.get('boundary_edge', 'Unknown')
-                    route_len = len(candidate.get('route', []))
-                    observation_parts.append(f"    {j+1}. To {boundary} | {travel_time}s | {route_len} edges")
+                    travel_time = candidate.get('travel_time', 0)
+                    boundary = candidate.get('boundary_edge', 'Unknown')[-10:]  # Last 10 chars
+                    candidate_info.append(f"{j+1}.{boundary}({travel_time:.0f}s)")
+            
+            if candidate_info:
+                candidates_str = " | ".join(candidate_info)
+                observation_parts.append(f"V{i+1}: {vehicle_id}→R{target_region} | {candidates_str}")
             else:
-                observation_parts.append(f"  No valid candidates")
+                observation_parts.append(f"V{i+1}: {vehicle_id}→R{target_region} | No candidates")
         
         observation_parts.append("")
-        observation_parts.append("SELECT: Choose best candidate for each vehicle (e.g., '1,2,1' for V1->option1, V2->option2, V3->option1)")
+        
+        # Compact system state (only essential info)
+        active_vehicles = len(getattr(self, 'region_vehicles', []))
+        high_util_count = sum(1 for count in getattr(self, 'planned_routes', {}).values() if count > 5)
+        observation_parts.append(f"Region load: {active_vehicles} active, {high_util_count} high-util edges")
+        
+        observation_parts.append("")
+        observation_parts.append("SELECT: Choose best option for each vehicle (format: '1,2,1')")
         
         observation_text = "\n".join(observation_parts)
-        # 适当放宽上下文长度限制以保证信息完整性
-        max_context_length = 2000
+        
+        # Tight length control (traffic agent uses compact contexts)
+        max_context_length = 1200  # Reduced for efficiency
         if len(observation_text) > max_context_length:
             observation_text = observation_text[:max_context_length-3] + "..."
         
@@ -950,15 +1036,68 @@ class RegionalAgent:
         observation_parts.append(f"Current time: {current_time:.1f}s")
         observation_parts.append("")
         
-        # Show route candidates - 限制最多3个选项以控制长度
+        # Show route candidates - provide raw, real-time metrics for decision making (no scoring)
         observation_parts.append("ROUTE CANDIDATES:")
         limited_candidates = route_candidates[:3]  # 限制最多3个选项
         for i, candidate in enumerate(limited_candidates):
-            # 简化描述，只保留关键信息
-            short_desc = candidate['description'][:50] + "..." if len(candidate['description']) > 50 else candidate['description']
-            observation_parts.append(f"Option {i+1}: {short_desc}")
-            observation_parts.append(f"  Time: {candidate['travel_time']:.1f}s, Dist: {candidate['distance']:.1f}m")
+            # Show full description with all key decision factors
+            observation_parts.append(f"Option {i+1}: {candidate['description']}")
+            
+            # Include raw metrics only（将原先打分的来源量化前信号完整暴露）
+            metrics = []
+            metrics.append(f"Time: {candidate['travel_time']:.1f}s")
+            metrics.append(f"Dist: {candidate['distance']:.1f}m")
+            
+            # Append raw evaluation values; do NOT provide any pre-scored values
+            if 'evaluation' in candidate:
+                eval_data = candidate['evaluation']
+                # 路径逐边原始拥堵与速度（前若干段，避免过长）
+                raw_series_cong = []
+                raw_series_speed = []
+                for e in candidate.get('route', [])[:8]:
+                    ed = self.road_info.get(e, {})
+                    raw_series_cong.append(f"{e}:{ed.get('congestion_level', 0.0):.2f}")
+                    raw_series_speed.append(f"{e}:{ed.get('avg_speed', 0.0):.1f}")
+                if raw_series_cong:
+                    metrics.append("EdgeCong[0..]: " + "|".join(raw_series_cong))
+                if raw_series_speed:
+                    metrics.append("EdgeSpeed[0..]: " + "|".join(raw_series_speed))
+                # 汇总级的原始统计
+                metrics.append(f"AvgCong: {eval_data.get('avg_congestion', 0.0):.2f}")
+                metrics.append(f"AvgSpeed: {eval_data.get('avg_speed', 0.0):.1f}m/s")
+                metrics.append(f"VehTotal: {eval_data.get('total_vehicles', 0)}")
+                metrics.append(f"BoundaryCong: {eval_data.get('boundary_congestion', 0.0):.2f}")
+                metrics.append(f"PlannedUse: {eval_data.get('planned_usage', 0)}")
+                metrics.append(f"Edges: {eval_data.get('edge_count', len(candidate['route']))}")
+                
+            observation_parts.append(f"  {' | '.join(metrics)}")
         observation_parts.append("")
+
+        # Inject global macro guidance (if available from environment)
+        try:
+            if hasattr(self, 'parent_env') and hasattr(self.parent_env, '_get_current_global_macro_guidance'):
+                guidance = self.parent_env._get_current_global_macro_guidance()
+                if guidance:
+                    try:
+                        goals = guidance.get('priority_goals', [])
+                        avoid_regions = guidance.get('avoid_regions', [])
+                        avoid_edges = guidance.get('avoid_edges', [])
+                        msg = guidance.get('message', '')
+                        observation_parts.append("GLOBAL_GUIDANCE:")
+                        observation_parts.append("")
+                        if goals:
+                            observation_parts.append("Goals: " + ", ".join([str(g) for g in goals[:3]]))
+                        if avoid_regions:
+                            observation_parts.append("AvoidRegions: " + ",".join([f"R{int(r)}" for r in avoid_regions[:6]]))
+                        if avoid_edges:
+                            observation_parts.append("AvoidEdges: " + ",".join([str(e) for e in avoid_edges[:8]]))
+                        if msg:
+                            observation_parts.append(f"Note: {msg}")
+                        observation_parts.append("")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         
         # Regional context - 简化信息
         observation_parts.append(f"REGION {self.region_id}: {len(self.region_vehicles)} vehicles, {len(self.outgoing_boundaries)} boundaries")
@@ -973,11 +1112,15 @@ class RegionalAgent:
             observation_parts.append(f"High util: {', '.join(high_util_edges[:3])}")
         observation_parts.append("")
         
-        observation_parts.append("OBJECTIVE: Select best route (respond with option number only)")
+        # Decision format reminder (raw-only, numeric output)
+        observation_parts.append("")
+        observation_parts.append("DECISION FORMAT: Reply with the option number only (1, 2, ...).")
+        observation_parts.append("OBJECTIVE: Use raw metrics only. Prefer shorter/simpler when close; avoid edges showing slow/stop.")
         
         observation_text = "\n".join(observation_parts)
-        # 上下文长度控制 - 限制在1500字符以内
-        max_context_length = 1500
+        # Allow longer context to ensure LLM sees complete candidate information
+        # Only truncate if extremely long (>3000 chars) to prevent memory issues
+        max_context_length = 3000
         if len(observation_text) > max_context_length:
             observation_text = observation_text[:max_context_length-3] + "..."
         
@@ -1010,7 +1153,7 @@ class RegionalAgent:
             # Use LLM for batch decision making
             call_id = self.logger.log_llm_call_start(
                 "RegionalAgent", str(self.region_id), 
-                len(str(decision_context))
+                len(str(decision_context)), "decision", "", str(decision_context)
             )
             
             decisions = []
@@ -1101,6 +1244,15 @@ class RegionalAgent:
             'regional_state': self._get_regional_state(),
             'recommendations': recommendations.__dict__ if recommendations else None
         }
+        
+        # Attach global macro guidance snapshot if available
+        try:
+            if hasattr(self, 'parent_env') and hasattr(self.parent_env, '_get_current_global_macro_guidance'):
+                guidance = self.parent_env._get_current_global_macro_guidance()
+                if guidance:
+                    context['global_guidance'] = guidance
+        except Exception:
+            pass
         
         for vehicle_id in vehicle_ids:
             try:
@@ -1343,6 +1495,20 @@ class RegionalAgent:
                     vehicle_id = vehicle_data['vehicle_id']
                     route_options[vehicle_id] = vehicle_data['candidate_boundaries']
                 
+                # Incorporate global macro guidance to coordination messages if present
+                try:
+                    if context.get('global_guidance'):
+                        gg = context['global_guidance']
+                        coordination_messages.append({
+                            'from': 'TrafficAgent(Global)',
+                            'message': gg.get('message', ''),
+                            'priority_goals': gg.get('priority_goals', []),
+                            'avoid_regions': gg.get('avoid_regions', []),
+                            'avoid_edges': gg.get('avoid_edges', [])
+                        })
+                except Exception:
+                    pass
+
                 # Call the enhanced LLM decision method
                 llm_result = self.llm_agent.regional_coordination_decision(
                     regional_context=regional_context,
@@ -1434,8 +1600,8 @@ class RegionalAgent:
             traffic_predictions = self._get_traffic_predictions_for_region()
             
             # Use enhanced hybrid decision making
-            if hasattr(self.llm_agent, 'enhanced_hybrid_decision_making_pipeline'):
-                llm_decisions = self.llm_agent.enhanced_hybrid_decision_making_pipeline(
+            if hasattr(self.raw_llm_agent, 'enhanced_hybrid_decision_making_pipeline'):
+                llm_decisions = self.raw_llm_agent.enhanced_hybrid_decision_making_pipeline(
                     data_texts=data_texts,
                     answer_option_forms=answer_options,
                     decision_type="regional_coordination",
@@ -1447,7 +1613,7 @@ class RegionalAgent:
                 )
             else:
                 # Basic hybrid decision making fallback
-                llm_decisions = self.llm_agent.hybrid_decision_making_pipeline(
+                llm_decisions = self.raw_llm_agent.hybrid_decision_making_pipeline(
                     data_texts, answer_options
                 ) if hasattr(self.llm_agent, 'hybrid_decision_making_pipeline') else []
             
@@ -2631,6 +2797,108 @@ class RegionalAgent:
         except Exception as e:
             self.logger.log_error(f"LANE_CHANGE_FAILED: {vehicle_id} -> {e}")
             return False
+
+    def _set_route_safely(self, vehicle_id: str, route: List[str]) -> bool:
+        """在路口/内部边规避下安全设置路线，并记录监控日志。"""
+        try:
+            if vehicle_id not in traci.vehicle.getIDList():
+                return False
+            if not route or len(route) == 0:
+                return False
+            current_edge = traci.vehicle.getRoadID(vehicle_id)
+            # 路口内部边上：不直接 setRoute，尝试构造连接段
+            if current_edge.startswith(':'):
+                try:
+                    safe_route = self._create_safe_route(current_edge, route)
+                except Exception:
+                    safe_route = None
+                if safe_route:
+                    traci.vehicle.setRoute(vehicle_id, safe_route)
+                    self.logger.log_info(f"SAFE_SET_ROUTE: {vehicle_id} on junction -> applied safe route len={len(safe_route)}")
+                    return True
+                self.logger.log_warning(f"SAFE_SET_ROUTE_DEFER: {vehicle_id} at {current_edge} (junction), route deferred")
+                return False
+            # 校验可达性与首段连通
+            try:
+                if hasattr(self, '_validate_route_setting_ref'):
+                    valid = self._validate_route_setting_ref(vehicle_id, route)
+                else:
+                    # 直接做一次 findRoute 以验证 current_edge 到 route[0]
+                    res = traci.simulation.findRoute(current_edge, route[0])
+                    valid = bool(res and hasattr(res, 'edges'))
+                if not valid:
+                    self.logger.log_warning(f"SAFE_SET_ROUTE_REJECT: {vehicle_id} invalid route start from {current_edge} -> {route[0]}")
+                    return False
+            except Exception as e:
+                self.logger.log_warning(f"SAFE_SET_ROUTE_CHECK_FAIL: {vehicle_id} -> {e}")
+                return False
+            # 通过验证后设置
+            traci.vehicle.setRoute(vehicle_id, route)
+            self.logger.log_info(f"SAFE_SET_ROUTE_OK: {vehicle_id} route_len={len(route)} start={route[0]} end={route[-1]}")
+            return True
+        except Exception as e:
+            self.logger.log_error(f"SAFE_SET_ROUTE_ERROR: {vehicle_id} -> {e}")
+            return False
+
+    def _ensure_exit_lane_preselection(self, vehicle_id: str, route: List[str]) -> None:
+        """距路口阈值内，依据 bestLanes 预选出口车道，降低硬卡。"""
+        try:
+            if vehicle_id not in traci.vehicle.getIDList():
+                return
+            current_edge = traci.vehicle.getRoadID(vehicle_id)
+            if not current_edge or current_edge.startswith(':'):
+                return
+            # 只在接近路口时尝试（120~200m窗口）
+            try:
+                pos = traci.vehicle.getLanePosition(vehicle_id)  # on lane dist from lane start
+                edge_len = traci.lane.getLength(f"{current_edge}_0") if traci.edge.getLaneNumber(current_edge) > 0 else 0
+                dist_to_end = max(0.0, edge_len - pos)
+            except Exception:
+                dist_to_end = 0.0
+            if dist_to_end > 200.0:
+                return
+            # 获取最佳车道建议
+            try:
+                best = traci.vehicle.getBestLanes(vehicle_id)
+            except Exception:
+                best = None
+            if not best:
+                return
+            # 选择能通向下一边的车道
+            next_edge = None
+            if route and current_edge in route:
+                idx = route.index(current_edge)
+                if idx + 1 < len(route):
+                    next_edge = route[idx + 1]
+            target_lane_idx = None
+            if next_edge is not None:
+                try:
+                    for info in best:
+                        # info: (laneId, length, allowsContinuation, nextLaneId, ...)
+                        # 兼容不同 SUMO 版本字段，尽量依据 allowsContinuation/nextLaneId 判断
+                        allows = False
+                        nLane = None
+                        try:
+                            allows = bool(info[2])
+                        except Exception:
+                            pass
+                        try:
+                            nLane = info[3]
+                        except Exception:
+                            pass
+                        if allows and isinstance(nLane, str) and nLane.startswith(next_edge + "_"):
+                            try:
+                                lane_id = info[0]
+                                target_lane_idx = int(lane_id.split('_')[-1])
+                                break
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+            if target_lane_idx is not None:
+                self._execute_lane_change(vehicle_id, target_lane_idx)
+        except Exception as e:
+            self.logger.log_warning(f"BESTLANES_PRESELECT_FAIL: {vehicle_id} -> {e}")
     
     def _track_lane_change_performance(self, vehicle_id: str, from_lane: int, to_lane: int, duration: int):
         """Track lane change performance for optimization."""
@@ -2701,8 +2969,14 @@ class RegionalAgent:
                     if edge in self.region_edges:
                         self.planned_routes[edge] += 1
                 
-                # Set vehicle route in SUMO
-                traci.vehicle.setRoute(decision.vehicle_id, decision.route)
+                # Set vehicle route safely (junction-aware) and preselect exit lane
+                if self._set_route_safely(decision.vehicle_id, decision.route):
+                    try:
+                        self._ensure_exit_lane_preselection(decision.vehicle_id, decision.route)
+                    except Exception:
+                        pass
+                else:
+                    self.logger.log_warning(f"SAFE_ROUTE_SKIP: {decision.vehicle_id} route rejected")
                 
                 # Execute intelligent lane assignment if specified
                 if decision.lane_assignment is not None:
@@ -2966,3 +3240,353 @@ class RegionalAgent:
             
         except Exception:
             return 1.0
+    
+    def generate_candidate_routes_for_vehicle(self, vehicle_id: str, target_region: int, current_time: float) -> List[Dict]:
+        """
+        Generate candidate routes for a vehicle entering the region.
+        
+        This method supports the candidate route mechanism where vehicles use the first
+        candidate route while optimal planning is in progress.
+        
+        Args:
+            vehicle_id: Vehicle ID
+            target_region: Target region ID
+            current_time: Current simulation time
+            
+        Returns:
+            List of candidate routes with route information and priority
+        """
+        try:
+            self.logger.log_info(f"CANDIDATE_ROUTES: Generating candidates for {vehicle_id} -> region {target_region}")
+            
+            # Get current vehicle position
+            try:
+                current_edge = traci.vehicle.getRoadID(vehicle_id)
+                if not self._is_valid_edge_for_planning(current_edge):
+                    self.logger.log_warning(f"CANDIDATE_ROUTES: Invalid edge {current_edge} for {vehicle_id}")
+                    return []
+            except Exception as traci_error:
+                self.logger.log_error(f"CANDIDATE_ROUTES: TraCI error for {vehicle_id}: {traci_error}")
+                return []
+            
+            # Get boundary candidates to target region
+            boundary_candidates = self._get_boundary_candidates_to_region(target_region)
+            if not boundary_candidates:
+                # Fallback to any outgoing boundary
+                boundary_candidates = self.outgoing_boundaries[:3] if self.outgoing_boundaries else []
+                if not boundary_candidates:
+                    self.logger.log_warning(f"CANDIDATE_ROUTES: No boundaries available for {vehicle_id}")
+                    return []
+            
+            # Generate route candidates with priority scoring
+            candidate_routes = []
+            
+            for i, boundary_edge in enumerate(boundary_candidates[:3]):  # Limit to top 3
+                try:
+                    # Use SUMO's route finding
+                    route_result = traci.simulation.findRoute(current_edge, boundary_edge)
+                    
+                    if route_result and route_result.edges and route_result.travelTime > 0:
+                        route_edges = list(route_result.edges)
+                        
+                        # Calculate priority score (higher is better for first choice)
+                        priority_score = self._calculate_candidate_route_priority(
+                            route_edges, boundary_edge, current_time
+                        )
+                        
+                        candidate_route = {
+                            'boundary_edge': boundary_edge,
+                            'route': route_edges,
+                            'travel_time': float(route_result.travelTime),
+                            'distance': float(route_result.length),
+                            'priority_score': priority_score,
+                            'candidate_rank': i + 1,  # 1 = primary, 2 = secondary, etc.
+                            'description': f"Candidate {i+1} to {boundary_edge} ({route_result.travelTime:.0f}s)",
+                            'is_primary_candidate': i == 0
+                        }
+                        
+                        candidate_routes.append(candidate_route)
+                        
+                except Exception as e:
+                    self.logger.log_warning(f"CANDIDATE_ROUTES: Failed to generate route to {boundary_edge}: {e}")
+                    continue
+            
+            # Sort by priority score (descending)
+            candidate_routes.sort(key=lambda x: x['priority_score'], reverse=True)
+            
+            # Mark the highest priority as primary
+            if candidate_routes:
+                candidate_routes[0]['is_primary_candidate'] = True
+                for route in candidate_routes[1:]:
+                    route['is_primary_candidate'] = False
+            
+            self.logger.log_info(f"CANDIDATE_ROUTES: Generated {len(candidate_routes)} candidates for {vehicle_id}")
+            return candidate_routes
+            
+        except Exception as e:
+            self.logger.log_error(f"CANDIDATE_ROUTES: Critical error for {vehicle_id}: {e}")
+            return []
+    
+    def _calculate_candidate_route_priority(self, route_edges: List[str], boundary_edge: str, current_time: float) -> float:
+        """
+        Calculate priority score for a candidate route.
+        Higher scores indicate better immediate choices.
+        """
+        try:
+            priority_score = 100.0  # Base score
+            
+            # Factor 1: Route length (shorter routes preferred for immediate use)
+            length_penalty = len(route_edges) * 2.0
+            priority_score -= length_penalty
+            
+            # Factor 2: Current congestion on route
+            total_congestion = 0.0
+            valid_edges = 0
+            
+            for edge in route_edges:
+                if edge in self.road_info:
+                    congestion = self.road_info[edge].get('congestion_level', 0)
+                    total_congestion += congestion
+                    valid_edges += 1
+            
+            if valid_edges > 0:
+                avg_congestion = total_congestion / valid_edges
+                congestion_penalty = avg_congestion * 5.0  # Higher penalty for congestion
+                priority_score -= congestion_penalty
+            
+            # Factor 3: Boundary edge utilization (prefer less used boundaries)
+            if boundary_edge in self.planned_routes:
+                utilization_penalty = self.planned_routes[boundary_edge] * 3.0
+                priority_score -= utilization_penalty
+            
+            # Factor 4: Road capacity and vehicle count
+            for edge in route_edges[:3]:  # Check first 3 edges
+                if edge in self.road_info:
+                    vehicle_count = self.road_info[edge].get('vehicle_num', 0)
+                    road_capacity = self.road_info[edge].get('road_len', 100) / 10.0
+                    
+                    if road_capacity > 0:
+                        density_penalty = (vehicle_count / road_capacity) * 4.0
+                        priority_score -= density_penalty
+            
+            return max(0.0, priority_score)
+            
+        except Exception as e:
+            self.logger.log_warning(f"CANDIDATE_PRIORITY: Error calculating priority: {e}")
+            return 50.0  # Default medium priority
+    
+    def apply_optimal_route_decision(self, vehicle_id: str, optimal_route: Dict, current_time: float) -> bool:
+        """
+        Apply the optimal route decision to a vehicle that was using a candidate route.
+        
+        This method handles the transition from candidate route to optimal route by:
+        1. Finding the closest point on the optimal route to vehicle's current position
+        2. Creating a navigation route from current position to that point
+        3. Concatenating with remaining optimal route
+        
+        Args:
+            vehicle_id: Vehicle ID
+            optimal_route: Optimal route decision from LLM
+            current_time: Current simulation time
+            
+        Returns:
+            True if route was successfully applied, False otherwise
+        """
+        try:
+            if not optimal_route or 'route' not in optimal_route:
+                self.logger.log_warning(f"OPTIMAL_ROUTE_APPLY: Invalid route for {vehicle_id}")
+                return False
+            
+            optimal_route_edges = optimal_route['route']
+            if not optimal_route_edges:
+                return False
+            
+            # Get vehicle's current position
+            try:
+                current_edge = traci.vehicle.getRoadID(vehicle_id)
+                current_position = traci.vehicle.getPosition(vehicle_id)
+                
+                if not self._is_valid_edge_for_planning(current_edge):
+                    self.logger.log_warning(f"OPTIMAL_ROUTE_APPLY: Vehicle {vehicle_id} on invalid edge {current_edge}")
+                    return False
+                    
+            except Exception as traci_error:
+                self.logger.log_error(f"OPTIMAL_ROUTE_APPLY: TraCI error for {vehicle_id}: {traci_error}")
+                return False
+            
+            # Find the closest point on optimal route to current position
+            closest_edge_index = self._find_closest_edge_on_route(
+                current_edge, optimal_route_edges, current_position
+            )
+            
+            if closest_edge_index == -1:
+                # Vehicle not near optimal route, generate navigation route
+                target_edge = optimal_route_edges[0]  # Navigate to start of optimal route
+                
+                try:
+                    navigation_result = traci.simulation.findRoute(current_edge, target_edge)
+                    if navigation_result and navigation_result.edges:
+                        navigation_route = list(navigation_result.edges)
+                        # Combine navigation route with optimal route (avoid duplicates)
+                        if navigation_route[-1] == optimal_route_edges[0]:
+                            final_route = navigation_route + optimal_route_edges[1:]
+                        else:
+                            final_route = navigation_route + optimal_route_edges
+                    else:
+                        # Fallback: create route from current edge to optimal route target
+                        try:
+                            target_boundary = optimal_route.get('boundary_edge', optimal_route_edges[-1])
+                            fallback_result = traci.simulation.findRoute(current_edge, target_boundary)
+                            if fallback_result and fallback_result.edges:
+                                final_route = list(fallback_result.edges)
+                            else:
+                                # Last resort: keep current route
+                                self.logger.log_warning(f"OPTIMAL_ROUTE_APPLY: Cannot connect {current_edge} to optimal route, keeping current route")
+                                return False
+                        except Exception:
+                            self.logger.log_warning(f"OPTIMAL_ROUTE_APPLY: Fallback route generation failed for {vehicle_id}")
+                            return False
+                        
+                except Exception as nav_error:
+                    self.logger.log_warning(f"OPTIMAL_ROUTE_APPLY: Navigation generation failed for {vehicle_id}: {nav_error}")
+                    # Try direct route to boundary as last resort
+                    try:
+                        target_boundary = optimal_route.get('boundary_edge', optimal_route_edges[-1])
+                        fallback_result = traci.simulation.findRoute(current_edge, target_boundary)
+                        if fallback_result and fallback_result.edges:
+                            final_route = list(fallback_result.edges)
+                        else:
+                            return False
+                    except Exception:
+                        return False
+                    
+            else:
+                # Vehicle is on or near optimal route, ensure route starts with current edge
+                if closest_edge_index == 0 and optimal_route_edges[0] == current_edge:
+                    final_route = optimal_route_edges
+                else:
+                    # Build route from current edge to remaining optimal route
+                    remaining_route = optimal_route_edges[closest_edge_index:]
+                    if remaining_route and remaining_route[0] != current_edge:
+                        # Need to connect current edge to remaining route
+                        try:
+                            connection_result = traci.simulation.findRoute(current_edge, remaining_route[0])
+                            if connection_result and connection_result.edges:
+                                connection_route = list(connection_result.edges)
+                                if connection_route[-1] == remaining_route[0]:
+                                    final_route = connection_route + remaining_route[1:]
+                                else:
+                                    final_route = connection_route + remaining_route
+                            else:
+                                final_route = [current_edge] + remaining_route
+                        except Exception:
+                            final_route = [current_edge] + remaining_route
+                    else:
+                        final_route = remaining_route
+            
+            # Final validation: ensure route starts with current edge
+            if final_route and final_route[0] != current_edge:
+                self.logger.log_warning(f"OPTIMAL_ROUTE_APPLY: Final route doesn't start with current edge {current_edge}, prepending it")
+                final_route = [current_edge] + final_route
+            
+            # Apply the final route
+            try:
+                if not final_route:
+                    self.logger.log_warning(f"OPTIMAL_ROUTE_APPLY: Empty final route for {vehicle_id}")
+                    return False
+                    
+                self.logger.log_info(f"OPTIMAL_ROUTE_APPLY: Setting route for {vehicle_id}: {final_route[:3]}...{final_route[-1]} ({len(final_route)} edges)")
+                traci.vehicle.setRoute(vehicle_id, final_route)
+                
+                # Update tracking
+                self.vehicle_routes[vehicle_id] = final_route
+                self.vehicle_targets[vehicle_id] = optimal_route.get('boundary_edge', final_route[-1])
+                self.vehicle_last_update[vehicle_id] = current_time
+                
+                # Update planned route usage
+                for edge in final_route:
+                    if edge in self.region_edges:
+                        self.planned_routes[edge] += 1
+                
+                self.logger.log_info(f"OPTIMAL_ROUTE_APPLIED: {vehicle_id} transitioned to optimal route "
+                                   f"({len(final_route)} edges to {optimal_route.get('boundary_edge', 'destination')})")
+                
+                return True
+                
+            except Exception as apply_error:
+                self.logger.log_error(f"OPTIMAL_ROUTE_APPLY: Failed to set route for {vehicle_id}: {apply_error}")
+                return False
+            
+        except Exception as e:
+            self.logger.log_error(f"OPTIMAL_ROUTE_APPLY: Critical error for {vehicle_id}: {e}")
+            return False
+    
+    def _find_closest_edge_on_route(self, current_edge: str, route_edges: List[str], current_position: Tuple[float, float]) -> int:
+        """
+        Find the index of the closest edge on the optimal route to the vehicle's current position.
+        
+        Returns:
+            Index of closest edge in route, or -1 if not found
+        """
+        try:
+            # Check if current edge is directly in the route
+            if current_edge in route_edges:
+                return route_edges.index(current_edge)
+            
+            # Check edges near current position using distance heuristic
+            min_distance = float('inf')
+            closest_index = -1
+            
+            for i, edge in enumerate(route_edges):
+                try:
+                    # Get edge geometry approximation
+                    edge_start = traci.junction.getPosition(traci.edge.getFromJunction(edge))
+                    edge_end = traci.junction.getPosition(traci.edge.getToJunction(edge))
+                    
+                    # Calculate approximate distance to edge
+                    edge_center = ((edge_start[0] + edge_end[0]) / 2, (edge_start[1] + edge_end[1]) / 2)
+                    distance = ((current_position[0] - edge_center[0]) ** 2 + 
+                               (current_position[1] - edge_center[1]) ** 2) ** 0.5
+                    
+                    if distance < min_distance:
+                        min_distance = distance
+                        closest_index = i
+                        
+                except Exception:
+                    continue
+            
+            # If closest edge is found and reasonably close (< 500m), use it
+            if closest_index != -1 and min_distance < 500:
+                return closest_index
+            else:
+                return -1
+                
+        except Exception as e:
+            self.logger.log_warning(f"CLOSEST_EDGE_SEARCH: Error finding closest edge: {e}")
+            return -1
+    
+    def _get_vehicle_start_edge_from_data(self, vehicle_id: str) -> Optional[str]:
+        """Get vehicle's start edge from route data or cache for pre-planning."""
+        try:
+            # Check route data from parent environment
+            if hasattr(self, 'parent_env') and hasattr(self.parent_env, 'route_data'):
+                for trip_data in self.parent_env.route_data:
+                    if len(trip_data) >= 4 and trip_data[0] == vehicle_id:
+                        start_edge = trip_data[1]  # start_edge
+                        self.logger.log_info(f"GET_VEHICLE_START_EDGE: Found {vehicle_id} start_edge={start_edge} from route_data")
+                        return start_edge
+            
+            # Fallback: check upcoming vehicle cache if available  
+            if hasattr(self, 'parent_env') and hasattr(self.parent_env, 'upcoming_vehicle_cache'):
+                if vehicle_id in self.parent_env.upcoming_vehicle_cache:
+                    cache_data = self.parent_env.upcoming_vehicle_cache[vehicle_id]
+                    if 'start_edge' in cache_data:
+                        start_edge = cache_data['start_edge']
+                        self.logger.log_info(f"GET_VEHICLE_START_EDGE: Found {vehicle_id} start_edge={start_edge} from cache")
+                        return start_edge
+            
+            self.logger.log_warning(f"GET_VEHICLE_START_EDGE: Could not find start_edge for {vehicle_id}")
+            return None
+        except Exception as e:
+            self.logger.log_error(f"GET_VEHICLE_START_EDGE: Error for {vehicle_id}: {e}")
+            return None

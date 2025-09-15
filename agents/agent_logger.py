@@ -40,6 +40,7 @@ class LLMCallLog:
     success: bool
     decision: str
     context_length: int
+    input_context: str = ""
     error: Optional[str] = None
 
 
@@ -221,7 +222,8 @@ class AgentLogger:
                 f.write(json.dumps(log_entry) + '\n')
     
     def log_llm_call_start(self, agent_type: str, agent_id: str, context_length: int, 
-                          task_type: str = "decision", input_preview: str = "") -> str:
+                          task_type: str = "decision", input_preview: str = "", 
+                          input_context: str = "") -> str:
         """Log the start of an LLM call and return call ID with enhanced tracking."""
         call_id = f"{agent_type}_{agent_id}_{int(time.time() * 1000)}"  # Use milliseconds for uniqueness
         start_time = time.time()
@@ -240,13 +242,17 @@ class AgentLogger:
         if not hasattr(self, '_active_call_metadata'):
             self._active_call_metadata = {}
         
+        # Use input_context if provided, otherwise fall back to input_preview
+        full_context = input_context if input_context else input_preview
+        
         self._active_call_metadata[call_id] = {
             'agent_type': agent_type,
             'agent_id': agent_id,
             'start_time': start_time,
             'task_type': task_type,
             'input_length': context_length,
-            'input_preview': input_preview[:500]  # Store first 500 chars
+            'input_preview': input_preview[:500],  # Store first 500 chars for preview
+            'input_context': full_context  # Store complete context
         }
         
         return call_id
@@ -270,6 +276,7 @@ class AgentLogger:
         # Get additional metadata
         task_type = call_metadata.get('task_type', 'decision')
         input_preview = call_metadata.get('input_preview', '')
+        input_context = call_metadata.get('input_context', '')
         
         # Console output for detailed tracking
         status_text = "SUCCESS" if success else "FAILED"
@@ -299,6 +306,7 @@ class AgentLogger:
             success=success,
             decision=decision,
             context_length=context_length,
+            input_context=input_context,
             error=error
         )
         
@@ -321,6 +329,7 @@ class AgentLogger:
                 "decision_length": len(decision) if decision else 0,
                 "context_length": context_length,
                 "input_preview": input_preview[:200] if input_preview else "",
+                "input_context": input_context,
                 "error": error,
                 "performance_category": self._categorize_performance(duration_ms)
             }

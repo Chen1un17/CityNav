@@ -719,11 +719,12 @@ def get_global_concurrency_manager() -> ConcurrencyManager:
     """Get or create global concurrency manager"""
     global _global_concurrency_manager
     if _global_concurrency_manager is None:
+        # 收紧并发以降低 EngineCore Router 压力（配合 vLLM chat 串行锁）
         _global_concurrency_manager = ConcurrencyManager(
-            max_concurrent_requests=6,  # Conservative limit based on vLLM max_num_seqs
-            max_queue_size=50,
+            max_concurrent_requests=8,
+            max_queue_size=100,
             request_timeout=45.0,
-            rate_limit_per_second=8.0,  # Conservative rate limit
+            rate_limit_per_second=8.0,
             adaptive_scaling=True
         )
     return _global_concurrency_manager

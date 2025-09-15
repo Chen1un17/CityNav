@@ -169,9 +169,22 @@ class LLM(object):
         self.connection_pool = None
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="llm_worker")
         self._shutdown = False
+        # 串行化 vLLM chat 调用，避免 EngineCore 路由器协议错乱
+        self._vllm_call_lock = RLock()
         self.gpu_memory_utilization = gpu_memory_utilization
-        # GPU内存管理 - 添加推理计数器
+        # GPU内存管理 - 计数器（累计计数，非并发态）
         self.current_inference_count = 0
+        # 并发安全：活动中的推理请求数量（用于热重载等待）
+        # 注意：与上面的累计计数不同，这个计数在每次推理开始/结束时增减
+        self.active_inference_count = 0
+        # 模型热重载同步：在重载期间阻塞新的推理，等待在途推理完成
+        try:
+            import threading  # 确保可用
+            self._reload_condition = threading.Condition()
+            self._reload_in_progress = False
+        except Exception:
+            self._reload_condition = None
+            self._reload_in_progress = False
         self.tokenizer, self.model, self.generation_kwargs, self.use_api = self.initialize_llm(llm_path, top_k, top_p, temperature, max_tokens)
         
         # Handle different model path formats
@@ -205,6 +218,7 @@ class LLM(object):
         
         # Multi-agent prompt templates
         self.regional_coordination_template = None
+        self.global_macro_guidance_template = None
         self.macro_planning_template = None
         self.inter_agent_communication_template = None
         self.hybrid_decision_template = None
@@ -246,7 +260,7 @@ class LLM(object):
                 "block_size": 16  # 减小block size节约内存
             }
             
-            print(f"调整序列长度: {max_tokens} -> {effective_max_len} (节省KV cache内存)")
+            print(f"调整序列长度: {max_tokens} -> {effective_max_len} (A800优化)")
             
             # 使用CUDA_VISIBLE_DEVICES环境变量来指定GPU
             if self.gpu_ids is not None:
@@ -255,25 +269,25 @@ class LLM(object):
                         # 单GPU模式，设置CUDA_VISIBLE_DEVICES
                         os.environ['CUDA_VISIBLE_DEVICES'] = str(self.gpu_ids[0])
                         vllm_kwargs["tensor_parallel_size"] = 1
-                        print(f"LLM initialization: Using GPU {self.gpu_ids[0]}")
+                        print(f"A800配置: 使用GPU {self.gpu_ids[0]} (单卡模式)")
                     else:
                         # 多GPU模式，使用tensor parallel
                         gpu_ids_str = ','.join(map(str, self.gpu_ids))
                         os.environ['CUDA_VISIBLE_DEVICES'] = gpu_ids_str
                         vllm_kwargs["tensor_parallel_size"] = len(self.gpu_ids)
-                        print(f"LLM initialization: Using GPUs {gpu_ids_str} with tensor parallel")
+                        print(f"A800配置: 使用GPUs {gpu_ids_str} (tensor parallel)")
                 else:
                     # 单个GPU ID
                     os.environ['CUDA_VISIBLE_DEVICES'] = str(self.gpu_ids)
                     vllm_kwargs["tensor_parallel_size"] = 1
-                    print(f"LLM initialization: Using GPU {self.gpu_ids}")
+                    print(f"A800配置: 使用GPU {self.gpu_ids}")
             else:
                 # 使用默认GPU
                 vllm_kwargs["tensor_parallel_size"] = 1
-                print("LLM initialization: Using default GPU")
+                print("A800配置: 使用默认GPU")
             
-            print(f"vLLM配置: {vllm_kwargs}")
-            print("正在初始化vLLM引擎...这可能需要几分钟")
+            print(f"A800优化vLLM配置: {vllm_kwargs}")
+            print("正在初始化vLLM引擎(A800优化)...这可能需要几分钟")
             
             try:
                 llm_model = vllm.LLM(**vllm_kwargs)
@@ -325,7 +339,7 @@ class LLM(object):
                 "block_size": 16  # 减小block size节约内存
             }
             
-            print(f"调整序列长度: {max_tokens} -> {effective_max_len} (节省KV cache内存)")
+            print(f"调整序列长度: {max_tokens} -> {effective_max_len} (A800优化)")
             
             # 使用CUDA_VISIBLE_DEVICES环境变量来指定GPU
             if self.gpu_ids is not None:
@@ -334,25 +348,25 @@ class LLM(object):
                         # 单GPU模式，设置CUDA_VISIBLE_DEVICES
                         os.environ['CUDA_VISIBLE_DEVICES'] = str(self.gpu_ids[0])
                         vllm_kwargs["tensor_parallel_size"] = 1
-                        print(f"LLM initialization: Using GPU {self.gpu_ids[0]}")
+                        print(f"A800配置: 使用GPU {self.gpu_ids[0]} (单卡模式)")
                     else:
                         # 多GPU模式，使用tensor parallel
                         gpu_ids_str = ','.join(map(str, self.gpu_ids))
                         os.environ['CUDA_VISIBLE_DEVICES'] = gpu_ids_str
                         vllm_kwargs["tensor_parallel_size"] = len(self.gpu_ids)
-                        print(f"LLM initialization: Using GPUs {gpu_ids_str} with tensor parallel")
+                        print(f"A800配置: 使用GPUs {gpu_ids_str} (tensor parallel)")
                 else:
                     # 单个GPU ID
                     os.environ['CUDA_VISIBLE_DEVICES'] = str(self.gpu_ids)
                     vllm_kwargs["tensor_parallel_size"] = 1
-                    print(f"LLM initialization: Using GPU {self.gpu_ids}")
+                    print(f"A800配置: 使用GPU {self.gpu_ids}")
             else:
                 # 使用默认GPU
                 vllm_kwargs["tensor_parallel_size"] = 1
-                print("LLM initialization: Using default GPU")
+                print("A800配置: 使用默认GPU")
             
-            print(f"vLLM配置: {vllm_kwargs}")
-            print("正在初始化vLLM引擎...这可能需要几分钟")
+            print(f"A800优化vLLM配置: {vllm_kwargs}")
+            print("正在初始化vLLM引擎(A800优化)...这可能需要几分钟")
             
             try:
                 llm_model = vllm.LLM(**vllm_kwargs)
@@ -435,6 +449,90 @@ class LLM(object):
         
         return memory_text
     
+    def _build_sampling_params(self):
+        """确保返回合法的 vLLM SamplingParams，修正类型与可选项，避免协议不一致。
+        - 统一显式字段：top_k(int), top_p(float), temperature(float), max_tokens(int)
+        - 避免潜在的 stop/stop_token_ids 单值类型引起的协议报文不一致
+        """
+        try:
+            import vllm as _vllm
+        except Exception:
+            return self.generation_kwargs
+        # 已经是 SamplingParams
+        if isinstance(self.generation_kwargs, getattr(_vllm, 'SamplingParams', object)):
+            return self.generation_kwargs
+        # 字典或可映射对象时，提取并规范类型
+        params_dict = {}
+        try:
+            params_dict = dict(self.generation_kwargs)
+        except Exception:
+            # 回退：按属性访问
+            for key in ("top_k", "top_p", "temperature", "max_tokens", "stop", "stop_token_ids"):
+                if hasattr(self.generation_kwargs, key):
+                    params_dict[key] = getattr(self.generation_kwargs, key)
+        top_k = int(params_dict.get("top_k", 50) or 50)
+        top_p = float(params_dict.get("top_p", 1.0) or 1.0)
+        temperature = float(params_dict.get("temperature", 0.1) or 0.1)
+        max_tokens = int(params_dict.get("max_tokens", 512) or 512)
+        # 严格规范潜在问题字段
+        stop = params_dict.get("stop", None)
+        stop_token_ids = params_dict.get("stop_token_ids", None)
+        if isinstance(stop, (str, int)):
+            # 单值一律转为列表[str]
+            stop = [str(stop)] if isinstance(stop, (str, int)) else None
+        elif stop is not None:
+            # 其他类型统一转字符串列表
+            try:
+                stop = [str(x) for x in stop]
+            except Exception:
+                stop = None
+        if isinstance(stop_token_ids, int):
+            stop_token_ids = [int(stop_token_ids)]
+        elif stop_token_ids is not None:
+            try:
+                stop_token_ids = [int(x) for x in stop_token_ids]
+            except Exception:
+                stop_token_ids = None
+        try:
+            return _vllm.SamplingParams(
+                top_k=top_k,
+                top_p=top_p,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stop=stop,
+                stop_token_ids=stop_token_ids,
+                n=1,
+                best_of=1,
+            )
+        except Exception:
+            # 最后的回退：直接返回原对象
+            return self.generation_kwargs
+
+    def _sanitize_messages(self, messages):
+        """将 chat messages 规范为 vLLM 期望的 [[{role, content}, ...], ...]，并保证 content 为字符串。
+        任何非字符串 content 将以 JSON 序列化为字符串，None -> 空串。
+        """
+        try:
+            sanitized = []
+            for conv in messages:
+                new_conv = []
+                for msg in conv:
+                    role = str(msg.get("role", "user"))
+                    content = msg.get("content", "")
+                    if content is None:
+                        content = ""
+                    elif not isinstance(content, str):
+                        try:
+                            content = json.dumps(content, ensure_ascii=False)
+                        except Exception:
+                            content = str(content)
+                    new_conv.append({"role": role, "content": content})
+                sanitized.append(new_conv)
+            return sanitized
+        except Exception:
+            # 失败则原样返回
+            return messages
+
     def _validate_and_clean_decision(self, decision_dict, default_answer="1"):
         """
         Validate and clean LLM decision response to ensure required fields are present and valid.
@@ -562,7 +660,30 @@ class LLM(object):
     
     def _internal_inference(self, query, system_prompt=None, request_id=None):
         """Internal inference method with original logic but enhanced error handling"""
-        # GPU内存管理 - 增加推理计数并定期清理
+        # 在热重载期间阻塞新推理，并登记活动推理计数
+        def _enter_inference():
+            if getattr(self, '_reload_condition', None) is None:
+                self.active_inference_count = max(0, getattr(self, 'active_inference_count', 0)) + 1
+                return
+            with self._reload_condition:
+                while getattr(self, '_reload_in_progress', False):
+                    self._reload_condition.wait(timeout=0.1)
+                self.active_inference_count += 1
+        def _exit_inference():
+            try:
+                if getattr(self, '_reload_condition', None) is None:
+                    self.active_inference_count = max(0, getattr(self, 'active_inference_count', 1) - 1)
+                    return
+                with self._reload_condition:
+                    self.active_inference_count = max(0, self.active_inference_count - 1)
+                    if self.active_inference_count == 0:
+                        # 通知可能等待的热重载线程
+                        self._reload_condition.notify_all()
+            except Exception:
+                pass
+
+        _enter_inference()
+        # GPU内存管理 - 增加累计计数并定期清理
         self.current_inference_count += 1
         
         message = [
@@ -636,11 +757,15 @@ class LLM(object):
             retry_count = 0
             while retry_count < 2:
                 try:
-                    if self.model is None:
-                        print(f"ERROR: Model is None, cannot perform inference")
+                    # Ensure vLLM engine availability
+                    if not self._ensure_vllm_model_ready():
+                        print(f"ERROR: vLLM engine unavailable after recovery attempts")
                         return '{"answer": "1", "summary": "Model not available"}'
                     
-                    responses_gen = self.model.chat([message], use_tqdm=False, sampling_params=self.generation_kwargs)
+                    # 使用带超时与崩溃恢复的安全调用
+                    # 统一规范消息，避免 content 非字符串
+                    safe_message_list = self._sanitize_messages([message])
+                    responses_gen = self._vllm_chat_with_timeout(safe_message_list, timeout_s=300)
                     
                     # Validate vLLM response structure
                     if not responses_gen or len(responses_gen) == 0:
@@ -690,6 +815,9 @@ class LLM(object):
                         retry_count += 1
                         if retry_count >= 2:
                             return '{"answer": "1", "summary": "LLM inference failed, using fallback"}'
+        
+        # 确保活动推理计数回退
+        _exit_inference()
 
         # Final validation
         if response is None or not response.strip():
@@ -705,8 +833,8 @@ class LLM(object):
         
         all_responses = []
         
-        # Use smaller, controlled batch sizes to prevent vLLM overload
-        optimal_batch_size = min(4, len(queries))  # Reduced batch size for better control
+        # A800优化：更大的批处理大小提高吞吐量
+        optimal_batch_size = 12  # A800可以处理更大的batch size
         
         for batch_start in range(0, len(queries), optimal_batch_size):
             batch_end = min(batch_start + optimal_batch_size, len(queries))
@@ -732,7 +860,9 @@ class LLM(object):
                     batch_responses = self._batch_api_inference(messages)
                 else:
                     # vLLM-based inference with concurrency control
-                    batch_responses = self._batch_vllm_inference(messages)
+                    # 统一规范消息，避免 content 非字符串
+                    safe_messages = self._sanitize_messages(messages)
+                    batch_responses = self._batch_vllm_inference(safe_messages)
                 
                 all_responses.extend(batch_responses)
                 
@@ -761,8 +891,8 @@ class LLM(object):
         responses = [None for _ in range(len(messages))]
         
         if self.connection_pool is not None:
-            # Use enhanced connection pool with strict concurrency
-            max_workers = min(len(messages), 2)  # Further reduced concurrent connections
+            # A800优化：API推理的并发连接数
+            max_workers = min(len(messages), 4)  # A800可以支持更多并发连接
             with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="enhanced_batch") as executor:
                 futures = []
                 
@@ -804,15 +934,29 @@ class LLM(object):
     def _batch_vllm_inference(self, messages):
         """Handle vLLM batch inference with enhanced error checking"""
         try:
+            # 在热重载期间阻塞新批推理
+            entered = False
+            if getattr(self, '_reload_condition', None) is None:
+                self.active_inference_count = max(0, getattr(self, 'active_inference_count', 0)) + 1
+                entered = True
+            else:
+                with self._reload_condition:
+                    while getattr(self, '_reload_in_progress', False):
+                        self._reload_condition.wait(timeout=0.1)
+                    self.active_inference_count += 1
+                    entered = True
+
             with self.concurrency_manager.managed_request(f"{self.agent_id}_vllm_batch") as request_id:
-                if self.model is None:
-                    print(f"ERROR: vLLM model is None for {self.agent_id}")
+                # Ensure vLLM engine availability for batch path
+                if not self._ensure_vllm_model_ready():
+                    print(f"ERROR: vLLM model unavailable for {self.agent_id} (batch) after recovery")
                     return [
                         '{"answer": "1", "summary": "vLLM model unavailable"}'
                         for _ in messages
                     ]
                 
-                responses_gen = self.model.chat(messages, use_tqdm=False, sampling_params=self.generation_kwargs)
+                # 使用带超时与崩溃恢复的安全调用
+                responses_gen = self._vllm_chat_with_timeout(messages, timeout_s=300)
                 
                 # Enhanced validation for batch responses
                 if not responses_gen:
@@ -833,13 +977,241 @@ class LLM(object):
                         responses.append('{"answer": "1", "summary": "vLLM response processing error"}')
                 
                 return responses
-                
         except Exception as e:
             print(f"vLLM batch inference error for {self.agent_id}: {e}")
+            # Try to proactively recover engine for subsequent calls
+            try:
+                self._ensure_vllm_model_ready()
+            except Exception:
+                pass
             return [
                 '{"answer": "1", "summary": "vLLM batch inference failed"}'
                 for _ in messages
             ]
+        finally:
+            # 退出活动推理计数
+            try:
+                if getattr(self, '_reload_condition', None) is None:
+                    self.active_inference_count = max(0, getattr(self, 'active_inference_count', 1) - 1)
+                else:
+                    with self._reload_condition:
+                        self.active_inference_count = max(0, self.active_inference_count - 1)
+                        if self.active_inference_count == 0:
+                            self._reload_condition.notify_all()
+            except Exception:
+                pass
+
+    def _vllm_chat_with_timeout(self, messages, timeout_s=120):
+        """对 self.model.chat 做超时与崩溃恢复包装，避免 EngineCore 挂死或协议错误导致阻塞"""
+        try:
+            import threading
+            from queue import Queue
+        except Exception:
+            # 如果导入失败，回退为直接调用
+            # 统一规范消息与采样参数，避免协议类型不一致，并串行化调用
+            sampling_params = self._build_sampling_params()
+            safe_messages = self._sanitize_messages(messages)
+            with self._vllm_call_lock:
+                return self.model.chat(safe_messages, use_tqdm=False, sampling_params=sampling_params)
+        
+        result_queue = Queue(maxsize=1)
+        
+        def _call_chat():
+            try:
+                sampling_params = self._build_sampling_params()
+                safe_messages = self._sanitize_messages(messages)
+                with self._vllm_call_lock:
+                    res = self.model.chat(safe_messages, use_tqdm=False, sampling_params=sampling_params)
+                result_queue.put((True, res))
+            except Exception as e:
+                result_queue.put((False, e))
+        
+        # 确保模型实例可用，避免 NoneType.chat
+        try:
+            if getattr(self, 'model', None) is None:
+                self._ensure_vllm_model_ready()
+        except Exception:
+            pass
+        if getattr(self, 'model', None) is None:
+            raise RuntimeError("vLLM model is not available")
+
+        t = threading.Thread(target=_call_chat, daemon=True)
+        t.start()
+        
+        try:
+            ok, payload = result_queue.get(timeout=timeout_s)
+        except Exception:
+            # 超时：尝试快速重启引擎并抛出异常让上层提供回退
+            print(f"[ERROR] vLLM chat timeout after {timeout_s}s, restarting engine…")
+            self._restart_vllm_engine_quick()
+            raise TimeoutError(f"vLLM chat timeout after {timeout_s}s")
+        
+        if ok:
+            return payload
+        else:
+            err = payload
+            msg = str(err)
+            # 捕捉 vLLM v1 协议/解码异常与 ZeroMQ Router 异常，触发快速重启
+            if (
+                "EngineCoreRequestType" in msg
+                or "b'\\x00\\x00'" in msg
+                or "ValidationError" in msg
+                or "Expected `array`, got `int`" in msg
+                or "router.cpp:166" in msg
+                or "EngineArgs.__init__()" in msg
+            ):
+                # 引擎通信协议异常：重启以恢复
+                print(f"[ERROR] vLLM EngineCore protocol error detected: {msg}. Restarting engine…")
+                self._restart_vllm_engine_quick()
+            raise err
+
+    def _restart_vllm_engine_quick(self):
+        """快速重启本地 vLLM 引擎；保守参数，尽量维持当前设备。失败则保持原状。"""
+        try:
+            import torch
+            import os
+            # 优雅关闭旧引擎
+            try:
+                if getattr(self, 'model', None) is not None and hasattr(self.model, 'shutdown'):
+                    self.model.shutdown()
+            except Exception as _sd:
+                print(f"[WARN] vLLM.shutdown() failed: {_sd}")
+            try:
+                if getattr(self, 'model', None) is not None:
+                    del self.model
+            except Exception:
+                pass
+            self.model = None
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+            except Exception:
+                pass
+            
+            # 选择设备
+            device_id = None
+            try:
+                if isinstance(getattr(self, 'gpu_ids', None), (list, tuple)) and len(self.gpu_ids) > 0:
+                    device_id = int(self.gpu_ids[0])
+                elif isinstance(getattr(self, 'gpu_ids', None), int):
+                    device_id = int(self.gpu_ids)
+            except Exception:
+                device_id = None
+            
+            vllm_kwargs = {
+                "model": getattr(self, 'llm_name', None) or getattr(self, 'model_path', None),
+                "gpu_memory_utilization": getattr(self, 'gpu_memory_utilization', 0.85),
+                "tensor_parallel_size": getattr(self, 'tensor_parallel_size', 1),
+                "trust_remote_code": True,
+            }
+            if device_id is not None:
+                # 确保可见
+                try:
+                    curr = os.environ.get('CUDA_VISIBLE_DEVICES')
+                    if curr:
+                        curr_set = set([x.strip() for x in curr.split(',') if x.strip() != ''])
+                        if str(device_id) not in curr_set:
+                            os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(sorted(curr_set | {str(device_id)}, key=lambda x: int(x)))
+                    else:
+                        os.environ['CUDA_VISIBLE_DEVICES'] = str(device_id)
+                except Exception:
+                    pass
+                # vLLM EngineArgs 不支持 device 参数；仅通过 CUDA_VISIBLE_DEVICES 约束
+            
+            import vllm
+            new_model = vllm.LLM(**vllm_kwargs)
+            self.model = new_model
+            print(f"[INFO] vLLM engine restarted on device {vllm_kwargs.get('device', 'auto')}")
+        except Exception as e:
+            print(f"[WARN] Failed to restart vLLM engine: {e}")
+    
+    def _ensure_vllm_model_ready(self) -> bool:
+        """确保本地 vLLM 引擎可用；若丢失则尝试快速重启与完整重建。
+        返回 True 表示可用，False 表示仍不可用（上层应走回退）。"""
+        # API 模式无需保证本地引擎
+        if getattr(self, 'use_api', False):
+            return True
+        # 已经可用
+        if getattr(self, 'model', None) is not None:
+            return True
+        # 通过条件变量串行化恢复流程，避免并发重启
+        gated = False
+        try:
+            if getattr(self, '_reload_condition', None) is not None:
+                with self._reload_condition:
+                    if getattr(self, '_reload_in_progress', False):
+                        # 其他线程正在重启；等待一小段时间
+                        self._reload_condition.wait(timeout=2.0)
+                        return getattr(self, 'model', None) is not None
+                    self._reload_in_progress = True
+                    gated = True
+        except Exception:
+            gated = False
+        try:
+            # 尝试快速重启
+            self._restart_vllm_engine_quick()
+            if getattr(self, 'model', None) is not None:
+                # 确保采样参数对象有效
+                try:
+                    import vllm as _vllm
+                    if not hasattr(self.generation_kwargs, 'temperature'):
+                        # 兼容 dict -> SamplingParams
+                        self.generation_kwargs = _vllm.SamplingParams(**dict(self.generation_kwargs))
+                except Exception:
+                    pass
+                return True
+            # 快速重启失败，尝试完整重建
+            try:
+                import vllm as _vllm
+                import os as _os
+                vllm_kwargs = {
+                    "model": getattr(self, 'llm_name', None) or getattr(self, 'model_path', None),
+                    "gpu_memory_utilization": getattr(self, 'gpu_memory_utilization', 0.85),
+                    "tensor_parallel_size": getattr(self, 'tensor_parallel_size', 1),
+                    "trust_remote_code": True,
+                }
+                # 固定设备（若配置了 gpu_ids）
+                device_id = None
+                try:
+                    if isinstance(getattr(self, 'gpu_ids', None), (list, tuple)) and len(self.gpu_ids) > 0:
+                        device_id = int(self.gpu_ids[0])
+                    elif isinstance(getattr(self, 'gpu_ids', None), int):
+                        device_id = int(self.gpu_ids)
+                except Exception:
+                    device_id = None
+                if device_id is not None:
+                    try:
+                        curr = _os.environ.get('CUDA_VISIBLE_DEVICES')
+                        if curr:
+                            curr_set = set([x.strip() for x in curr.split(',') if x.strip() != ''])
+                            if str(device_id) not in curr_set:
+                                _os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(sorted(curr_set | {str(device_id)}, key=lambda x: int(x)))
+                        else:
+                            _os.environ['CUDA_VISIBLE_DEVICES'] = str(device_id)
+                    except Exception:
+                        pass
+                    # vLLM EngineArgs 不支持 device 参数；仅通过 CUDA_VISIBLE_DEVICES 约束
+                new_model = _vllm.LLM(**vllm_kwargs)
+                self.model = new_model
+                try:
+                    if not hasattr(self.generation_kwargs, 'temperature'):
+                        self.generation_kwargs = _vllm.SamplingParams(**dict(self.generation_kwargs))
+                except Exception:
+                    pass
+                print(f"[INFO] vLLM engine recreated on device {vllm_kwargs.get('device', 'auto')}")
+                return True
+            except Exception as _e:
+                print(f"[WARN] Failed to recreate vLLM engine: {_e}")
+                return False
+        finally:
+            if gated:
+                try:
+                    with self._reload_condition:
+                        self._reload_in_progress = False
+                        self._reload_condition.notify_all()
+                except Exception:
+                    pass
     
     def _enhanced_threading_inference(self, llm_name, message, response_list, m_id):
         """Enhanced threading inference with better error handling"""
@@ -1167,6 +1539,28 @@ class LLM(object):
             "data_analysis": sample_info[i][1] if isinstance(sample_info[i], (list, tuple)) and len(sample_info[i]) == 2 else "N/A"}
             for i in range(len(queries))
         ]
+
+        # Fast path: single-query uses single inference to avoid vLLM batch path
+        if len(queries) == 1:
+            idx, single_query = queries[0]
+            res = self.inference(single_query)
+            try:
+                possible_answer = regex.findall(markdown_code_pattern, res)
+                if len(possible_answer) <= 0:
+                    decision = json.loads(res)
+                else:
+                    decision = json.loads(possible_answer[-1])
+            except Exception:
+                decision = {}
+            # Validate and clean
+            decision = self._validate_and_clean_decision(decision, default_answer="1")
+            if decision and decision.get("answer") and decision.get("summary"):
+                decision.update({
+                    "data_text": sample_info[idx][0] if isinstance(sample_info[idx], (list, tuple)) and len(sample_info[idx]) == 2 else sample_info[idx],
+                    "data_analysis": sample_info[idx][1] if isinstance(sample_info[idx], (list, tuple)) and len(sample_info[idx]) == 2 else "N/A"
+                })
+                decision_making_results[idx].update(decision)
+            return decision_making_results
         while retry_count < 3:
             retry_queries = []
             failed_responses = list()
@@ -1408,6 +1802,12 @@ class LLM(object):
             # Macro planning template
             self.macro_planning_template = load_json("./prompts/macro_planning_template.json")["template"]
             
+            # Global macro guidance template
+            try:
+                self.global_macro_guidance_template = load_json("./prompts/global_macro_guidance_template.json")["template"]
+            except Exception:
+                self.global_macro_guidance_template = self.decision_making_template
+            
             # Inter-agent communication template
             self.inter_agent_communication_template = load_json("./prompts/inter_agent_communication_template.json")["template"]
             
@@ -1419,6 +1819,7 @@ class LLM(object):
             # Use fallback templates
             self.regional_coordination_template = self.decision_making_template
             self.macro_planning_template = self.decision_making_template
+            self.global_macro_guidance_template = self.decision_making_template
             self.inter_agent_communication_template = self.decision_making_template
             self.hybrid_decision_template = self.decision_making_template
 
@@ -1536,6 +1937,75 @@ class LLM(object):
                 "load_balancing": "Error in processing",
                 "conflict_resolution": "Error in planning",
                 "regional_coordination_messages": {}
+            }
+
+    def global_macro_guidance(self, global_state, regional_report, hotspots, flow_targets):
+        """Generate global macro guidance for this timestamp.
+        Returns a strict JSON dict with keys: priority_goals, avoid_regions, avoid_edges, reroute_suggestions, message, ttl
+        """
+        try:
+            query = copy.copy(self.overall_template)
+            guidance_template = copy.copy(self.global_macro_guidance_template)
+            guidance_template = guidance_template.replace("<global_state>", self._compress_data(global_state))
+            guidance_template = guidance_template.replace("<regional_report>", self._compress_data(regional_report))
+            guidance_template = guidance_template.replace("<hotspots>", self._compress_data(hotspots))
+            guidance_template = guidance_template.replace("<flow_targets>", self._compress_data(flow_targets))
+            query = query.replace("<step_instruction>", guidance_template)
+            query = query.replace("<data_text>", "Global macro guidance for current timestamp")
+
+            # Add memory context
+            memory_text = ""
+            for exp in self.memory:
+                memory_text += f"- {exp}\n"
+            memory_text = memory_text[:-1] if memory_text else "N/A"
+            query = query.replace("<experience>", memory_text)
+
+            response = self.inference(query)
+            try:
+                possible_answer = regex.findall(markdown_code_pattern, response)
+                if len(possible_answer) > 0:
+                    decision_result = json.loads(possible_answer[-1])
+                else:
+                    decision_result = json.loads(response)
+            except (json.JSONDecodeError, IndexError, Exception):
+                # Fallback minimal structure
+                decision_result = {
+                    "priority_goals": ["avoid congestion"],
+                    "avoid_regions": [],
+                    "avoid_edges": [],
+                    "reroute_suggestions": [],
+                    "message": "Use caution; avoid severe bottlenecks",
+                    "ttl": 60
+                }
+            # Normalize types
+            try:
+                decision_result["avoid_regions"] = [int(r) for r in decision_result.get("avoid_regions", []) if str(r).strip() != ""]
+            except Exception:
+                decision_result["avoid_regions"] = []
+            try:
+                decision_result["avoid_edges"] = [str(e) for e in decision_result.get("avoid_edges", []) if str(e).strip() != ""]
+            except Exception:
+                decision_result["avoid_edges"] = []
+            if not isinstance(decision_result.get("priority_goals", []), list):
+                decision_result["priority_goals"] = [str(decision_result.get("priority_goals", "avoid congestion"))]
+            if not isinstance(decision_result.get("reroute_suggestions", []), list):
+                decision_result["reroute_suggestions"] = [str(decision_result.get("reroute_suggestions", ""))]
+            try:
+                decision_result["ttl"] = int(decision_result.get("ttl", 60))
+            except Exception:
+                decision_result["ttl"] = 60
+            if not isinstance(decision_result.get("message", ""), str):
+                decision_result["message"] = "Global macro guidance"
+            return decision_result
+        except Exception as e:
+            print(f"Global macro guidance failed: {e}")
+            return {
+                "priority_goals": ["avoid congestion"],
+                "avoid_regions": [],
+                "avoid_edges": [],
+                "reroute_suggestions": [],
+                "message": f"Error: {e}",
+                "ttl": 60
             }
 
     def inter_agent_communication(self, communication_context, sender_info, recipient_info, 
@@ -1766,6 +2236,8 @@ class LocalLLMManager:
         self.task_info = task_info
         self.traffic_llm = None
         self.regional_llm = None
+        self.traffic_llm_raw = None
+        self.regional_llm_raw = None
         
         print(f"\n=== 初始化本地LLM管理器 ===")
         print(f"模型路径: {model_path}")
@@ -1871,6 +2343,9 @@ class LocalLLMManager:
         os.environ["CUDA_LAUNCH_BLOCKING"] = "0"  # 正常模式下设为0，调试时可设为1
         os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"  # 使用FlashAttention
         os.environ["TORCH_CUDA_ARCH_LIST"] = "8.6"  # 设置CUDA架构避免编译问题
+        # 默认将热重载暂存放在 GPU 2,3（可见性由下游再校验，不可见则回退CPU）
+        os.environ.setdefault("LLM_HOT_RELOAD_STAGING", "gpu")
+        os.environ.setdefault("LLM_HOT_RELOAD_GPUS", "2,3")
         print("[INFO] 已设置CUDA内存管理和attention backend环境变量")
         
         # Initialize global concurrency manager
@@ -1895,7 +2370,8 @@ class LocalLLMManager:
             agent_id="traffic_llm"  # Add agent identifier
         )
         
-        # Wrap with concurrency control
+        # Store both raw and wrapped instances
+        self.traffic_llm_raw = traffic_llm_raw
         self.traffic_llm = create_enhanced_llm_wrapper(traffic_llm_raw, "traffic_llm", concurrency_manager)
         print("[SUCCESS] Traffic LLM 初始化完成（已集成并发控制）")
         
@@ -1917,19 +2393,20 @@ class LocalLLMManager:
             agent_id="regional_llm"  # Add agent identifier
         )
         
-        # Wrap with concurrency control
+        # Store both raw and wrapped instances
+        self.regional_llm_raw = regional_llm_raw
         self.regional_llm = create_enhanced_llm_wrapper(regional_llm_raw, "regional_llm", concurrency_manager)
         print("[SUCCESS] Regional LLM 初始化完成（已集成并发控制）")
         
-        print("\n=== 所有LLM实例初始化完成（增强版） ===")
-        print("- Traffic LLM: GPU 0 + 并发控制")
-        print("- Regional LLM: GPU 1 + 并发控制")
-        print("- GPU 2-3: 用于训练")
+        print("\n=== A800双GPU LLM实例初始化完成 ===")
+        print("- Traffic LLM: A800 GPU 0 (95%内存利用率)")
+        print("- Regional LLM: A800 GPU 1 (95%内存利用率)")
+        print("- 优化特性: FlashInfer + 分块预填充 + 前缀缓存")
+        print("- 批处理大小: 8 (针对A800优化)")
         print(f"- 并发管理器: 最大{concurrency_manager.max_concurrent_requests}并发")
         
-        # 设置训练使用的GPU
-        os.environ["TRAINING_CUDA_VISIBLE_DEVICES"] = "2,3"
-        print("[INFO] 训练将使用GPU 2,3")
+        # 训练使用的GPU应在主进程设置，这里不再覆盖，避免与推理配置混淆
+        print(f"[INFO] 推理GPU固定: Traffic->GPU0, Regional->GPU1; 训练GPU由主进程环境变量控制")
         
         # Print concurrency manager status
         concurrency_manager.print_status()
@@ -1947,6 +2424,18 @@ class LocalLLMManager:
         if self.regional_llm is None:
             raise ValueError("Regional LLM 尚未初始化，请先调用 initialize_llms()")
         return self.regional_llm
+    
+    def get_traffic_llm_raw(self):
+        """获取Traffic LLM原始实例（无并发控制）"""
+        if self.traffic_llm_raw is None:
+            raise ValueError("Traffic LLM 原始实例尚未初始化，请先调用 initialize_llms()")
+        return self.traffic_llm_raw
+    
+    def get_regional_llm_raw(self):
+        """获取Regional LLM原始实例（无并发控制）"""
+        if self.regional_llm_raw is None:
+            raise ValueError("Regional LLM 原始实例尚未初始化，请先调用 initialize_llms()")
+        return self.regional_llm_raw
     
     def get_gpu_status(self):
         """获取GPU使用状态（修复了可见性问题）"""
@@ -2128,6 +2617,59 @@ class LocalLLMManager:
                     print(f"错误: {llm_type} LLM使用API模式，不支持LoRA适配器")
                     return False
                 
+                # SAFETY: 避免在推理进行中重载；等待在途请求完成并阻塞新请求
+                try:
+                    if hasattr(target_llm, '_reload_condition') and target_llm._reload_condition is not None:
+                        import time as _time
+                        with target_llm._reload_condition:
+                            # 开始重载，阻塞新推理进入
+                            target_llm._reload_in_progress = True
+                            start_ts = _time.time()
+                            timeout_s = 120.0
+                            # 额外等待并发管理器中该 Agent 的在途请求清空
+                            while True:
+                                remaining = timeout_s - (_time.time() - start_ts)
+                                if remaining <= 0:
+                                    print(f"[WARN] 等待在途推理清空超时，放弃本次直接加载，加入队列")
+                                    target_llm._reload_in_progress = False
+                                    target_llm._reload_condition.notify_all()
+                                    try:
+                                        self.queue_adapter_update(llm_type, adapter_path)
+                                    except Exception:
+                                        pass
+                                    return False
+                                # 计算该 LLM 的在途数量：本地计数 + 并发管理器活跃请求
+                                local_active = int(getattr(target_llm, 'active_inference_count', 0) or 0)
+                                cm_active = 0
+                                try:
+                                    cm = getattr(target_llm, 'concurrency_manager', None)
+                                    agent_id = str(getattr(target_llm, 'agent_id', llm_type))
+                                    if cm is not None and hasattr(cm, 'active_requests'):
+                                        cm_active = sum(1 for _rid in list(cm.active_requests) if str(_rid).startswith(agent_id))
+                                except Exception:
+                                    cm_active = 0
+                                if local_active <= 0 and cm_active <= 0:
+                                    break
+                                target_llm._reload_condition.wait(timeout=0.5)
+                    else:
+                        # 条件变量不可用时，保守起见进入队列
+                        print(f"[INFO] {llm_type} 缺少同步条件，改为队列等待应用适配器")
+                        try:
+                            self.queue_adapter_update(llm_type, adapter_path)
+                        except Exception:
+                            pass
+                        return False
+                except Exception as _wait_err:
+                    print(f"[WARN] 等待在途推理清空时异常: {_wait_err}")
+                    try:
+                        if hasattr(target_llm, '_reload_condition') and target_llm._reload_condition is not None:
+                            with target_llm._reload_condition:
+                                target_llm._reload_in_progress = False
+                                target_llm._reload_condition.notify_all()
+                    except Exception:
+                        pass
+                    return False
+                
                 # Attempt to load adapter using PEFT
                 success = self._load_adapter_to_vllm_model(target_llm, adapter_path, llm_type)
                 
@@ -2142,6 +2684,10 @@ class LocalLLMManager:
                     return True
                 else:
                     print(f"✗ {llm_type} LoRA适配器加载失败")
+                    # Strategy 3: Queue adapter for next model initialization (last resort)
+                    print(f"将适配器加入待处理队列...")
+                    self.lora_adapters[llm_type]['pending'] = adapter_path
+                    print(f"⚠ 适配器已排队，将在下次模型初始化时应用")
                     return False
                     
         except Exception as e:
@@ -2149,6 +2695,15 @@ class LocalLLMManager:
             import traceback
             traceback.print_exc()
             return False
+        finally:
+            # 结束热重载阻塞，允许新推理继续
+            try:
+                if 'target_llm' in locals() and hasattr(target_llm, '_reload_condition') and target_llm._reload_condition is not None:
+                    with target_llm._reload_condition:
+                        target_llm._reload_in_progress = False
+                        target_llm._reload_condition.notify_all()
+            except Exception:
+                pass
     
     def _load_adapter_to_vllm_model(self, llm_instance, adapter_path: str, llm_type: str) -> bool:
         """
@@ -2183,7 +2738,7 @@ class LocalLLMManager:
             print(f"将适配器加入待处理队列...")
             self.lora_adapters[llm_type]['pending'] = adapter_path
             print(f"⚠ 适配器已排队，将在下次模型初始化时应用")
-            return True  # Return True as queuing is successful
+            return False  # 返回False表示本次加载失败，仅完成排队
             
         except Exception as e:
             print(f"LoRA适配器应用过程发生错误: {e}")
@@ -2199,29 +2754,151 @@ class LocalLLMManager:
             from peft import PeftModel
             import tempfile
             import shutil
+            import os
+            import time as _time
             
             print(f"开始重初始化{llm_type}模型...")
             
-            # Save current model configuration
-            model_path = llm_instance.llm_name if hasattr(llm_instance, 'llm_name') else self.model_path
-            gpu_ids = getattr(llm_instance, 'gpu_ids', [0] if llm_type == 'traffic' else [1])
+            # Save current model configuration (operate on underlying original LLM if wrapped)
+            base_llm = getattr(llm_instance, 'original_llm', llm_instance)
+            model_path = base_llm.llm_name if hasattr(base_llm, 'llm_name') else self.model_path
+            gpu_ids = getattr(base_llm, 'gpu_ids', [0] if llm_type == 'traffic' else [1])
             
-            # Step 1: Clear current model from memory
-            if hasattr(llm_instance, 'model') and llm_instance.model is not None:
-                del llm_instance.model
-                torch.cuda.empty_cache()
-                print(f"✓ 清理旧模型内存")
+            # Step 1: Clear current model from memory (if exists)
+            try:
+                if hasattr(base_llm, 'model') and base_llm.model is not None:
+                    # 优先调用vLLM的优雅关闭接口，释放引擎进程占用的显存
+                    try:
+                        if hasattr(base_llm.model, 'shutdown'):
+                            base_llm.model.shutdown()
+                        elif hasattr(base_llm.model, 'llm_engine') and hasattr(base_llm.model.llm_engine, 'shutdown'):
+                            base_llm.model.llm_engine.shutdown()
+                        print("已调用 vLLM.shutdown()，等待释放显存…")
+                        _time.sleep(2.0)
+                    except Exception as _sd_err:
+                        print(f"[WARN] vLLM.shutdown() 调用异常: {_sd_err}")
+                    try:
+                        del base_llm.model
+                        import gc as _gc
+                        _gc.collect()
+                    except Exception:
+                        pass
+                    base_llm.model = None
+                    torch.cuda.empty_cache()
+                    print(f"✓ 清理旧模型内存")
+                    
+                    # 等待目标GPU出现可用显存（最多60秒），按目标利用率判断
+                    try:
+                        target_gpu_id = gpu_ids[0] if gpu_ids else (0 if llm_type == 'traffic' else 1)
+                        wait_deadline = _time.time() + 60.0
+                        # 读取目标利用率配置
+                        try:
+                            _env_util = os.environ.get('LLM_GPU_MEMORY_UTILIZATION', '').strip()
+                            _wait_util = float(_env_util) if _env_util else None
+                        except Exception:
+                            _wait_util = None
+                        if not isinstance(_wait_util, float):
+                            _wait_util = float(getattr(base_llm, 'gpu_memory_utilization', getattr(self, 'gpu_memory_utilization', 0.85)))
+                        while _time.time() < wait_deadline:
+                            status = self.get_gpu_status()
+                            gpu_list = status.get('gpu_status', [])
+                            free_gb = None
+                            total_gb = None
+                            for g in gpu_list:
+                                if int(g.get('gpu_id', -1)) == int(target_gpu_id):
+                                    try:
+                                        total_gb = float(str(g.get('memory_total', '0GB')).replace('GB',''))
+                                        alloc = float(str(g.get('memory_allocated', '0GB')).replace('GB',''))
+                                        free_gb = max(total_gb - alloc, 0.0)
+                                    except Exception:
+                                        free_gb = None
+                                    break
+                            # 至少需要 total * utilization - 1GB 的可用空间
+                            if free_gb is not None and total_gb is not None:
+                                required_gb = max(0.0, total_gb * _wait_util - 1.0)
+                                if free_gb >= required_gb:
+                                    break
+                            # 若无法获取准确信息，退化阈值到16GB
+                            if free_gb is not None and total_gb is None and free_gb >= 16.0:
+                                break
+                            _time.sleep(0.5)
+                    except Exception:
+                        pass
+            except Exception as del_err:
+                print(f"[WARN] 清理旧模型时出现问题: {del_err}")
             
             # Step 2: Load base model with transformers first
             print(f"加载基础模型: {model_path}")
-            from transformers import AutoModelForCausalLM, AutoTokenizer
+            from transformers import AutoModelForCausalLM
             
-            base_model = AutoModelForCausalLM.from_pretrained(
-                model_path,
-                torch_dtype=torch.float16,
-                device_map=f"cuda:{gpu_ids[0] if gpu_ids else 0}",
-                trust_remote_code=True
-            )
+            # 选择热重载的暂存设备（默认使用GPU，按照 LLM_HOT_RELOAD_GPUS=2,3 顺序挑选）
+            staging_device = None
+            try:
+                staging_policy = os.environ.get('LLM_HOT_RELOAD_STAGING', 'gpu').lower()
+                if staging_policy != 'gpu':
+                    raise RuntimeError('staging policy not gpu')
+                preferred = os.environ.get('LLM_HOT_RELOAD_GPUS')
+                preferred_list = []
+                if preferred:
+                    try:
+                        preferred_list = [int(x.strip()) for x in preferred.split(',') if x.strip() != '']
+                    except Exception:
+                        preferred_list = []
+                # 若无环境变量，优先尝试与当前不同的GPU（2/3），且剩余显存>16GB
+                if not preferred_list:
+                    preferred_list = [2, 3, 1, 0]
+                status = self.get_gpu_status()
+                gpu_list = status.get('gpu_status', [])
+                for gid in preferred_list:
+                    if gpu_ids and gid == gpu_ids[0]:
+                        continue
+                    for g in gpu_list:
+                        if int(g.get('gpu_id', -1)) == int(gid):
+                            try:
+                                total = float(str(g.get('memory_total', '0GB')).replace('GB',''))
+                                alloc = float(str(g.get('memory_allocated', '0GB')).replace('GB',''))
+                                free_gb = max(total - alloc, 0.0)
+                                if free_gb >= 16.0:
+                                    staging_device = f"cuda:{gid}"
+                            except Exception:
+                                pass
+                            break
+                    if staging_device is not None:
+                        break
+            except Exception:
+                staging_device = None
+            
+            # 校验 staging_device 是否对当前进程可见，否则回退CPU
+            try:
+                if staging_device and staging_device.startswith("cuda:"):
+                    import re as _re
+                    m2 = _re.search(r"cuda:(\d+)", staging_device)
+                    if m2:
+                        _gid2 = int(m2.group(1))
+                        import torch as _torch
+                        if (not _torch.cuda.is_available()) or (_gid2 >= _torch.cuda.device_count()):
+                            print(f"[INFO] 目标暂存GPU {_gid2} 对当前进程不可见，回退到 CPU 暂存")
+                            staging_device = None
+            except Exception:
+                staging_device = None
+            
+            if staging_device is None:
+                print("[INFO] 暂存设备选择为 CPU（无足够空闲GPU）")
+                base_model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    torch_dtype=torch.float16,
+                    device_map="cpu",
+                    low_cpu_mem_usage=True,
+                    trust_remote_code=True
+                )
+            else:
+                print(f"[INFO] 暂存设备选择: {staging_device}")
+                base_model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    torch_dtype=torch.float16,
+                    device_map=staging_device,
+                    trust_remote_code=True
+                )
             
             # Step 3: Apply LoRA adapter
             print(f"应用LoRA适配器: {adapter_path}")
@@ -2229,30 +2906,67 @@ class LocalLLMManager:
             
             # Step 4: Merge LoRA weights (optional but recommended)
             print(f"合并LoRA权重...")
-            model_with_lora = model_with_lora.merge_and_unload()
+            try:
+                model_with_lora = model_with_lora.merge_and_unload()
+            except Exception as merge_err:
+                print(f"[WARN] 合并LoRA失败，将以PEFT形式加载: {merge_err}")
             
-            # Step 5: Save merged model to temporary directory
+            # Step 5: Save merged (or PEFT) model to temporary directory
             with tempfile.TemporaryDirectory() as temp_dir:
                 print(f"保存合并模型到临时目录...")
                 model_with_lora.save_pretrained(temp_dir)
                 
-                # Copy tokenizer files if they exist
-                tokenizer_files = ['tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 'vocab.txt']
-                for file in tokenizer_files:
-                    src_path = os.path.join(model_path, file)
-                    if os.path.exists(src_path):
-                        shutil.copy(src_path, temp_dir)
+                # Also save tokenizer to ensure model and tokenizer are in same directory
+                print(f"保存tokenizer到临时目录...")
+                tokenizer_path = temp_dir  # Default to temp_dir
+                try:
+                    from transformers import AutoTokenizer
+                    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                    tokenizer.save_pretrained(temp_dir)
+                    print(f"✓ tokenizer已保存到临时目录")
+                except Exception as e:
+                    print(f"[WARN] 保存tokenizer失败: {e}, 将使用原始路径")
+                    tokenizer_path = model_path  # Fallback to original path
                 
-                # Step 6: Reinitialize vLLM with merged model
+                # Step 6: Reinitialize vLLM with new model
                 print(f"使用合并模型重初始化vLLM...")
-                
-                # Clear memory first
-                torch.cuda.empty_cache()
-                
-                # Create new vLLM instance
+                # 先释放合并阶段占用（GPU/CPU），确保显存充足
+                try:
+                    del model_with_lora
+                except Exception:
+                    pass
+                try:
+                    del base_model
+                except Exception:
+                    pass
+                try:
+                    import torch as _torch
+                    if _torch.cuda.is_available():
+                        _torch.cuda.empty_cache()
+                        _torch.cuda.synchronize()
+                except Exception:
+                    pass
+
+                # 读取实例或环境中的显存占用比例配置，默认0.85
+                try:
+                    _env_util = os.environ.get('LLM_GPU_MEMORY_UTILIZATION', '').strip()
+                    _env_util_val = float(_env_util) if _env_util else None
+                except Exception:
+                    _env_util_val = None
+                _instance_util = getattr(base_llm, 'gpu_memory_utilization', None)
+                _self_util = getattr(self, 'gpu_memory_utilization', None)
+                _target_util = (
+                    _env_util_val if isinstance(_env_util_val, float) else (
+                        _instance_util if isinstance(_instance_util, (int, float)) else (
+                            _self_util if isinstance(_self_util, (int, float)) else 0.85
+                        )
+                    )
+                )
+
                 vllm_kwargs = {
                     "model": temp_dir,
-                    "gpu_memory_utilization": 0.85,
+                    "tokenizer": tokenizer_path,  # Use same path as model, or fallback to original
+                    "gpu_memory_utilization": float(_target_util),
                     "tensor_parallel_size": 1,
                     "max_model_len": 8192,
                     "enforce_eager": True,
@@ -2262,15 +2976,69 @@ class LocalLLMManager:
                     "max_num_seqs": 128,
                     "block_size": 16
                 }
+                # 锁定到原始GPU，不自动切换；如需允许切换，可设置 LLM_HOT_RELOAD_ALLOW_SWITCH=1
+                final_gpu_id = gpu_ids[0] if gpu_ids else (0 if llm_type == 'traffic' else 1)
+                try:
+                    if os.environ.get('LLM_HOT_RELOAD_ALLOW_SWITCH', '0') == '1':
+                        import torch as _torch
+                        visible_ids_env = os.environ.get('CUDA_VISIBLE_DEVICES')
+                        if visible_ids_env and visible_ids_env.strip():
+                            visible_physical = [int(x.strip()) for x in visible_ids_env.split(',') if x.strip() != '']
+                        else:
+                            visible_physical = list(range(_torch.cuda.device_count()))
+                        status2 = self.get_gpu_status()
+                        gpu_list2 = status2.get('gpu_status', [])
+                        def _free_gb_for(phy_id: int):
+                            for g in gpu_list2:
+                                if int(g.get('gpu_id', -1)) == int(phy_id):
+                                    try:
+                                        total = float(str(g.get('memory_total', '0GB')).replace('GB',''))
+                                        alloc = float(str(g.get('memory_allocated', '0GB')).replace('GB',''))
+                                        return max(total - alloc, 0.0)
+                                    except Exception:
+                                        return None
+                            return None
+                        free_final = _free_gb_for(final_gpu_id)
+                        if (free_final is None or free_final < 8.0):
+                            candidates = [pid for pid in visible_physical if pid != final_gpu_id]
+                            best = None
+                            best_free = -1.0
+                            for pid in candidates:
+                                fg = _free_gb_for(pid)
+                                if fg is not None and fg > best_free:
+                                    best = pid
+                                    best_free = fg
+                            if best is not None and best_free >= 16.0:
+                                print(f"[INFO] 目标GPU显存不足，切换到可见备用GPU {best} 进行vLLM重启")
+                                final_gpu_id = best
+                                setattr(llm_instance, 'gpu_ids', [final_gpu_id])
+                except Exception:
+                    pass
                 
-                if gpu_ids:
-                    vllm_kwargs["device"] = f"cuda:{gpu_ids[0]}"
+                # 在当前可见GPU集合内，严格绑定到目标GPU：
+                # 临时覆写 CUDA_VISIBLE_DEVICES，确保vLLM子进程落到与微调前相同的物理GPU
+                _prev_cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', None)
+                try:
+                    os.environ['CUDA_VISIBLE_DEVICES'] = str(final_gpu_id)
+                    new_model = vllm.LLM(**vllm_kwargs)
+                finally:
+                    if _prev_cuda_visible is None:
+                        try:
+                            del os.environ['CUDA_VISIBLE_DEVICES']
+                        except Exception:
+                            pass
+                    else:
+                        os.environ['CUDA_VISIBLE_DEVICES'] = _prev_cuda_visible
                 
-                new_model = vllm.LLM(**vllm_kwargs)
-                
-                # Replace the model in the LLM instance
-                llm_instance.model = new_model
-                
+                # Replace the model in the LLM instance safely
+                # 将新引擎绑定到底层 LLM 对象，并让包装器读取到底层
+                setattr(base_llm, 'model', new_model)
+                try:
+                    # 对包装器场景：如果 llm_instance 是包装器，确保它透传 original_llm
+                    if getattr(llm_instance, 'original_llm', None) is base_llm:
+                        pass
+                except Exception:
+                    pass
                 print(f"✓ {llm_type}模型重初始化完成")
                 return True
                 
@@ -2279,11 +3047,13 @@ class LocalLLMManager:
             import traceback
             traceback.print_exc()
             
-            # Try to recover original model
+            # Try to recover original model state markers instead of raising
             try:
-                self._recover_original_model(llm_instance, llm_type)
-            except:
-                print(f"原模型恢复也失败，{llm_type} LLM可能需要完全重启")
+                if hasattr(llm_instance, 'model') and llm_instance.model is None:
+                    # leave as None; wrapper将继续工作但会触发下次初始化加载
+                    pass
+            except Exception:
+                pass
             
             return False
     
@@ -2421,3 +3191,119 @@ class LocalLLMManager:
         
         print(f"更新队列大小: {status['queue_size']}")
         print("=" * 40)
+    
+    # ===== TIME-SLICED TRAINING: MODEL LIFECYCLE MANAGEMENT =====
+    
+    def release_inference_models(self) -> bool:
+        """释放推理模型以释放GPU内存用于训练"""
+        try:
+            print("\n=== 释放推理模型 ===")
+            
+            # 保存当前适配器状态
+            current_adapters = {
+                'traffic': self.lora_adapters['traffic']['current'] if hasattr(self, 'lora_adapters') else None,
+                'regional': self.lora_adapters['regional']['current'] if hasattr(self, 'lora_adapters') else None
+            }
+            
+            # 释放Traffic LLM
+            if self.traffic_llm is not None:
+                print("释放Traffic LLM...")
+                if hasattr(self.traffic_llm, 'model') and self.traffic_llm.model is not None:
+                    del self.traffic_llm.model
+                del self.traffic_llm
+                self.traffic_llm = None
+            
+            # 释放Regional LLM
+            if self.regional_llm is not None:
+                print("释放Regional LLM...")
+                if hasattr(self.regional_llm, 'model') and self.regional_llm.model is not None:
+                    del self.regional_llm.model
+                del self.regional_llm
+                self.regional_llm = None
+            
+            # 清理GPU内存
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            
+            # 保存适配器状态供后续恢复
+            if not hasattr(self, '_released_state'):
+                self._released_state = {}
+            self._released_state['adapters'] = current_adapters
+            self._released_state['model_path'] = self.model_path
+            self._released_state['task_info'] = self.task_info
+            
+            print("推理模型已释放，GPU内存已清理")
+            return True
+            
+        except Exception as e:
+            print(f"释放推理模型失败: {e}")
+            return False
+    
+    def restore_inference_models(self, new_adapters: dict = None) -> bool:
+        """恢复推理模型，可选择加载新的适配器"""
+        try:
+            print("\n=== 恢复推理模型 ===")
+            
+            if not hasattr(self, '_released_state'):
+                print("错误: 没有找到释放状态信息")
+                return False
+            
+            # 重新初始化LLM实例
+            traffic_llm, regional_llm = self.initialize_llms()
+            
+            # 加载新适配器或恢复原适配器
+            adapters_to_load = new_adapters or self._released_state.get('adapters', {})
+            
+            if adapters_to_load:
+                print("加载适配器...")
+                for llm_type, adapter_path in adapters_to_load.items():
+                    if adapter_path and os.path.exists(adapter_path):
+                        print(f"加载{llm_type}适配器: {adapter_path}")
+                        self.load_lora_adapter_direct(llm_type, adapter_path)
+            
+            # 清理释放状态
+            if hasattr(self, '_released_state'):
+                delattr(self, '_released_state')
+            
+            print("推理模型已恢复")
+            return True
+            
+        except Exception as e:
+            print(f"恢复推理模型失败: {e}")
+            return False
+    
+    def get_memory_status(self) -> dict:
+        """获取GPU内存使用状态"""
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return {'error': 'CUDA不可用'}
+            
+            status = {'gpus': []}
+            for i in range(torch.cuda.device_count()):
+                memory_allocated = torch.cuda.memory_allocated(i) / 1024**3
+                memory_total = torch.cuda.get_device_properties(i).total_memory / 1024**3
+                memory_reserved = torch.cuda.memory_reserved(i) / 1024**3
+                
+                gpu_status = {
+                    'gpu_id': i,
+                    'allocated_gb': round(memory_allocated, 2),
+                    'reserved_gb': round(memory_reserved, 2),
+                    'total_gb': round(memory_total, 2),
+                    'utilization_percent': round(memory_allocated / memory_total * 100, 1)
+                }
+                status['gpus'].append(gpu_status)
+            
+            return status
+            
+        except Exception as e:
+            return {'error': str(e)}
+    
+    def is_inference_models_loaded(self) -> bool:
+        """检查推理模型是否已加载"""
+        return (self.traffic_llm is not None and 
+                self.regional_llm is not None and
+                hasattr(self.traffic_llm, 'model') and 
+                hasattr(self.regional_llm, 'model'))

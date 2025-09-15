@@ -8,7 +8,7 @@ and provides recommendations to Regional Agents based on global traffic state.
 import traci
 import networkx as nx
 import numpy as np
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 from collections import defaultdict, deque
 from dataclasses import dataclass
 
@@ -63,7 +63,7 @@ class TrafficAgent:
     
     def __init__(self, boundary_edges: List[Dict], edge_to_region: Dict,
                  road_info: Dict, num_regions: int, llm_agent, logger, 
-                 prediction_engine: PredictionEngine):
+                 prediction_engine: PredictionEngine, raw_llm_agent=None):
         """
         Initialize Traffic Agent.
         
@@ -75,12 +75,14 @@ class TrafficAgent:
             llm_agent: Language model agent for decision making
             logger: Agent logger instance
             prediction_engine: Prediction engine for traffic forecasting
+            raw_llm_agent: Optional raw LLM instance for macro planning (no concurrency wrapper)
         """
         self.boundary_edges = boundary_edges
         self.edge_to_region = edge_to_region
         self.road_info = road_info
         self.num_regions = num_regions
         self.llm_agent = llm_agent
+        self.raw_llm_agent = raw_llm_agent or llm_agent  # Use raw LLM for macro planning if available
         self.logger = logger
         self.prediction_engine = prediction_engine
         
@@ -101,6 +103,10 @@ class TrafficAgent:
         self.successful_macro_routes = 0
         self.avg_macro_travel_time = 0.0
         self.boundary_utilization: Dict[str, float] = {}
+        
+        # Region traversal statistics for autonomous vehicles (real ATT basis)
+        # Structure: {region_id: { 'total_time': float, 'count': int }}
+        self.region_travel_stats: Dict[int, Dict[str, float]] = defaultdict(lambda: {'total_time': 0.0, 'count': 0})
         
         # Coordination parameters
         self.congestion_threshold = 3.0  # Congestion level threshold
@@ -264,6 +270,30 @@ class TrafficAgent:
         except Exception as e:
             self.logger.log_error(f"REGIONAL_REPORT: Failed to collect regional congestion report: {e}")
             return {'timestamp': current_time, 'regions': {}, 'boundaries': {}, 'system_overview': {}, 'trends': {}, 'coordination_data': {}}
+
+    def record_region_dwell_time(self, region_id: int, dwell_time: float):
+        """Record a single traversal dwell time for a region (autonomous vehicles only).
+        Accumulates total time and count for ATT calculation.
+        """
+        try:
+            if region_id is None or region_id < 0:
+                return
+            if dwell_time is None or dwell_time <= 0:
+                return
+            stats = self.region_travel_stats[region_id]
+            stats['total_time'] += float(dwell_time)
+            stats['count'] += 1
+        except Exception as e:
+            self.logger.log_error(f"REGION_DWELL_RECORD_ERROR: region {region_id}: {e}")
+
+    def get_region_att(self, region_id: int) -> float:
+        """Get average traversal time (ATT) for a region based on recorded dwell times.
+        Returns a neutral default (300s) if no data is available yet.
+        """
+        stats = self.region_travel_stats.get(region_id)
+        if not stats or stats.get('count', 0) <= 0:
+            return 300.0
+        return stats['total_time'] / max(1, int(stats['count']))
     
     def _calculate_regional_metrics(self, region_edges: List[str], region_id: int) -> Dict:
         """Calculate comprehensive metrics for a region."""
@@ -329,7 +359,7 @@ class TrafficAgent:
                    'vehicle_count': 0, 'capacity_utilization': 0.0, 'avg_speed': 0.0, 'status': 'unknown'}
     
     def _calculate_boundary_metrics(self, edge_id: str, boundary_info: Dict) -> Dict:
-        """Calculate metrics for a boundary edge."""
+        """Calculate enhanced metrics for a boundary edge including coordination data."""
         try:
             metrics = {
                 'edge_id': edge_id,
@@ -339,7 +369,11 @@ class TrafficAgent:
                 'vehicle_count': 0,
                 'utilization': 0.0,
                 'flow_rate': 0.0,
-                'status': 'normal'
+                'status': 'normal',
+                'active_vehicles': 0,
+                'capacity_warning': False,
+                'output_availability': 1.0,
+                'av_targets': 0
             }
             
             if edge_id in self.road_info:
@@ -350,6 +384,7 @@ class TrafficAgent:
                 
                 metrics['congestion_level'] = congestion
                 metrics['vehicle_count'] = vehicles
+                metrics['active_vehicles'] = vehicles
                 
                 # Calculate utilization
                 road_len = edge_data.get('road_len', 100)
@@ -357,7 +392,26 @@ class TrafficAgent:
                 capacity = (road_len * lane_num) / 8.0
                 
                 if capacity > 0:
-                    metrics['utilization'] = min(1.0, vehicles / capacity)
+                    utilization = min(1.0, vehicles / capacity)
+                    metrics['utilization'] = utilization
+                
+                # Enhanced capacity warning based on congestion and utilization
+                metrics['capacity_warning'] = congestion > 3.0 or metrics['utilization'] > 0.8
+                
+                # Output availability (higher is better, inverse of congestion)
+                metrics['output_availability'] = max(0.1, min(1.0, 1.0 - congestion / 5.0))
+                
+                # Estimate autonomous vehicles targeting this edge
+                # Based on vehicles planned to cross this boundary
+                base_targets = max(1, int(vehicles * 0.3))
+                
+                # Check if vehicles are planned to use this boundary from macro routes
+                planned_vehicles = 0
+                for vehicle_id, macro_route in self.vehicle_macro_routes.items():
+                    if edge_id in macro_route.boundary_edges:
+                        planned_vehicles += 1
+                
+                metrics['av_targets'] = max(base_targets, planned_vehicles)
                 
                 # Calculate flow rate from historical data
                 if edge_id in self.boundary_traffic_flow:
@@ -365,14 +419,16 @@ class TrafficAgent:
                     if len(flow_data) >= 2:
                         recent_flow = flow_data[-5:] if len(flow_data) >= 5 else flow_data
                         avg_vehicles = sum(flow[1] for flow in recent_flow) / len(recent_flow)
-                        metrics['flow_rate'] = avg_vehicles
+                        metrics['flow_rate'] = avg_vehicles * 60  # Convert to veh/h
                 
-                # Determine status
-                if congestion > 4.0:
+                # Enhanced status determination
+                if congestion > 4.0 or metrics['utilization'] > 0.9:
                     metrics['status'] = 'blocked'
-                elif congestion > 2.0:
+                elif congestion > 3.0 or metrics['utilization'] > 0.8:
+                    metrics['status'] = 'saturated'
+                elif congestion > 2.0 or metrics['utilization'] > 0.6:
                     metrics['status'] = 'congested'
-                elif congestion > 1.0:
+                elif congestion > 1.0 or metrics['utilization'] > 0.4:
                     metrics['status'] = 'busy'
                 else:
                     metrics['status'] = 'normal'
@@ -383,7 +439,8 @@ class TrafficAgent:
             self.logger.log_error(f"BOUNDARY_METRICS: Failed for edge {edge_id}: {e}")
             return {'edge_id': edge_id, 'from_region': boundary_info.get('from_region', -1), 
                    'to_region': boundary_info.get('to_region', -1), 'congestion_level': 0.0, 
-                   'vehicle_count': 0, 'utilization': 0.0, 'flow_rate': 0.0, 'status': 'unknown'}
+                   'vehicle_count': 0, 'utilization': 0.0, 'flow_rate': 0.0, 'status': 'unknown',
+                   'active_vehicles': 0, 'capacity_warning': False, 'output_availability': 0.0, 'av_targets': 0}
     
     def _calculate_congestion_trends(self) -> Dict:
         """Calculate congestion trends from historical data."""
@@ -529,28 +586,20 @@ class TrafficAgent:
             }
     
     def _calculate_avg_travel_time(self) -> float:
-        """Calculate average travel time (simplified implementation)."""
+        """Calculate system average travel time using recorded region traversal ATT.
+        Uses aggregated per-region dwell stats across autonomous vehicles.
+        """
         try:
-            # This would ideally track actual travel times
-            # For now, use a simple heuristic based on congestion
-            total_congestion = 0
-            count = 0
-            
-            for edge_data in self.road_info.values():
-                if 'congestion_level' in edge_data:
-                    total_congestion += edge_data['congestion_level']
-                    count += 1
-            
-            avg_congestion = total_congestion / max(1, count)
-            
-            # Convert congestion to estimated travel time factor
-            base_time = 300  # Base 5 minutes
-            congestion_factor = 1.0 + (avg_congestion * 0.5)  # 50% increase per congestion level
-            
-            return base_time * congestion_factor
-            
-        except:
-            return 300.0  # Default 5 minutes
+            total_time = 0.0
+            total_count = 0
+            for stats in self.region_travel_stats.values():
+                total_time += stats.get('total_time', 0.0)
+                total_count += int(stats.get('count', 0))
+            if total_count <= 0:
+                return 0.0
+            return total_time / total_count
+        except Exception:
+            return 0.0
     
     def _update_region_graph_weights(self, regional_congestion: Dict[int, float],
                                    boundary_congestion: Dict[str, float]):
@@ -588,6 +637,35 @@ class TrafficAgent:
                 utilization = vehicle_count / max(1, capacity)
                 self.boundary_utilization[edge_id] = min(1.0, utilization)
     
+    def plan_single_macro_route(self, vehicle_id: str, start_region: int, end_region: int, current_time: float, coordination_data: Dict = None) -> Optional[MacroRoute]:
+        """
+        Plan macro route for a single vehicle.
+        
+        Args:
+            vehicle_id: ID of vehicle needing planning
+            start_region: Current region
+            end_region: Target region
+            current_time: Current simulation time
+            coordination_data: Optional coordination data
+            
+        Returns:
+            MacroRoute object or None if failed
+        """
+        try:
+            request = {
+                'vehicle_id': vehicle_id,
+                'start_region': start_region,
+                'end_region': end_region
+            }
+            
+            # Use existing batch method for single vehicle
+            routes = self.batch_macro_planning([request], current_time, coordination_data)
+            return routes[0] if routes else None
+            
+        except Exception as e:
+            self.logger.log_error(f"SINGLE_MACRO_PLANNING: Failed for {vehicle_id}: {e}")
+            return None
+
     def batch_macro_planning(self, requests: List[Dict], current_time: float, coordination_data: Dict = None) -> List[MacroRoute]:
         """
         Plan macro routes for multiple vehicles simultaneously with coordination.
@@ -607,9 +685,14 @@ class TrafficAgent:
             # Prepare context for LLM-based planning with coordination data
             planning_context = self._prepare_macro_planning_context(requests, current_time, coordination_data)
             
+            # Generate the actual LLM input texts to log what LLM really sees
+            llm_input_texts = self._prepare_llm_input_texts(planning_context)
+            combined_llm_input = "\n\n=== BATCH REQUEST ===\n\n".join(llm_input_texts)
+            
             # Use LLM for intelligent route planning with coordination
             call_id = self.logger.log_llm_call_start(
-                "TrafficAgent", "coordinated_macro_planning", len(str(planning_context))
+                "TrafficAgent", "coordinated_macro_planning", len(combined_llm_input),
+                "decision", "", combined_llm_input
             )
             
             macro_routes = []
@@ -675,11 +758,111 @@ class TrafficAgent:
         # Limit to max 10 regions
         relevant_regions = list(relevant_regions)[:10]
         
-        # Create compact data structures
+        # Create compact data structures (will be overridden by real performance if available)
         compact_regional_congestion = {
             region_id: full_regional_congestion.get(region_id, 0) 
             for region_id in relevant_regions
         }
+
+        # Try to use real-time performance metrics from logger to populate regional congestion
+        performance_regional_metrics = {}
+        system_avg_travel_time = 0.0
+        try:
+            # Prefer in-memory history for freshest data
+            if hasattr(self.logger, 'performance_history') and self.logger.performance_history:
+                last_perf = self.logger.performance_history[-1]
+                # last_perf is PerformanceMetrics dataclass
+                performance_regional_metrics = getattr(last_perf, 'regional_metrics', {}) or {}
+                system_avg_travel_time = getattr(last_perf, 'average_travel_time', 0.0) or 0.0
+        except Exception:
+            pass
+
+        # Override congestion using real avg_congestion if available from performance logs
+        if performance_regional_metrics:
+            for region_id in list(compact_regional_congestion.keys()):
+                metrics = performance_regional_metrics.get(region_id, {})
+                if isinstance(metrics, dict) and 'avg_congestion' in metrics:
+                    compact_regional_congestion[region_id] = metrics.get('avg_congestion', compact_regional_congestion.get(region_id, 0))
+
+        # If coordination_data is a full regional report, merge its real metrics
+        if coordination_data and isinstance(coordination_data, dict) and (
+            'regions' in coordination_data or 'boundaries' in coordination_data or 'system_overview' in coordination_data
+        ):
+            try:
+                # Derive regional congestion from report
+                report_regions = coordination_data.get('regions', {})
+                if isinstance(report_regions, dict) and report_regions:
+                    for region_id_str, metrics in report_regions.items():
+                        try:
+                            region_id_int = int(region_id_str)
+                        except Exception:
+                            region_id_int = region_id_str
+                        if region_id_int in relevant_regions and isinstance(metrics, dict):
+                            cong_val = metrics.get('congestion_level', None)
+                            if cong_val is not None:
+                                compact_regional_congestion[region_id_int] = cong_val
+                            # Merge into regional metrics to expose active_vehicles etc.
+                            perf_metrics_for_region = performance_regional_metrics.get(region_id_int, {}) if isinstance(performance_regional_metrics, dict) else {}
+                            merged_metrics = {
+                                **perf_metrics_for_region,
+                                'avg_congestion': cong_val if cong_val is not None else perf_metrics_for_region.get('avg_congestion', 0.0),
+                                'active_vehicles': metrics.get('vehicle_count', perf_metrics_for_region.get('active_vehicles', 0)),
+                                'capacity_utilization': metrics.get('capacity_utilization', perf_metrics_for_region.get('capacity_utilization', 0.0))
+                            }
+                            if isinstance(performance_regional_metrics, dict):
+                                performance_regional_metrics[region_id_int] = merged_metrics
+                
+                # Derive boundary congestion from report
+                report_boundaries = coordination_data.get('boundaries', {})
+                compact_boundary_congestion_from_report = {}
+                if isinstance(report_boundaries, dict) and report_boundaries:
+                    for edge_id, bmetrics in report_boundaries.items():
+                        if isinstance(bmetrics, dict):
+                            cong_val = bmetrics.get('congestion_level', None)
+                            if cong_val is not None:
+                                compact_boundary_congestion_from_report[edge_id] = cong_val
+                
+                # System ATT from report
+                system_avg_travel_time = coordination_data.get('system_overview', {}).get('avg_travel_time', system_avg_travel_time)
+                
+                # Build coordination summary similar to _analyze_coordination_data
+                overloaded_regions = []
+                available_regions = []
+                region_loads = []
+                if isinstance(report_regions, dict):
+                    for rid_str, metrics in report_regions.items():
+                        try:
+                            rid = int(rid_str)
+                        except Exception:
+                            rid = rid_str
+                        if not isinstance(metrics, dict):
+                            continue
+                        cong = metrics.get('congestion_level', 0.0)
+                        status = metrics.get('status', 'normal')
+                        cap_util = metrics.get('capacity_utilization', 0.0)
+                        region_loads.append(cap_util if cap_util is not None else 0.0)
+                        if cong is not None and cong > 3.0 or status in ('congested', 'heavily_congested'):
+                            overloaded_regions.append(rid)
+                        elif cong is not None and cong < 2.0 and cap_util is not None and cap_util < 0.6:
+                            available_regions.append(rid)
+                load_balance_score = 1.0
+                if region_loads and max(region_loads) > 0:
+                    load_balance_score = 1 - (max(region_loads) - min(region_loads)) / max(region_loads)
+                coordination_summary = {
+                    'overloaded_regions': overloaded_regions[:5],
+                    'available_regions': available_regions[:8],
+                    'load_balance_score': round(load_balance_score, 3)
+                }
+                
+                # Prefer report-based boundary congestion if present
+                if compact_boundary_congestion_from_report:
+                    compact_boundary_congestion = compact_boundary_congestion_from_report
+                
+                # Prefer report-derived coordination summary
+                coordination_data = coordination_summary
+            except Exception:
+                # If merging fails, keep existing data
+                pass
         
         # Only keep top 10 most congested boundaries
         compact_boundary_congestion = {}
@@ -689,13 +872,28 @@ class TrafficAgent:
             compact_boundary_congestion = dict(top_congested_boundaries)
         
         # Compact performance metrics (only essential metrics)
-        performance = self.get_performance_metrics()
+        # Use logger counters to compute real LLM success rate matching performance logs
+        try:
+            llm_success_rate = (self.logger.successful_llm_calls / max(1, self.logger.total_llm_calls)) * 100.0
+        except Exception:
+            llm_success_rate = 0.0
+
+        traffic_perf = self.get_performance_metrics()
         compact_performance = {
-            'success_rate': performance.get('success_rate', 0),
-            'regional_balance': performance.get('regional_balance', 0),
-            'active_macro_routes': performance.get('active_macro_routes', 0)
+            'success_rate': llm_success_rate,
+            'regional_balance': traffic_perf.get('regional_balance', 0.0),
+            'active_macro_routes': traffic_perf.get('active_macro_routes', 0)
         }
         
+        # Gather stuck hotspots from logger/environment if available (exposed via performance metrics placeholder)
+        stuck_hotspots = {}
+        try:
+            # Use vehicle logger performance file if embedded; otherwise rely on regional reports later
+            if hasattr(self, 'stuck_edge_blacklist') and isinstance(self.stuck_edge_blacklist, dict):
+                stuck_hotspots = self.stuck_edge_blacklist
+        except Exception:
+            pass
+
         # Optimize: Only include essential data to reduce context size
         context = {
             'current_time': current_time,
@@ -704,8 +902,21 @@ class TrafficAgent:
             'regional_congestion': compact_regional_congestion,
             'boundary_congestion': compact_boundary_congestion,
             'performance_metrics': compact_performance,
-            'coordination_data': coordination_data if coordination_data else {}
+            'coordination_data': coordination_data if coordination_data else {},
+            'stuck_hotspots': stuck_hotspots,
+            # expose real performance regional metrics and system ATT for downstream observation building
+            'regional_metrics': performance_regional_metrics,
+            'system_avg_travel_time': system_avg_travel_time
         }
+
+        # Attach current global macro guidance (if environment provided)
+        try:
+            if hasattr(self, 'parent_env') and hasattr(self.parent_env, '_get_current_global_macro_guidance'):
+                gg = self.parent_env._get_current_global_macro_guidance()
+                if gg:
+                    context['global_guidance'] = gg
+        except Exception:
+            pass
         
         # Optional: Add very limited congestion forecast only for most relevant boundaries
         if requests and len(requests) <= 5:  # Only for small batches
@@ -797,17 +1008,44 @@ class TrafficAgent:
                         'special_requirements': None
                     })
                 
-                # Prepare compact regional conditions (only relevant regions)
+                # Build raw planned movements (region/boundary incoming vehicle lists)
+                planned_region_incoming: Dict[int, List[str]] = defaultdict(list)
+                planned_boundary_incoming: Dict[str, List[str]] = defaultdict(list)
+                try:
+                    for vid, mroute in self.vehicle_macro_routes.items():
+                        # Regions the vehicle plans to traverse (excluding potential current region)
+                        try:
+                            for rid in mroute.region_sequence[1:]:
+                                planned_region_incoming[rid].append(vid)
+                        except Exception:
+                            pass
+                        # Boundary edges along its macro route
+                        try:
+                            for be in mroute.boundary_edges:
+                                planned_boundary_incoming[be].append(vid)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                # Prepare regional conditions (raw view only)
                 regional_conditions = {}
                 for region_id in relevant_regions:
                     congestion = compact_regional_congestion.get(region_id, 0)
+                    # Derive raw vehicle_count and avg_speed from current road_info (no scores/thresholds)
+                    region_edges = [e for e, r in self.edge_to_region.items() if r == region_id]
+                    vehicle_count = sum(self.road_info.get(edge, {}).get('vehicle_num', 0) for edge in region_edges[:10])
+                    speeds = [self.road_info.get(edge, {}).get('avg_speed', 0.0) for edge in region_edges[:10]]
+                    avg_speed = (sum(speeds) / len(speeds)) if speeds else 0.0
                     regional_conditions[region_id] = {
+                        'region_id': region_id,
                         'congestion_level': congestion,
-                        'capacity_utilization': min(1.0, congestion / 5.0),
-                        'status': 'congested' if congestion > 3.0 else 'normal'
+                        'vehicle_count': int(vehicle_count),
+                        'avg_speed_ms': float(avg_speed),
+                        'planned_incoming_vehicle_ids': planned_region_incoming.get(region_id, [])
                     }
                 
-                # Prepare compact boundary analysis (only top 10 most relevant)
+                # Prepare boundary analysis (raw; only top 10 most relevant)
                 boundary_analysis = {}
                 relevant_boundary_edges = []
                 
@@ -821,12 +1059,17 @@ class TrafficAgent:
                 
                 for boundary_info in relevant_boundary_edges:
                     edge_id = boundary_info['edge_id']
+                    # Raw metrics from road_info if available
+                    edge_data = self.road_info.get(edge_id, {})
                     boundary_analysis[edge_id] = {
+                        'edge_id': edge_id,
                         'from_region': boundary_info['from_region'],
                         'to_region': boundary_info['to_region'],
-                        'congestion_level': compact_boundary_congestion.get(edge_id, 0),
-                        'utilization': min(0.8, compact_boundary_congestion.get(edge_id, 0) / 5.0),
-                        'predicted_flow': 'stable'
+                        'congestion_level': edge_data.get('congestion_level', compact_boundary_congestion.get(edge_id, 0)),
+                        'vehicle_count': edge_data.get('vehicle_num', 0),
+                        'avg_speed_ms': edge_data.get('avg_speed', 0.0),
+                        'flow_rate_vehph': 0.0,
+                        'planned_incoming_vehicle_ids': planned_boundary_incoming.get(edge_id, [])
                     }
                 
                 # Prepare compact flow predictions (limited forecast data)
@@ -841,38 +1084,38 @@ class TrafficAgent:
                                 compact_forecast[edge_id] = forecast_data[:2]  # Only first 2 time points
                 
                 flow_predictions = {
-                    'time_horizon': min(self.prediction_horizon, 900),  # Max 15 minutes
-                    'compact_forecast': compact_forecast,
-                    'regional_trend': 'stable'
+                    'time_horizon_s': min(self.prediction_horizon, 900),
+                    'compact_forecast': compact_forecast
                 }
                 
-                # Prepare compact coordination needs
-                coordination_needs = {
-                    'load_balancing_required': any(
-                        util > 0.8 for util in compact_boundary_congestion.values()
-                    ),
-                    'conflict_resolution_needed': len(context['requests']) > 1,
-                    'priority_routing': len(context['requests']) > 3,
-                    'system_optimization_level': 'regional'  # Focus on regional instead of global
-                }
+                # Inject global macro guidance into coordination_needs to influence macro planning
+                coordination_needs = {}
+                try:
+                    if 'global_guidance' in context:
+                        gg = context['global_guidance']
+                        coordination_needs = {
+                            'priority_goals': gg.get('priority_goals', []),
+                            'avoid_regions': gg.get('avoid_regions', []),
+                            'avoid_edges': gg.get('avoid_edges', []),
+                            'message': gg.get('message', '')
+                        }
+                except Exception:
+                    pass
                 
-                # Prepare compact region routes information (max 2 routes per request)
+                # Prepare region routes information (raw; max 2 routes per request; no recommendations)
                 region_routes = {}
                 for request in context['requests'][:5]:  # Max 5 requests
                     start_region = request['start_region']
                     end_region = request['end_region']
                     
                     available_routes = self._get_possible_regional_routes(start_region, end_region, max_routes=2)
-                    recommended_route = self._get_shortest_regional_route(start_region, end_region)
                     
                     region_routes[f"{start_region}-{end_region}"] = {
-                        'available_routes': available_routes[:2],  # Max 2 routes
-                        'recommended_route': recommended_route,
-                        'route_count': min(len(available_routes), 2)
+                        'available_routes': available_routes[:2]
                     }
                 
-                # Call the enhanced LLM macro planning method
-                llm_result = self.llm_agent.macro_route_planning(
+                # Call the enhanced LLM macro planning method with raw LLM to avoid double concurrency control
+                llm_result = self.raw_llm_agent.macro_route_planning(
                     global_state=global_state,
                     route_requests=route_requests,
                     regional_conditions=regional_conditions,
@@ -937,6 +1180,7 @@ class TrafficAgent:
         # Prepare data for LLM
         data_texts = []
         answer_options = []
+        routes_per_request: List[List[List[int]]] = []
         
         for request in context['requests']:
             start_region = request['start_region']
@@ -949,7 +1193,9 @@ class TrafficAgent:
             
             # Create possible route options
             possible_routes = self._get_possible_regional_routes(start_region, end_region)
-            route_options = "/".join([str(route) for route in possible_routes])
+            routes_per_request.append(possible_routes)
+            # Use numeric option form for strict protocol
+            route_options = "/".join([str(i+1) for i in range(len(possible_routes))])
             
             data_texts.append(data_text)
             answer_options.append(f'"{route_options}"')
@@ -990,10 +1236,38 @@ class TrafficAgent:
                 regional_coordination=coordination_opportunities,
                 traffic_predictions=traffic_predictions
             )
+            # Map numeric option answers back to route strings to keep downstream compatibility
+            try:
+                for i, decision in enumerate(llm_decisions or []):
+                    ans = decision.get('answer') if isinstance(decision, dict) else None
+                    if ans is None:
+                        continue
+                    try:
+                        option_index = int(str(ans).strip())
+                        if 1 <= option_index <= len(routes_per_request[i]):
+                            decision['answer'] = str(routes_per_request[i][option_index - 1])
+                    except Exception:
+                        continue
+            except Exception:
+                pass
         elif hasattr(self.llm_agent, 'hybrid_decision_making_pipeline'):
             llm_decisions = self.llm_agent.hybrid_decision_making_pipeline(
                 data_texts, answer_options
             )
+            # Map numeric answers to route strings
+            try:
+                for i, decision in enumerate(llm_decisions or []):
+                    ans = decision.get('answer') if isinstance(decision, dict) else None
+                    if ans is None:
+                        continue
+                    try:
+                        option_index = int(str(ans).strip())
+                        if 1 <= option_index <= len(routes_per_request[i]):
+                            decision['answer'] = str(routes_per_request[i][option_index - 1])
+                    except Exception:
+                        continue
+            except Exception:
+                pass
         else:
             # Basic fallback decisions
             llm_decisions = []
@@ -1011,46 +1285,102 @@ class TrafficAgent:
     
     def _create_macro_route_observation(self, start_region: int, end_region: int,
                                       context: Dict[str, Any]) -> str:
-        """Create observation text for macro route planning with coordination data."""
+        """Create enhanced observation text for macro route planning with comprehensive coordination data."""
         observation_parts = []
+        
+        # Header with vehicle context  
+        requests = context.get('requests', [])
+        current_request = None
+        for req in requests:
+            if req.get('start_region') == start_region and req.get('end_region') == end_region:
+                current_request = req
+                break
         
         observation_parts.append(f"Coordinated Macro Route Planning: Region {start_region} -> Region {end_region}")
         observation_parts.append("")
         
-        # Coordination data first for efficiency
-        coordination_data = context.get('coordination_data', {})
-        if coordination_data and coordination_data.get('coordination_opportunities', False):
-            overloaded = coordination_data.get('overloaded_regions', [])[:3]  # Top 3 overloaded
-            available = coordination_data.get('available_regions', [])[:3]    # Top 3 available
-            load_balance = coordination_data.get('load_balance_score', 1.0)
-            
-            observation_parts.append(f"Coordination: Avoid_R{overloaded} | Use_R{available} | Balance:{load_balance:.2f}")
+        # Vehicle Information
+        if current_request:
+            vehicle_id = current_request.get('vehicle_id', 'Unknown')
+            observation_parts.append("Vehicle:")
             observation_parts.append("")
+            observation_parts.append(f"vehicle_id: {vehicle_id}")
+            # Note: start_edge and end_edge would need to be passed in context for full implementation
+            observation_parts.append(f"start_region: {start_region}, dest_region: {end_region}")
+
+        # Global Macro Guidance (if available)
+        try:
+            gg = context.get('global_guidance')
+            if gg:
+                observation_parts.append("")
+                observation_parts.append("GLOBAL_GUIDANCE:")
+                observation_parts.append("")
+                goals = gg.get('priority_goals', []) or []
+                avoid_regions = gg.get('avoid_regions', []) or []
+                avoid_edges = gg.get('avoid_edges', []) or []
+                msg = gg.get('message', '') or ''
+                if goals:
+                    observation_parts.append("Goals: " + ", ".join([str(g) for g in goals[:3]]))
+                if avoid_regions:
+                    observation_parts.append("AvoidRegions: " + ",".join([f"R{int(r)}" for r in avoid_regions[:8]]))
+                if avoid_edges:
+                    observation_parts.append("AvoidEdges: " + ",".join([str(e) for e in avoid_edges[:10]]))
+                if msg:
+                    observation_parts.append(f"Note: {msg}")
+                observation_parts.append("")
+        except Exception:
+            pass
         
-        # Current regional congestion - 只显示相关区域
+        # Regional congestion for key regions (raw metrics only)
         regional_congestion = context.get('regional_congestion', {})
-        congestion_list = []
-        
-        # Only show congestion for start/end regions and highly congested regions
         relevant_regions = {start_region, end_region}
         
-        # Add top 5 most congested regions
-        congested_regions = sorted(regional_congestion.items(), 
-                                 key=lambda x: x[1], reverse=True)[:5]
-        for region_id, _ in congested_regions:
-            relevant_regions.add(region_id)
+        # Add top 5 most congested regions  
+        if regional_congestion:
+            top_congested_regions = sorted(regional_congestion.items(), 
+                                         key=lambda x: x[1], reverse=True)[:5]
+            for region_id, _ in top_congested_regions:
+                relevant_regions.add(region_id)
         
-        # Limit to max 10 regions to show
-        for region_id in sorted(relevant_regions)[:10]:
+        congestion_list = []
+        for region_id in sorted(relevant_regions)[:8]:  # Limit to 8 regions
             congestion = regional_congestion.get(region_id, 0)
-            congestion_list.append(f"R{region_id}:{congestion:.1f}")
+            congestion_list.append(f"R{region_id}:{congestion:.2f}")
         
         if congestion_list:
             observation_parts.append("Key_Regional_Congestion: " + "|".join(congestion_list))
             observation_parts.append("")
         
-        # Possible routes - 限制最多3条路径
-        possible_routes = self._get_possible_regional_routes(start_region, end_region, max_routes=3)
+        # Region State Snapshot (raw real-time metrics; no scoring)
+        observation_parts.append("Region_State_Snapshot:")
+        observation_parts.append("")
+        
+        # Generate enhanced region state information
+        current_state = self.global_state_history[-1] if self.global_state_history else None
+        regional_metrics = context.get('regional_metrics', {}) or {}
+        for region_id in sorted(relevant_regions)[:6]:  # Limit to 6 regions for prompt efficiency
+            # Prefer real metrics from performance logs
+            metrics = regional_metrics.get(region_id, {}) if isinstance(regional_metrics, dict) else {}
+            congestion = metrics.get('avg_congestion', regional_congestion.get(region_id, 0))
+            vehicle_count = metrics.get('active_vehicles', None)
+            if vehicle_count is None:
+                region_edges = [e for e, r in self.edge_to_region.items() if r == region_id]
+                vehicle_count = sum(self.road_info.get(edge, {}).get('vehicle_num', 0) for edge in region_edges[:5])
+            avg_speed = metrics.get('avg_speed', None)
+            if avg_speed is None:
+                # compute average speed from edges if available
+                region_edges = [e for e, r in self.edge_to_region.items() if r == region_id]
+                speeds = [self.road_info.get(edge, {}).get('avg_speed', 0.0) for edge in region_edges[:5]]
+                avg_speed = (sum(speeds) / len(speeds)) if speeds else 0.0
+            capacity_util = metrics.get('capacity_utilization', 0.0)
+            region_line = (f"R{region_id}: vehicles={int(vehicle_count)}, avg_speed={avg_speed:.1f}m/s, cong={congestion:.2f}, "
+                         f"capacity_util={capacity_util:.2f}")
+            observation_parts.append(region_line)
+        
+        observation_parts.append("")
+        
+        # Routes Analysis（为每条候选附带逐区域的原始序列数据；不做评分）
+        possible_routes = self._get_possible_regional_routes(start_region, end_region, max_routes=4)
         route_list = []
         
         for i, route in enumerate(possible_routes):
@@ -1058,44 +1388,127 @@ class TrafficAgent:
                 continue
                 
             route_str = ">".join([f"R{r}" for r in route])
-            
-            # Calculate route congestion
-            route_congestion = np.mean([
-                regional_congestion.get(region, 0) for region in route[1:]  # Exclude start
-            ])
-            
-            # Check if route uses overloaded regions
-            overloaded_penalty = 0
-            if coordination_data:
-                overloaded_regions = set(coordination_data.get('overloaded_regions', []))
-                overloaded_penalty = len(set(route).intersection(overloaded_regions))
-            
-            route_compact = f"Rt{i+1}:{route_str}[cong:{route_congestion:.1f},avoid:{overloaded_penalty}]"
-            route_list.append(route_compact)
+            # 构造逐区域原始序列（拥堵、容量利用率、均速）
+            cong_series_parts = []
+            cap_series_parts = []
+            speed_series_parts = []
+            for rid in route:
+                rmetrics = regional_metrics.get(rid, {}) if isinstance(regional_metrics, dict) else {}
+                r_cong = rmetrics.get('avg_congestion', regional_congestion.get(rid, 0.0))
+                r_cap = rmetrics.get('capacity_utilization', 0.0)
+                if 'avg_speed' in rmetrics:
+                    r_speed = rmetrics.get('avg_speed', 0.0)
+                else:
+                    # 估算均速
+                    region_edges = [e for e, r in self.edge_to_region.items() if r == rid]
+                    speeds = [self.road_info.get(edge, {}).get('avg_speed', 0.0) for edge in region_edges[:5]]
+                    r_speed = (sum(speeds) / len(speeds)) if speeds else 0.0
+                cong_series_parts.append(f"R{rid}:{r_cong:.2f}")
+                cap_series_parts.append(f"R{rid}:{r_cap:.2f}")
+                speed_series_parts.append(f"R{rid}:{r_speed:.1f}")
+            cong_series = "|".join(cong_series_parts)
+            cap_series = "|".join(cap_series_parts)
+            speed_series = "|".join(speed_series_parts)
+            route_line = (f"Rt{i+1}: {route_str} | cong_series: {cong_series} | "
+                          f"cap_series: {cap_series} | speed_series: {speed_series}")
+            route_list.append(route_line)
         
         if route_list:
-            observation_parts.append("Routes: " + " | ".join(route_list))
+            observation_parts.append("Routes:")
+            observation_parts.append("")
+            for route in route_list:
+                observation_parts.append(route)
             observation_parts.append("")
         
-        # Simplified performance - 只显示关键指标
-        performance = context.get('performance_metrics', {})
-        if performance:
-            perf_list = [
-                f"success:{performance.get('success_rate', 0):.1f}%",
-                f"balance:{performance.get('regional_balance', 0):.1f}"
-            ]
-            observation_parts.append("Performance: " + "|".join(perf_list))
-            observation_parts.append("")
+        # Coordination Raw（原始列表形式，不做平衡评分/份额推荐）
+        try:
+            overloaded_items = []
+            available_items = []
+            # 基于regional_metrics推导原始候选集
+            for rid in sorted(relevant_regions)[:8]:
+                rmetrics = regional_metrics.get(rid, {}) if isinstance(regional_metrics, dict) else {}
+                cong = rmetrics.get('avg_congestion', regional_congestion.get(rid, 0.0))
+                capu = rmetrics.get('capacity_utilization', 0.0)
+                if cong is not None and (cong > 3.0):
+                    overloaded_items.append(f"R{rid}(cong:{cong:.2f},cap:{capu:.2f})")
+                if cong is not None and capu is not None and (cong < 2.0 and capu < 0.6):
+                    available_items.append(f"R{rid}(cong:{cong:.2f},cap:{capu:.2f})")
+            if overloaded_items or available_items:
+                observation_parts.append("Coordination_Raw:")
+                observation_parts.append("")
+                if overloaded_items:
+                    observation_parts.append("overloaded: " + ", ".join(overloaded_items[:6]))
+                if available_items:
+                    observation_parts.append("available: " + ", ".join(available_items[:6]))
+                observation_parts.append("")
+        except Exception:
+            pass
         
-        observation_parts.append("Objective: Select route avoiding overloaded regions, optimizing load balance")
+        # Cut-Edge Status (raw metrics only)
+        observation_parts.append("Cut-Edge_Status:")
+        observation_parts.append("")
+        
+        # Generate boundary edge status for relevant connections
+        relevant_boundaries = []
+        for boundary_info in self.boundary_edges:
+            if (boundary_info['from_region'] in relevant_regions or 
+                boundary_info['to_region'] in relevant_regions):
+                relevant_boundaries.append(boundary_info)
+        
+        for boundary_info in relevant_boundaries[:6]:  # Limit to 6 boundaries
+            edge_id = boundary_info['edge_id'] 
+            from_region = boundary_info['from_region']
+            to_region = boundary_info['to_region']
+            # Use calculated boundary metrics for raw values
+            bmetrics = self._calculate_boundary_metrics(edge_id, boundary_info)
+            boundary_line = (f"BE_{from_region}_{to_region}: vehicles={bmetrics.get('vehicle_count', 0)}, "
+                           f"cong={bmetrics.get('congestion_level', 0.0):.2f}, util={bmetrics.get('utilization', 0.0):.2f}, "
+                           f"flow_rate={bmetrics.get('flow_rate', 0.0):.1f}veh/h")
+            observation_parts.append(boundary_line)
+        
+        # Do not include system performance/score summaries in the prompt
+        
+        observation_parts.append("Objective: Select route based on current raw regional and boundary metrics; avoid known congested areas and stuck edges.")
+        observation_parts.append("")
+        
+        # Route options for decision (only include once at final combination stage)
+        # Keep observation focused on factual state; options will be appended in _prepare_llm_input_texts
         
         observation_text = "\n".join(observation_parts)
-        # 严格的上下文长度控制 - 限制在800字符以内
-        max_context_length = 800
+        
+        # Allow sufficient context but prevent excessive length
+        max_context_length = 2500
         if len(observation_text) > max_context_length:
             observation_text = observation_text[:max_context_length-3] + "..."
         
         return observation_text
+    
+    def _prepare_llm_input_texts(self, context: Dict[str, Any]) -> List[str]:
+        """Prepare the exact text inputs that LLM will see for logging purposes."""
+        llm_input_texts = []
+        
+        for request in context['requests']:
+            start_region = request['start_region']
+            end_region = request['end_region']
+            
+            # Generate the observation text (what LLM sees)
+            observation_text = self._create_macro_route_observation(
+                start_region, end_region, context
+            )
+            
+            # Generate the route options (what LLM chooses from)
+            possible_routes = self._get_possible_regional_routes(start_region, end_region)
+            # Enforce numeric option protocol by logging numbered options for clarity
+            option_strs = []
+            for idx, route in enumerate(possible_routes, start=1):
+                option_strs.append(f"{idx}:{route}")
+            route_options = "/".join([str(route) for route in possible_routes])
+            
+            # Combine observation and options (single source of truth for options)
+            full_input = f"{observation_text}\n\nROUTE OPTIONS: {route_options}"
+            llm_input_texts.append(full_input)
+        
+        return llm_input_texts
     
     def _get_possible_regional_routes(self, start_region: int, 
                                     end_region: int, max_routes: int = 3) -> List[List[int]]:
@@ -1243,23 +1656,17 @@ class TrafficAgent:
         return boundary_edges
     
     def _estimate_macro_travel_time(self, region_sequence: List[int]) -> float:
-        """Estimate travel time for a macro route."""
-        base_time_per_region = 300  # 5 minutes base time per region
-        
-        total_time = 0
-        current_state = self.global_state_history[-1] if self.global_state_history else None
-        
-        for region_id in region_sequence:
-            region_time = base_time_per_region
-            
-            # Adjust for congestion
-            if current_state and region_id in current_state.regional_congestion:
-                congestion = current_state.regional_congestion[region_id]
-                region_time *= (1.0 + congestion * 0.3)  # 30% increase per congestion level
-            
-            total_time += region_time
-        
-        return total_time
+        """Estimate travel time for a macro route by summing recorded regional ATT.
+        Falls back to neutral default for regions without data.
+        """
+        try:
+            total_time = 0.0
+            for region_id in region_sequence:
+                total_time += self.get_region_att(region_id)
+            return total_time
+        except Exception:
+            # Fallback: neutral default per region if any unexpected error occurs
+            return 300.0 * len(region_sequence)
     
     def _make_heuristic_macro_plans(self, requests: List[Dict], 
                                   current_time: float) -> List[MacroRoute]:
@@ -1315,15 +1722,15 @@ class TrafficAgent:
                 # Vehicle deviated from route, replan
                 self.logger.log_info(f"Vehicle {vehicle_id} deviated from macro route, replanning")
                 
-                new_requests = [{
-                    'vehicle_id': vehicle_id,
-                    'start_region': current_region,
-                    'end_region': macro_route.end_region
-                }]
-                
-                new_routes = self.batch_macro_planning(new_requests, current_time)
-                if new_routes:
-                    self.vehicle_macro_routes[vehicle_id] = new_routes[0]
+                # Use single vehicle macro planning for replanning
+                new_route = self.plan_single_macro_route(
+                    vehicle_id=vehicle_id,
+                    start_region=current_region,
+                    end_region=macro_route.end_region,
+                    current_time=current_time
+                )
+                if new_route:
+                    self.vehicle_macro_routes[vehicle_id] = new_route
     
     def get_regional_recommendations(self, region_id: int, 
                                    current_time: float) -> RegionalRecommendation:
@@ -1391,6 +1798,16 @@ class TrafficAgent:
                 priority_vehicles=[],
                 avoid_edges=[]
             )
+
+    def get_global_guidance_overlay(self, parent_env=None) -> Dict[str, Any]:
+        """Expose current global macro guidance for downstream agents. Returns dict or empty."""
+        try:
+            if parent_env and hasattr(parent_env, '_get_current_global_macro_guidance'):
+                guidance = parent_env._get_current_global_macro_guidance()
+                return guidance or {}
+        except Exception:
+            pass
+        return {}
     
     def get_performance_metrics(self) -> Dict[str, float]:
         """Get Traffic Agent performance metrics."""

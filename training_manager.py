@@ -21,6 +21,7 @@ import signal
 import multiprocessing as mp
 import threading
 from typing import Dict, List, Any, Optional, Tuple
+import math
 from collections import deque
 from dataclasses import dataclass, field
 import json
@@ -70,6 +71,50 @@ class TrainingConfig:
             # 默认配置
             self.traffic_gpu = "cuda:2"
             self.regional_gpu = "cuda:3"
+
+        # 观测模式（关闭强化相位与放大量）
+        if os.getenv("OBSERVATION_MODE", "0") in ("1", "true", "True"): 
+            self.training_mode = "online_only"
+            self.enable_progressive_training = False
+            self.reinforcement_phase_enabled = False
+            self.reinforcement_batch_multiplier = 1
+            # 更长的切换阈值以避免进入reinforcement逻辑
+            self.online_steps_per_reinforcement = 10 ** 9
+
+        # 可视化 y 轴刻度
+        if os.getenv("PLOT_LOSS_LOG", "0") in ("1", "true", "True"):
+            self.plot_loss_on_log_scale = True
+
+        # 动态 padding 与最大长度
+        if os.getenv("USE_DYNAMIC_PADDING") is not None:
+            self.use_dynamic_padding = os.getenv("USE_DYNAMIC_PADDING", "1") in ("1", "true", "True")
+        if os.getenv("MAX_SEQ_LENGTH") is not None:
+            try:
+                self.max_seq_length = int(os.getenv("MAX_SEQ_LENGTH"))
+            except Exception:
+                pass
+
+        # Softplus 权重/EMA baseline
+        if os.getenv("REWARD_SOFTPLUS", "0") in ("1", "true", "True"):
+            self.use_softplus_reward_weight = True
+        if os.getenv("EMA_BASELINE", "0") in ("1", "true", "True"):
+            self.use_ema_baseline = True
+            if os.getenv("EMA_BETA") is not None:
+                try:
+                    self.ema_baseline_beta = float(os.getenv("EMA_BETA"))
+                except Exception:
+                    pass
+
+        if os.getenv("REINFORCEMENT_BATCH_MULTIPLIER") is not None:
+            try:
+                self.reinforcement_batch_multiplier = int(os.getenv("REINFORCEMENT_BATCH_MULTIPLIER"))
+            except Exception:
+                pass
+        if os.getenv("ONLINE_STEPS_PER_REINFORCEMENT") is not None:
+            try:
+                self.online_steps_per_reinforcement = int(os.getenv("ONLINE_STEPS_PER_REINFORCEMENT"))
+            except Exception:
+                pass
     
     traffic_gpu: str = "cuda:2"  # GPU for Traffic LLM training
     regional_gpu: str = "cuda:3"  # GPU for Regional LLM training
@@ -90,6 +135,9 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
     weight_decay: float = 0.01
     gradient_accumulation_steps: int = 8  # Increased to reduce memory per step
+    # Sequence/Tokenization
+    max_seq_length: int = 512
+    use_dynamic_padding: bool = True  # Use dynamic/no padding to avoid PAD loss
     
     # Progressive Mixed Training Configuration
     enable_progressive_training: bool = True  # Enable progressive mixed training
@@ -104,6 +152,15 @@ class TrainingConfig:
     warmup_phase_enabled: bool = True  # Enable offline warmup phase
     online_phase_enabled: bool = True  # Enable online micro-tuning phase  
     reinforcement_phase_enabled: bool = True  # Enable offline reinforcement phase
+    
+    # Visualization
+    plot_loss_on_log_scale: bool = False  # Prefer linear scale for readability
+    record_token_stats: bool = True  # Record tokens per step / loss per token
+
+    # Reward weighting & baseline smoothing (optional)
+    use_softplus_reward_weight: bool = False
+    use_ema_baseline: bool = False
+    ema_baseline_beta: float = 0.9
     
     # Checkpoint Configuration
     save_steps: int = 100  # Save adapters every N training steps
@@ -727,6 +784,19 @@ class MAGRPOTrainer:
             reward_values = [r for _, _, _, r in batch_inputs]
             reward_mean = np.mean(reward_values) if reward_values else 0.0
             reward_std = np.std(reward_values) if reward_values else 0.0
+
+            # Token statistics and normalized losses (optional but recommended)
+            tokens_this_step = 0
+            samples_this_step = len(batch_inputs)
+            if getattr(self.config, 'record_token_stats', False):
+                try:
+                    for (input_ids, attention_mask, _, _) in batch_inputs:
+                        # Count only non-PAD tokens (attention_mask==1)
+                        tokens_this_step += int(attention_mask.sum().item())
+                except Exception:
+                    # Fallback: count all tokens if mask unavailable
+                    for (input_ids, _, _, _) in batch_inputs:
+                        tokens_this_step += int(input_ids.numel())
             
             # Log training step
             if self.training_steps % self.config.log_steps == 0:
@@ -745,7 +815,7 @@ class MAGRPOTrainer:
             if self.config.enable_progressive_training:
                 self._update_progressive_state()
             
-            return {
+            metrics_out = {
                 'loss': step_loss,
                 'relative_reward_mean': reward_mean,
                 'relative_reward_std': reward_std,
@@ -753,6 +823,16 @@ class MAGRPOTrainer:
                 'training_phase': self.current_phase,
                 'online_steps_count': self.online_steps_count
             }
+
+            if getattr(self.config, 'record_token_stats', False):
+                metrics_out['tokens_this_step'] = tokens_this_step
+                metrics_out['samples_this_step'] = samples_this_step
+                if tokens_this_step > 0:
+                    metrics_out['loss_per_token'] = step_loss / float(tokens_this_step)
+                if samples_this_step > 0:
+                    metrics_out['loss_per_sample'] = step_loss / float(samples_this_step)
+
+            return metrics_out
             
         except Exception as e:
             self.logger.error(f"MAGRPO_TRAIN_ERROR: {self.name} training step failed: {e}")
@@ -774,8 +854,17 @@ class MAGRPOTrainer:
                     self.logger.warning(f"MAGRPO_REWARD_EXTRACT: Invalid sample format: {type(sample)}")
                     rewards.append(0.5)  # Default reward
             
-            # Calculate baseline (group mean)
-            baseline_reward = np.mean(rewards)
+            # Calculate baseline
+            if getattr(self.config, 'use_ema_baseline', False):
+                # Maintain EMA baseline per-trainer
+                if not hasattr(self, '_ema_baseline'):
+                    self._ema_baseline = float(np.mean(rewards)) if len(rewards) > 0 else 0.0
+                beta = float(getattr(self.config, 'ema_baseline_beta', 0.9))
+                current_mean = float(np.mean(rewards)) if len(rewards) > 0 else 0.0
+                self._ema_baseline = beta * self._ema_baseline + (1 - beta) * current_mean
+                baseline_reward = self._ema_baseline
+            else:
+                baseline_reward = np.mean(rewards)
             
             # Calculate relative rewards
             relative_rewards = [reward - baseline_reward for reward in rewards]
@@ -812,11 +901,12 @@ class MAGRPOTrainer:
                     continue
                 
                 # Tokenize
+                # Prefer dynamic padding to minimize PAD tokens
                 encoding = self.tokenizer(
                     training_text,
                     truncation=True,
-                    max_length=512,  # Reasonable length for training
-                    padding="max_length",
+                    max_length=self.config.max_seq_length,
+                    padding=("longest" if self.config.use_dynamic_padding else "max_length"),
                     return_tensors="pt"
                 )
                 
@@ -826,6 +916,13 @@ class MAGRPOTrainer:
                 # For causal language modeling, labels = input_ids
                 # Clone and detach to ensure proper gradient flow
                 labels = input_ids.clone().detach()
+                # Mask PAD tokens in labels to avoid contributing to loss
+                if attention_mask is not None:
+                    try:
+                        labels = labels.masked_fill(attention_mask == 0, -100)
+                    except Exception:
+                        # Fallback for unexpected shapes
+                        labels[attention_mask == 0] = -100
                 
                 # Ensure tensors are contiguous and have proper shape
                 input_ids = input_ids.contiguous()
@@ -833,7 +930,12 @@ class MAGRPOTrainer:
                 labels = labels.contiguous()
                 
                 # Convert relative reward to weight (ensure positive)
-                weight = max(0.1, 1.0 + rel_reward)  # Minimum weight of 0.1
+                if getattr(self.config, 'use_softplus_reward_weight', False):
+                    # Smooth, always-positive weight around ~1.0 baseline
+                    weight = torch.nn.functional.softplus(torch.tensor(rel_reward, device=self.device)).item() + 1.0
+                    weight = float(max(0.1, weight))
+                else:
+                    weight = max(0.1, 1.0 + rel_reward)  # Minimum weight of 0.1
                 
                 batch_inputs.append((input_ids, attention_mask, labels, weight))
             
@@ -1616,7 +1718,13 @@ class TrainingManager:
             'regional_lr': [],
             'att_improvement': [],
             'cooperation_quality': [],
-            'phase_transitions': []
+            'phase_transitions': [],
+            # Token-level statistics
+            'tokens_per_step': [],
+            'traffic_loss_per_token': [],
+            'regional_loss_per_token': [],
+            'traffic_loss_per_sample': [],
+            'regional_loss_per_sample': []
         }
         
         # Moving averages for smoother trends
@@ -1761,7 +1869,8 @@ class TrainingManager:
             ax1.set_title('Training Loss Convergence Analysis', fontweight='bold')
             ax1.set_xlabel('Training Steps')
             ax1.set_ylabel('Loss Value')
-            ax1.set_yscale('log')
+            if self.config.plot_loss_on_log_scale:
+                ax1.set_yscale('log')
             ax1.grid(True, alpha=0.3)
             ax1.legend()
             
@@ -2034,7 +2143,7 @@ class TrainingManager:
                     ax6.grid(True, alpha=0.3)
                     ax6.legend(loc='upper left')
             
-            # Update Plot 7: Sample Throughput
+            # Update Plot 7: Sample Throughput / Token Stats
             if len(self.training_history['steps']) > 0:
                 sample_throughput = [self.total_samples_processed * (i+1) / len(steps) 
                                    for i in range(len(steps))]
@@ -2046,8 +2155,20 @@ class TrainingManager:
                 self.line_objects['sample_throughput'].set_data(steps_sync, sample_throughput_sync)
                 ax7.relim()
                 ax7.autoscale_view()
+                
+                # If token stats are recorded, overlay a secondary y-axis curve for tokens/step
+                if getattr(self.config, 'record_token_stats', False) and len(self.training_history['tokens_per_step']) > 0:
+                    try:
+                        ax7b = ax7.twinx()
+                        tok_min_len = min(len(steps), len(self.training_history['tokens_per_step']))
+                        ax7b.plot(steps[:tok_min_len], self.training_history['tokens_per_step'][:tok_min_len],
+                                  color='darkorange', linewidth=1.5, alpha=0.7, label='Tokens/Step')
+                        ax7b.set_ylabel('Tokens per Step', color='darkorange')
+                        ax7b.tick_params(axis='y', labelcolor='darkorange')
+                    except Exception:
+                        pass
             
-            # Update Plot 8: Loss Convergence
+            # Update Plot 8: Loss Convergence (diff) and optionally per-token curves
             if len(self.training_history['traffic_loss']) > 1:
                 traffic_loss_diff = np.diff(self.training_history['traffic_loss'])
                 regional_loss_diff = np.diff(self.training_history['regional_loss'])
@@ -2073,6 +2194,20 @@ class TrainingManager:
                 
                 ax8.relim()
                 ax8.autoscale_view()
+                
+                # Optional: overlay normalized losses for stability observation
+                if getattr(self.config, 'record_token_stats', False) and len(self.training_history['traffic_loss_per_token']) > 0:
+                    try:
+                        ax8b = ax8.twinx()
+                        norm_min_len = min(len(steps), len(self.training_history['traffic_loss_per_token']), len(self.training_history['regional_loss_per_token']))
+                        ax8b.plot(steps[:norm_min_len], self.training_history['traffic_loss_per_token'][:norm_min_len],
+                                  color='teal', linewidth=1.2, alpha=0.7, label='Traffic Loss/Token')
+                        ax8b.plot(steps[:norm_min_len], self.training_history['regional_loss_per_token'][:norm_min_len],
+                                  color='firebrick', linewidth=1.2, alpha=0.7, label='Regional Loss/Token')
+                        ax8b.set_ylabel('Loss per Token')
+                        ax8b.tick_params(axis='y')
+                    except Exception:
+                        pass
             
             # Save updated figures to same files (overwrite)
             chart_path = self.chart_files['main']
@@ -2140,6 +2275,14 @@ class TrainingManager:
                     self.training_history['traffic_lr'].append(metrics.get('learning_rate', 0.0))
                     self.training_history['att_improvement'].append(avg_att_reward)
                     
+                    # Token stats / normalized loss
+                    if 'tokens_this_step' in metrics:
+                        self.training_history['tokens_per_step'].append(int(metrics.get('tokens_this_step', 0)))
+                    if 'loss_per_token' in metrics:
+                        self.training_history['traffic_loss_per_token'].append(float(metrics.get('loss_per_token', 0.0)))
+                    if 'loss_per_sample' in metrics:
+                        self.training_history['traffic_loss_per_sample'].append(float(metrics.get('loss_per_sample', 0.0)))
+                    
                     # Track ATT improvement history with real data
                     if len(self.att_improvement_history) == 0 or current_step % 5 == 0:
                         # Sample every 5 steps with real ATT data
@@ -2175,6 +2318,16 @@ class TrainingManager:
                     self.training_history['regional_reward'].append(avg_total_reward)
                     self.training_history['regional_lr'].append(metrics.get('learning_rate', 0.0))
                     self.training_history['cooperation_quality'].append(avg_coop_reward)
+                    
+                    # Token stats / normalized loss
+                    if 'tokens_this_step' in metrics:
+                        # already appended once for traffic; keep aligned length by padding if necessary
+                        if len(self.training_history['tokens_per_step']) < len(self.training_history['steps']):
+                            self.training_history['tokens_per_step'].append(int(metrics.get('tokens_this_step', 0)))
+                    if 'loss_per_token' in metrics:
+                        self.training_history['regional_loss_per_token'].append(float(metrics.get('loss_per_token', 0.0)))
+                    if 'loss_per_sample' in metrics:
+                        self.training_history['regional_loss_per_sample'].append(float(metrics.get('loss_per_sample', 0.0)))
                     
                     # Track cooperation quality history with real data
                     if len(self.cooperation_quality_history) == 0 or current_step % 5 == 0:
@@ -2652,6 +2805,33 @@ class TrainingManager:
                         control_messages_received += 1
                         
                         self.logger.info(f"CONTROL_MESSAGE: Received autonomous vehicle count - {total_autonomous}/{total_vehicles}")
+                        continue
+
+                    # Handle time-sliced training batches: unpack and enqueue all samples
+                    if (
+                        isinstance(sample, dict)
+                        and sample.get('time_sliced_training') is True
+                        and isinstance(sample.get('data'), list)
+                    ):
+                        batch_samples = sample.get('data') or []
+                        agent_type = sample.get('agent_type', 'unknown')
+                        session_id = sample.get('session_id', 'unknown')
+
+                        # Update counters
+                        batch_count = len(batch_samples)
+                        self.total_samples_processed += batch_count
+                        data_received_this_cycle += batch_count
+
+                        # Add all samples to buffers (keep parity with single-sample path)
+                        for s in batch_samples:
+                            self.traffic_buffer.add_sample(s)
+                            self.regional_buffer.add_sample(s)
+
+                        self.logger.info(
+                            f"TRAINING_BATCH_RECEIVED: session={session_id}, agent_type={agent_type}, "
+                            f"batch_size={batch_count}, Traffic buffer: {self.traffic_buffer.size()}, "
+                            f"Regional buffer: {self.regional_buffer.size()}"
+                        )
                         continue
                     
                     # Regular training sample processing

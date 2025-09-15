@@ -1,0 +1,35 @@
+---
+description: 运行命令与 CLI 约定
+---
+# 运行命令与 CLI 约定
+
+推荐使用下述命令运行：
+
+```bash
+python run_multi_agent.py check
+python run_multi_agent.py quick
+python run_multi_agent.py full
+python run_multi_agent.py compare
+python run_multi_agent.py benchmark
+python run_multi_agent.py train
+python run_multi_agent.py custom --llm "/data/zhouyuping/Qwen/" --batch-size 16 --location Manhattan --step-size 180 --max-steps 43200
+```
+
+核心参数约定（新增脚本请保持一致）：
+- `--llm / --llm-path-or-name`：LLM 模型路径或名称，默认优先本地路径（示例：`/data/zhouyuping/Qwen/`）。
+- `--batch-size`：LLM 批大小。
+- `--location`：仿真城市/区域（示例：`NewYork`/`Manhattan`）。
+- `--step-size`：决策步长（秒）。
+- `--max-steps`：仿真最大步数。
+- `--no-reflection`：禁用 LLM 反思。
+- `--single-agent` / `--multi-agent`：架构选择（默认多智能体）。
+- `--use-api-llm`：使用 API LLM（否则默认为本地共享 LLM）。
+- `--enable-training`：启用 MAGRPO 在线训练（仅本地 LLM + 多智能体模式）。
+
+数据与依赖检查：
+- 使用 `check` 子命令进行数据文件与目录检查，详见 [run_multi_agent.py](mdc:run_multi_agent.py) 中 `check_requirements`。
+- 安装依赖时需先装 PyTorch，再 `pip install -r [requirements.txt](mdc:requirements.txt)`。
+
+日志与监控：
+- WandB 默认离线模式（见 [run_multi_agent.py](mdc:run_multi_agent.py) 顶部 `os.environ["WANDB_MODE"] = "offline"`）。
+- 日志目录在 `logs/` 下，包含性能、决策与汇总报告，命名规则见 [README.md](mdc:README.md)。

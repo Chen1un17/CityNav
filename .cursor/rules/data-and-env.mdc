@@ -1,0 +1,24 @@
+---
+description: 数据路径、环境变量与外部服务约定
+---
+# 数据与环境配置
+
+数据路径（示例，来自 [main.py](mdc:main.py) 与 [run_multi_agent.py](mdc:run_multi_agent.py)）：
+- Region 数据目录：`/data/zhouyuping/LLMNavigation/Data/Region_1`（包括 `Manhattan_sumo_config.sumocfg`, `Manhattan_od_0.01.rou.alt.xml`, `Manhattan_road_info.json`, `Manhattan_adjacency_info.json` 等）
+- 任务信息：`/data/zhouyuping/LLMNavigation/Data/task_info.json`
+- 区域划分数据：`/data/zhouyuping/LLMNavigation/Data/NYC/Region_1`（若不存在将回退至单智能体模式）
+
+LLM 模型：
+- 本地模型默认路径：`/data/zhouyuping/Qwen/`
+- 使用 API LLM 时：若为 Qwen，需设置环境变量 `DASHSCOPE_API_KEY`，格式应以 `sk-` 开头。
+
+外部服务：
+- vLLM 推理服务器默认探测端口：`http://localhost:8000`、`http://127.0.0.1:8000`（以及 8001 作为备选）。
+- 若启用 LoRA 热更新，需确保服务器支持运行时加载（`VLLM_ALLOW_RUNTIME_LORA_UPDATING=True`）。
+
+日志与检查：
+- 日志目录：`logs/`，训练日志位于 `logs/training_<location>/`，多智能体运行日志命名含位置和模型名。
+- 运行前可使用 `python run_multi_agent.py check` 检查关键数据与目录是否存在。
+
+约定：
+- 尽量通过 CLI 参数传入数据路径，避免在业务代码中硬编码；确需默认值时在规则与 README 中同步说明。

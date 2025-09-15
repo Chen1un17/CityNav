@@ -48,7 +48,7 @@ class Simulation:
 
         # Parse route file and select autonomous vehicles
         all_vehicles = parse_rou_file(self.route_file)
-        all_vehicle_ids = [veh_id for veh_id, _, _ in all_vehicles]
+        all_vehicle_ids = [veh_id for veh_id, _, _, _ in all_vehicles]
         self.total_vehicles = len(all_vehicles)
         self.autonomous_vehicles = set(random.sample(all_vehicle_ids, int(0.02 * self.total_vehicles)))
         print(f"Selected {len(self.autonomous_vehicles)} vehicles as autonomous vehicles.")

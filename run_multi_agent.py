@@ -309,6 +309,8 @@ def main_runner():
                               help='Use API LLM instead of local LLM (requires API key)')
     custom_parser.add_argument('--enable-training', action='store_true',
                               help='Enable MAGRPO online training (requires local LLM)')
+    custom_parser.add_argument('--disable-global-guidance', action='store_true',
+                              help='Disable per-timestamp global macro guidance')
     
     args = parser.parse_args()
     
@@ -378,6 +380,16 @@ def main_runner():
             print(f"    * Training Group Sizes: Traffic=8, Regional=12")
         print()
         
+        # Propagate global guidance switch via environment variable
+        try:
+            if args.disable_global_guidance:
+                os.environ['DISABLE_GLOBAL_GUIDANCE'] = '1'
+            else:
+                if 'DISABLE_GLOBAL_GUIDANCE' in os.environ:
+                    del os.environ['DISABLE_GLOBAL_GUIDANCE']
+        except Exception:
+            pass
+
         main(args.llm, args.batch_size, args.location, use_reflection,
              args.step_size, args.max_steps, use_multi_agent, use_local_llm, enable_training)
 
