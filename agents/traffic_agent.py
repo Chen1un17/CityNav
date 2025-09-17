@@ -200,9 +200,37 @@ class TrafficAgent:
             # Update boundary traffic flow tracking
             self._update_boundary_traffic_flow(current_time)
             
+            self._emit_hotspot_throttle_guidance(current_time)
+            
         except Exception as e:
             self.logger.log_error(f"Traffic Agent global state update failed: {e}")
     
+    def _emit_hotspot_throttle_guidance(self, current_time: float) -> None:
+        """Issue temporary global guidance to avoid hotspot edges and throttle inflow."""
+        try:
+            if not hasattr(self, 'parent_env'):
+                return
+            env = self.parent_env
+            # Require recent hamper stats
+            if not hasattr(env, 'exit_hamper_counts'):
+                return
+            # Select top hotspot edges above minimal threshold
+            items = sorted(env.exit_hamper_counts.items(), key=lambda x: x[1], reverse=True)[:8]
+            hotspot_edges = [e for e, c in items if c >= 3]
+            if not hotspot_edges:
+                return
+            # Update global guidance with short TTL
+            try:
+                env.global_macro_guidance['data'] = {
+                    'avoid_edges': hotspot_edges,
+                    'message': 'Hotspot throttle: avoid high-hamper edges'
+                }
+                env.global_macro_guidance['expire_at'] = float(traci.simulation.getTime() + 240.0)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def collect_regional_congestion_report(self, current_time: float, regional_status_reports: Dict = None) -> Dict:
         """
         Collect real-time congestion report from all regions with coordination data.

@@ -1770,6 +1770,82 @@ class RegionalAgent:
         if not self.outgoing_boundaries:
             return None
         
+    def make_intra_region_destination_planning(self, vehicle_id: str, destination_edge: str, current_time: float) -> Optional[Dict]:
+        """Plan intra-region route directly to a destination edge within the same region using LLM selection pipeline.
+        
+        Args:
+            vehicle_id: Vehicle ID to plan for
+            destination_edge: Target destination edge (must be in this region)
+            current_time: Current simulation time
+        
+        Returns:
+            Selected plan dict with 'route' to destination and 'boundary_edge' set to destination_edge, or None
+        """
+        try:
+            # Input validation
+            if not isinstance(vehicle_id, str) or not vehicle_id.strip():
+                self.logger.log_error(f"REGIONAL_INTRA: Invalid vehicle_id: {vehicle_id}")
+                return None
+            if not isinstance(destination_edge, str) or not destination_edge.strip():
+                self.logger.log_error(f"REGIONAL_INTRA: Invalid destination_edge: {destination_edge}")
+                return None
+            # Validate destination belongs to this region
+            if destination_edge not in self.edge_to_region or self.edge_to_region[destination_edge] != self.region_id:
+                self.logger.log_warning(f"REGIONAL_INTRA: Destination {destination_edge} not in region {self.region_id}")
+                return None
+            
+            # Get current vehicle position using SUMO API
+            try:
+                current_edge = traci.vehicle.getRoadID(vehicle_id)
+                if not self._is_valid_edge_for_planning(current_edge):
+                    self.logger.log_warning(f"REGIONAL_INTRA: Vehicle {vehicle_id} on invalid edge: {current_edge}")
+                    return None
+                # Verify vehicle is actually in our region
+                if current_edge not in self.edge_to_region or self.edge_to_region[current_edge] != self.region_id:
+                    self.logger.log_warning(f"REGIONAL_INTRA: Vehicle {vehicle_id} edge {current_edge} not in region {self.region_id}")
+                    return None
+            except Exception as traci_error:
+                self.logger.log_error(f"REGIONAL_INTRA: TraCI error for vehicle {vehicle_id}: {traci_error}")
+                return None
+            
+            # Generate candidates to destination (reuse boundary candidate generator with destination)
+            route_candidates = self._generate_regional_route_candidates(
+                current_edge, [destination_edge], current_time
+            )
+            
+            if not route_candidates:
+                # Fallback: create minimal route entry to destination
+                fallback = self._create_fallback_route(current_edge, destination_edge)
+                if fallback:
+                    fallback['reasoning'] = 'Intra-region fallback to destination'
+                    return fallback
+                return None
+            
+            # Use LLM selector (target_region = self.region_id for context)
+            selected_plan = self._llm_select_regional_route(
+                vehicle_id, current_edge, route_candidates, self.region_id, current_time
+            )
+            
+            if selected_plan:
+                # Ensure keys and adapt semantics: boundary_edge := destination_edge
+                selected_plan['boundary_edge'] = destination_edge
+                self.logger.log_info(
+                    f"REGIONAL_INTRA: {vehicle_id} planned route to destination {destination_edge} (edges={len(selected_plan.get('route', []))})"
+                )
+                # Update tracking
+                self.vehicle_routes[vehicle_id] = list(selected_plan.get('route', []))
+                self.vehicle_targets[vehicle_id] = destination_edge
+                self.vehicle_last_update[vehicle_id] = current_time
+                for edge in selected_plan.get('route', []):
+                    if edge in self.region_edges:
+                        self.planned_routes[edge] += 1
+                return selected_plan
+            return None
+        
+        except Exception as e:
+            self.logger.log_error(f"REGIONAL_INTRA: Critical error for {vehicle_id}: {e}")
+            return None
+
         boundary_scores = {}
         
         for boundary in self.outgoing_boundaries:
@@ -2405,6 +2481,19 @@ class RegionalAgent:
                     return 0.1  # Priority boost
                 elif travel_time > 300:  # More than 5 minutes
                     return 0.05  # Moderate boost
+            
+            # Elevate priority for vehicles flagged by environment as repeatedly stuck (idle-based)
+            try:
+                if hasattr(self, 'parent_env') and hasattr(self.parent_env, 'vehicle_last_movement_time'):
+                    now = float(traci.simulation.getTime())
+                    last_move = float(self.parent_env.vehicle_last_movement_time.get(vehicle_id, now))
+                    idle_duration = max(0.0, now - last_move)
+                    if idle_duration > 600.0:
+                        return 0.12
+                    elif idle_duration > 300.0:
+                        return 0.08
+            except Exception:
+                pass
                     
             # Check for boundary approach (vehicles nearing region exits get priority)
             if edge_id in [b['edge_id'] for b in self.boundary_edges if b.get('from_region') == self.region_id]:
@@ -3369,6 +3458,21 @@ class RegionalAgent:
                         density_penalty = (vehicle_count / road_capacity) * 4.0
                         priority_score -= density_penalty
             
+            # Factor 5: Avoid hotspot edges provided by environment/global guidance
+            try:
+                avoid_edges = set()
+                if hasattr(self, 'parent_env') and hasattr(self.parent_env, 'hotspot_avoid_edges'):
+                    avoid_edges |= set(self.parent_env.hotspot_avoid_edges)
+                if hasattr(self, 'parent_env') and hasattr(self.parent_env, '_get_current_global_macro_guidance'):
+                    gg = self.parent_env._get_current_global_macro_guidance()
+                    if gg:
+                        avoid_edges |= set(gg.get('avoid_edges', []))
+                for e in route_edges[:8]:
+                    if e in avoid_edges:
+                        priority_score -= 80.0
+            except Exception:
+                pass
+
             return max(0.0, priority_score)
             
         except Exception as e:

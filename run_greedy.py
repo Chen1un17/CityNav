@@ -7,6 +7,7 @@ from tqdm import tqdm
 import networkx as nx
 import traci
 import wandb
+import xml.etree.ElementTree as ET
 from typing import Dict, List, Tuple, Optional
 os.environ["WANDB_MODE"] = "offline"
 sys.path.append("../")
@@ -61,6 +62,11 @@ class GreedyRoutePlanning(object):
         self.target_autonomous_count = 0
         self.route_lookup = {}
         
+        # NYC dual-route support
+        self.primary_route_file: Optional[str] = None
+        self.background_route_files: List[str] = []
+        self.primary_vehicle_ids: set = set()
+        
         # Network data
         self.road_info = None
         self.adjacency_matrix = None
@@ -104,28 +110,62 @@ class GreedyRoutePlanning(object):
         
         print(f"Loaded {len(self.road_info)} road segments and {len(self.adjacency_matrix)} adjacency entries")
         
-        # Parse route file for total vehicle count
-        print("Parsing vehicle routes...")
-        all_vehicles = parse_rou_file(self.route_file)
+        # Parse SUMO config to get route files and build primary vehicle set
+        self._load_route_files_from_sumocfg()
+        
+        # Parse ONLY the primary route file for autonomous-candidate vehicles
+        print("Parsing primary route file for autonomous candidates...")
+        all_vehicles = parse_rou_file(self.primary_route_file)
+        self.primary_vehicle_ids = {veh_id for veh_id, _, _, _ in all_vehicles}
         self.total_vehicles = len(all_vehicles)
         
-        # Store route info for route computation
-        self.route_lookup = {veh_id: (start_edge, end_edge) 
-                           for veh_id, start_edge, end_edge, _ in all_vehicles}
+        # Store route info for route computation (primary only)
+        self.route_lookup = {veh_id: (start_edge, end_edge)
+                             for veh_id, start_edge, end_edge, _ in all_vehicles}
         
-        # Calculate target autonomous vehicles (2% of total vehicles)
+        # Calculate target autonomous vehicles (2% of PRIMARY route vehicles)
         self.target_autonomous_count = int(0.02 * self.total_vehicles)
         self.autonomous_vehicles = set()
         self.vehicles_processed_count = 0  # Counter for sequential selection
         
-        print(f"Total vehicles in route file: {self.total_vehicles}")
-        print(f"Target autonomous vehicles (2%): {self.target_autonomous_count}")
+        print(f"Primary route file: {self.primary_route_file}")
+        if self.background_route_files:
+            print(f"Background route files: {', '.join(self.background_route_files)}")
+        print(f"Total vehicles in PRIMARY route file: {self.total_vehicles}")
+        print(f"Target autonomous vehicles (2% of primary): {self.target_autonomous_count}")
         
         # Get edge list from SUMO
         self.edges = traci.edge.getIDList()
         print(f"Retrieved {len(self.edges)} edges from SUMO")
         
-        print(f"Ready for sequential autonomous vehicle selection with {self.algorithm} algorithm")
+        print(f"Ready for sequential autonomous vehicle selection from PRIMARY route using {self.algorithm} algorithm")
+
+    def _load_route_files_from_sumocfg(self) -> None:
+        """
+        Parse the SUMO config to extract route files. The first one is treated as
+        the PRIMARY route file (eligible for autonomous selection and ATT metrics),
+        while any subsequent files are treated as BACKGROUND (no decisions/ATT).
+        """
+        try:
+            tree = ET.parse(self.sumo_config)
+            root = tree.getroot()
+            input_node = root.find('input')
+            if input_node is None:
+                raise ValueError("SUMO config missing <input> section")
+            route_files_attr = input_node.find('route-files')
+            if route_files_attr is None:
+                raise ValueError("SUMO config missing <route-files> entry")
+            value = route_files_attr.get('value', '')
+            routes = [p.strip() for p in value.split(',') if p.strip()]
+            if not routes:
+                raise ValueError("No route files found in SUMO config")
+            self.primary_route_file = routes[0]
+            self.background_route_files = routes[1:]
+        except Exception as e:
+            print(f"Failed to parse SUMO config for route files: {e}")
+            # Fallback: use provided route_file as primary
+            self.primary_route_file = self.route_file
+            self.background_route_files = []
     
     def _compute_greedy_route(self, start_edge: str, end_edge: str) -> Optional[Dict]:
         """
@@ -324,7 +364,8 @@ class GreedyRoutePlanning(object):
                         
                         # Select first 2% of vehicles as autonomous (sequential selection)
                         self.vehicles_processed_count += 1
-                        if len(self.autonomous_vehicles) < self.target_autonomous_count:
+                        if (veh_id in self.primary_vehicle_ids and 
+                            len(self.autonomous_vehicles) < self.target_autonomous_count):
                             self.autonomous_vehicles.add(veh_id)
                             
                             # Get start and end edges for route computation from SUMO
@@ -513,14 +554,23 @@ def run_single_experiment(location: str, step_size: float, max_steps: int,
     Returns:
         Tuple of (average_travel_time, completed_vehicles)
     """
-    # File paths using the specified data structure
-    sumo_config = f"/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_sumo_config.sumocfg"
-    route_file = f"/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_od_0.01.rou.alt.xml"
-    road_info_file = f"/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_road_info.json"
-    adjacency_file = f"/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_adjacency_info.json"
+    # File paths based on location
+    if location in ["NewYork", "NYC", "NY"]:
+        sumo_config = "/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_sumo_config.sumocfg"
+        # Primary route file will be inferred from SUMO config; set a best-effort default
+        route_file = "/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_od_0.1.rou.alt.xml"
+        road_info_file = "/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_road_info.json"
+        # Use city-wide adjacency by default
+        adjacency_file = "/data/zhouyuping/LLMNavigation/Data/edge_adjacency_alpha_1.json"
+    else:
+        sumo_config = f"/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_sumo_config.sumocfg"
+        route_file = f"/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_od_0.01.rou.alt.xml"
+        road_info_file = f"/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_road_info.json"
+        adjacency_file = f"/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_adjacency_info.json"
     
     # Verify required files exist
-    required_files = [sumo_config, route_file, road_info_file, adjacency_file]
+    required_files = [sumo_config, road_info_file, adjacency_file]
+    # route_file may be inferred from sumo_config at runtime; do not block on it here
     missing_files = [f for f in required_files if not os.path.exists(f)]
     
     if missing_files:

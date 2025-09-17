@@ -2807,6 +2807,29 @@ class TrainingManager:
                         self.logger.info(f"CONTROL_MESSAGE: Received autonomous vehicle count - {total_autonomous}/{total_vehicles}")
                         continue
 
+                    # Handle LoRA hot reload event from environment
+                    if isinstance(sample, dict) and sample.get('message_type') == 'lora_hot_reload':
+                        try:
+                            llm_type = sample.get('llm_type', 'unknown')
+                            adapter_name = sample.get('adapter_name', 'unknown')
+                            adapter_path = sample.get('adapter_path', 'unknown')
+                            source = sample.get('source', 'unknown')
+                            self.logger.info(
+                                f"LORA_EVENT: Hot-reload applied (type={llm_type}, name={adapter_name}, src={source}) -> {adapter_path}"
+                            )
+                            # Also log to specific trainer for visibility
+                            if llm_type == 'traffic':
+                                self.traffic_trainer.logger.info(
+                                    f"LORA_EVENT: Hot-reload applied -> {adapter_name} ({adapter_path}) from {source}"
+                                )
+                            elif llm_type == 'regional':
+                                self.regional_trainer.logger.info(
+                                    f"LORA_EVENT: Hot-reload applied -> {adapter_name} ({adapter_path}) from {source}"
+                                )
+                        except Exception as e:
+                            self.logger.error(f"LORA_EVENT_HANDLE_ERROR: {e}")
+                        continue
+
                     # Handle time-sliced training batches: unpack and enqueue all samples
                     if (
                         isinstance(sample, dict)
