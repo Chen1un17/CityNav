@@ -7,3 +7,6 @@ wandb/
 __pycache__/
 Qwen/
 *.md
+.cursor/
+Baselines/
+.claude/
