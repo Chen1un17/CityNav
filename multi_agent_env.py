@@ -13,7 +13,7 @@ import threading
 import signal
 import queue
 from contextlib import contextmanager
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Set, Optional, Tuple, Any
 import networkx as nx
 import traci
@@ -107,6 +107,9 @@ class MultiAgentTrafficEnvironment:
         self.is_training_active = False  # Flag to indicate training is in progress
         self.simulation_paused = False  # Flag to indicate simulation is paused for training
         self.training_session_count = 0  # Counter for training sessions
+        # 仅在确有新LoRA时才恢复：默认不在时间分片训练时释放推理模型，避免空重载
+        self.release_models_during_time_sliced_training = False
+        self.models_released = False
         
         # Circuit breaker for LLM call management
         self.llm_failure_counts = {}  # region_id -> (failure_count, last_failure_time)
@@ -197,6 +200,7 @@ class MultiAgentTrafficEnvironment:
         
         # Threading for parallel processing - match decision queue limit
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="decision_worker")
+        # 并行宏观/区域规划已回退，移除专用执行器与每区限流
         
         # Step-wise traffic state caching for optimization
         self._step_traffic_state_cache = {
@@ -218,6 +222,18 @@ class MultiAgentTrafficEnvironment:
         self.exit_hamper_counts: Dict[str, int] = {}
         self._hamper_samples: int = 0
         self.hotspot_avoid_edges: Set[str] = set()
+        
+        # Stuck-event tracking for RL penalty and analytics
+        self.vehicle_stuck_events: Dict[str, int] = {}
+        self.currently_stuck_vehicles: Set[str] = set()
+        # Stuck zone management: active blocked edges and cooldown control
+        self.vehicle_stuck_since: Dict[str, float] = {}
+        self.vehicle_stuck_zone_edges: Dict[str, Set[str]] = {}
+        self.blocked_edges_active: Set[str] = set()
+        self.cooldown_window_sec: float = 720.0
+        self.cooldown_zones: List[Dict[str, Any]] = []  # {edges:set, expire_at:float, assignments:int}
+        self.cooldown_edges: Set[str] = set()
+        self.max_zone_assignments_per_window: int = 30
         
         # Parameters for congestion-aware emergency routing
         self.congestion_weight_alpha: float = 1.2  # occupancy influence
@@ -250,9 +266,9 @@ class MultiAgentTrafficEnvironment:
         self.total_time_slots = 86400 // self.vis_update_interval  # 24 time slots
         self.current_time_slot = 0
         
-        # Regional congestion data (39 regions x time_slots)
-        self.congestion_matrix = np.zeros((39, self.total_time_slots))
-        self.region_labels = [f"Region {i}" for i in range(39)]
+        # Regional congestion data (75 regions x time_slots)
+        self.congestion_matrix = np.zeros((75, self.total_time_slots))
+        self.region_labels = [f"Region {i}" for i in range(75)]
         self.time_labels = [f"T{i}" for i in range(self.total_time_slots)]
         
         # Metrics for line plots
@@ -296,8 +312,8 @@ class MultiAgentTrafficEnvironment:
         self.axes['heatmap'].set_title('Regional Traffic Congestion Heatmap')
         self.axes['heatmap'].set_xlabel('Time Slots')
         self.axes['heatmap'].set_ylabel('Regions')
-        self.axes['heatmap'].set_yticks(range(0, 39, 5))
-        self.axes['heatmap'].set_yticklabels([f"R{i}" for i in range(0, 39, 5)])
+        self.axes['heatmap'].set_yticks(range(0, 75, 5))
+        self.axes['heatmap'].set_yticklabels([f"R{i}" for i in range(0, 75, 5)])
         plt.colorbar(self.heatmap_im, ax=self.axes['heatmap'])
         
         # Initialize line plots
@@ -358,7 +374,7 @@ class MultiAgentTrafficEnvironment:
     
     def _update_congestion_matrix(self, time_slot):
         """Update congestion matrix with current regional data."""
-        for region_id in range(39):
+        for region_id in range(75):
             region_edges = [edge for edge, reg in self.edge_to_region.items() if reg == region_id]
             if region_edges:
                 total_congestion = 0
@@ -890,8 +906,13 @@ class MultiAgentTrafficEnvironment:
                                     # Normal route application
                                     safe_route = self._create_safe_route(current_edge, route)
                                     if safe_route:
-                                        traci.vehicle.setRoute(vehicle_id, safe_route)
-                                        self.logger.log_info(f"LLM_UPDATE: Applied regional route for {vehicle_id}")
+                                        # Apply via unified setter with stuck/cooldown checks
+                                        try:
+                                            self._set_route_and_register(vehicle_id, safe_route)
+                                            self.logger.log_info(f"LLM_UPDATE: Applied regional route for {vehicle_id}")
+                                        except Exception:
+                                            traci.vehicle.setRoute(vehicle_id, safe_route)
+                                            self.logger.log_warning(f"LLM_UPDATE_FALLBACK: Direct setRoute due to unified setter failure")
                                     else:
                                         self.logger.log_warning(f"LLM_UPDATE: Cannot create safe route for {vehicle_id} from {current_edge}")
                             except Exception as route_error:
@@ -903,11 +924,11 @@ class MultiAgentTrafficEnvironment:
     def _load_region_data(self):
         """Load region partition data."""
         # Load boundary edges
-        boundary_file = os.path.join(self.region_data_dir, "boundary_edges_alpha_1.json")
+        boundary_file = os.path.join(self.region_data_dir, "boundary_edges_alpha_2.json")
         self.boundary_edges = load_json(boundary_file)
         
         # Load edge to region mapping
-        edge_region_file = os.path.join(self.region_data_dir, "edge_to_region_alpha_1.json")
+        edge_region_file = os.path.join(self.region_data_dir, "edge_to_region_alpha_2.json")
         self.edge_to_region = load_json(edge_region_file)
         
         # Determine number of regions
@@ -1220,6 +1241,13 @@ class MultiAgentTrafficEnvironment:
             self.prediction_engine = PredictionEngine(edge_list, self.logger)
             
             # Initialize Traffic Agent with appropriate LLM (already loaded)
+            # 原始LLM仅在本地共享LLM模式下可用；API/单一LLM模式下为None
+            raw_traffic_llm = None
+            if self.use_local_llm and getattr(self, 'llm_manager', None):
+                try:
+                    raw_traffic_llm = self.llm_manager.get_traffic_llm_raw()
+                except Exception:
+                    raw_traffic_llm = None
             self.traffic_agent = TrafficAgent(
                 boundary_edges=self.boundary_edges,
                 edge_to_region=self.edge_to_region,
@@ -1228,7 +1256,7 @@ class MultiAgentTrafficEnvironment:
                 llm_agent=self.traffic_llm,  # 使用已初始化的Traffic LLM
                 logger=self.logger,
                 prediction_engine=self.prediction_engine,
-                raw_llm_agent=self.llm_manager.get_traffic_llm_raw()  # 原始LLM用于macro planning
+                raw_llm_agent=raw_traffic_llm  # 原始LLM用于macro planning（仅本地LLM模式）
             )
             # 为Traffic Agent提供环境引用，便于获取全局宏观指导
             try:
@@ -1238,6 +1266,12 @@ class MultiAgentTrafficEnvironment:
             
             # Initialize Regional Agents with shared Regional LLM (already loaded)
             self.regional_agents = {}
+            raw_regional_llm = None
+            if self.use_local_llm and getattr(self, 'llm_manager', None):
+                try:
+                    raw_regional_llm = self.llm_manager.get_regional_llm_raw()
+                except Exception:
+                    raw_regional_llm = None
             for region_id in range(self.num_regions):
                 regional_agent = RegionalAgent(
                     region_id=region_id,
@@ -1246,7 +1280,7 @@ class MultiAgentTrafficEnvironment:
                     road_info=self.road_info,
                     road_network=self.road_network,
                     llm_agent=self.regional_llm,  # 所有区域共享已初始化的LLM
-                    raw_llm_agent=self.llm_manager.get_regional_llm_raw(),  # 注入原始Regional LLM
+                    raw_llm_agent=raw_regional_llm,  # 注入原始Regional LLM（仅本地LLM模式）
                     logger=self.logger,
                     prediction_engine=self.prediction_engine
                 )
@@ -1767,6 +1801,137 @@ class MultiAgentTrafficEnvironment:
             self.logger.log_error(f"ROUTE_VALIDATION: Error validating route for {vehicle_id}: {e}")
             return False
 
+    def _compute_stuck_zone_edges(self, center_edge: str) -> Set[str]:
+        """Compute stuck zone as center edge plus 1-hop and 2-hop successors."""
+        try:
+            zone: Set[str] = set()
+            if not center_edge or center_edge.startswith(':'):
+                return zone
+            zone.add(center_edge)
+            try:
+                one_hop = list(self.road_network.successors(center_edge))
+            except Exception:
+                one_hop = []
+            zone.update(one_hop)
+            two_hop: Set[str] = set()
+            for e in one_hop:
+                try:
+                    for n2 in self.road_network.successors(e):
+                        two_hop.add(n2)
+                except Exception:
+                    continue
+            zone.update(two_hop)
+            return zone
+        except Exception:
+            return set()
+
+    def _activate_stuck_zone_for_vehicle(self, vehicle_id: str, center_edge: str, current_time: float) -> None:
+        """Activate blocked zone for a stuck vehicle after threshold."""
+        try:
+            zone = self._compute_stuck_zone_edges(center_edge)
+            if not zone:
+                return
+            prev = self.vehicle_stuck_zone_edges.get(vehicle_id)
+            if prev:
+                self.blocked_edges_active.update(prev)
+            self.vehicle_stuck_zone_edges[vehicle_id] = set(zone)
+            self.blocked_edges_active.update(zone)
+            try:
+                for r_id, agent in getattr(self, 'regional_agents', {}).items():
+                    if hasattr(agent, 'update_stuck_edge_blacklist'):
+                        agent.update_stuck_edge_blacklist(set(zone), current_time)
+            except Exception:
+                pass
+            self.logger.log_warning(f"STUCK_ZONE_ACTIVATED: {vehicle_id} at {center_edge}, edges={len(zone)}")
+        except Exception as e:
+            self.logger.log_warning(f"STUCK_ZONE_ACTIVATE_ERROR: {vehicle_id} -> {e}")
+
+    def _deactivate_stuck_zone_for_vehicle(self, vehicle_id: str, current_time: float) -> None:
+        """Deactivate blocked zone when vehicle recovers; convert to cooldown."""
+        try:
+            zone = self.vehicle_stuck_zone_edges.get(vehicle_id)
+            if not zone:
+                return
+            for e in zone:
+                if e in self.blocked_edges_active:
+                    self.blocked_edges_active.discard(e)
+            expire_at = current_time + self.cooldown_window_sec
+            self.cooldown_zones.append({'edges': set(zone), 'expire_at': expire_at, 'assignments': 0})
+            self.cooldown_edges.update(zone)
+            try:
+                del self.vehicle_stuck_zone_edges[vehicle_id]
+            except Exception:
+                pass
+            self.logger.log_info(f"STUCK_ZONE_COOLDOWN: {vehicle_id} until {expire_at:.1f}")
+        except Exception as e:
+            self.logger.log_warning(f"STUCK_ZONE_DEACTIVATE_ERROR: {vehicle_id} -> {e}")
+
+    def _cleanup_cooldown_zones(self, current_time: float) -> None:
+        """Cleanup expired cooldown zones."""
+        try:
+            if not self.cooldown_zones:
+                return
+            remaining = []
+            removed_edges: Set[str] = set()
+            for z in self.cooldown_zones:
+                if current_time >= float(z.get('expire_at', 0)):
+                    removed_edges.update(z.get('edges', set()))
+                else:
+                    remaining.append(z)
+            self.cooldown_zones = remaining
+            if removed_edges:
+                for e in removed_edges:
+                    if e in self.cooldown_edges:
+                        self.cooldown_edges.discard(e)
+                self.logger.log_info(f"COOLDOWN_CLEANUP: removed {len(removed_edges)} edges")
+        except Exception:
+            pass
+
+    def is_edge_blocked(self, edge_id: str, current_time: float = 0.0) -> bool:
+        try:
+            return bool(edge_id in self.blocked_edges_active)
+        except Exception:
+            return False
+
+    def is_route_blocked(self, route: List[str], current_time: float = 0.0) -> bool:
+        try:
+            if not route:
+                return False
+            for e in route:
+                if e in self.blocked_edges_active:
+                    return True
+            return False
+        except Exception:
+            return False
+
+    def is_route_allowed_under_cooldown(self, route: List[str], current_time: float) -> bool:
+        # Cooling throttling disabled: always allow. Stuck edges handled by is_route_blocked.
+        return True
+
+    def _register_route_assignment_to_cooldown(self, route: List[str], current_time: float) -> None:
+        # Cooling throttling disabled: no-op.
+        return
+
+    def _set_route_and_register(self, vehicle_id: str, route: List[str]) -> None:
+        """Unified route set with blocked/cooldown checks and assignment registration."""
+        try:
+            if not route:
+                return
+            now = float(traci.simulation.getTime()) if traci else 0.0
+            if self.is_route_blocked(route, now):
+                self.logger.log_warning(f"ROUTE_BLOCKED: {vehicle_id} intersects active stuck zone")
+                return
+            if not self.is_route_allowed_under_cooldown(route, now):
+                self.logger.log_warning(f"ROUTE_COOLDOWN_THROTTLED: {vehicle_id} rejected by cooldown cap")
+                return
+            traci.vehicle.setRoute(vehicle_id, route)
+            self._register_route_assignment_to_cooldown(route, now)
+        except Exception as e:
+            try:
+                self.logger.log_warning(f"SET_ROUTE_REGISTER_FAIL: {vehicle_id} -> {e}")
+            except Exception:
+                pass
+
     def _get_or_create_step_traffic_state(self, current_time: float) -> Dict[str, Any]:
         """
         Get or create step-wise cached traffic state data.
@@ -1930,10 +2095,18 @@ class MultiAgentTrafficEnvironment:
             start_edge = route[0]
             dest_edge = route[-1]
             
-            # Map edges to regions
+            # Map edges to regions (apply neighbor-based fallback when missing)
             start_region = self.edge_to_region.get(start_edge)
             dest_region = self.edge_to_region.get(dest_edge)
-            
+
+            if start_region is None:
+                inferred = self._infer_region_from_neighbors(start_edge)
+                start_region = inferred if inferred != -1 else None
+
+            if dest_region is None:
+                inferred = self._infer_region_from_neighbors(dest_edge)
+                dest_region = inferred if inferred != -1 else None
+
             if start_region is None or dest_region is None:
                 self.logger.log_error(f"CORY_STATE: Region mapping failed for {vehicle_id} - "
                                      f"start_edge: {start_edge} -> {start_region}, "
@@ -2473,9 +2646,15 @@ class MultiAgentTrafficEnvironment:
                                 except Exception:
                                     pass
                             if self._validate_route_setting(vehicle_id, target_apply):
-                                traci.vehicle.setRoute(vehicle_id, target_apply)
+                                try:
+                                    self._set_route_and_register(vehicle_id, target_apply)
+                                except Exception:
+                                    traci.vehicle.setRoute(vehicle_id, target_apply)
                             else:
-                                traci.vehicle.setRoute(vehicle_id, best)
+                                try:
+                                    self._set_route_and_register(vehicle_id, best)
+                                except Exception:
+                                    traci.vehicle.setRoute(vehicle_id, best)
 
                             self.logger.log_info(
                                 f"STUCK_REPLAN: Applied congestion-aware emergency route for {vehicle_id} - len:{len(target_apply)}, cost:{best_cost:.1f}"
@@ -2668,40 +2847,170 @@ class MultiAgentTrafficEnvironment:
             return route_candidates[0] if route_candidates else []
     
     def _create_pioneer_observation(self, decision_input: Dict[str, Any], macro_context: Dict[str, Any]) -> str:
-        """Create compressed observation text for Pioneer LLM decision - PROMPT OPTIMIZATION."""
-        # Compress vehicle and route info
-        v_id = str(decision_input['vehicle_id'])[-4:]  # Use last 4 chars of vehicle ID
-        s_reg = decision_input['start_region']
-        d_reg = decision_input['dest_region']
-        time_s = decision_input['current_time']
-        
-        observation = f"V{v_id} R{s_reg}->R{d_reg} T{time_s:.0f}s\n\nCONG_RAW:"
-        
-        # Compress congestion info - only show relevant regions
-        relevant_regions = set([s_reg, d_reg])
-        for route in decision_input['route_candidates']:
-            relevant_regions.update(route)
-        
-        for region_id, congestion in decision_input['regional_congestion'].items():
-            if region_id in relevant_regions:
-                observation += f" R{region_id}:{congestion:.2f}"
-        
-        observation += f"\n\nOPTS:"
-        for i, route in enumerate(decision_input['route_candidates']):
-            observation += f" {i+1}:{route}"
-        
-        # Compress global state to essentials
-        observation += f"\n\nGLB_RAW: V{decision_input['global_state']['total_vehicles']} ATT{decision_input['global_state']['current_avg_travel_time']:.0f}s"
+        """Create English observation for macro (Pioneer) LLM decision.
+        Keep only raw facts; no hand-crafted scores. Require numeric-only reply.
+        """
+        try:
+            # Basic context
+            v_id = str(decision_input['vehicle_id'])[-4:]
+            s_reg = decision_input['start_region']
+            d_reg = decision_input['dest_region']
+            time_s = decision_input['current_time']
 
-        # Decision protocol note
-        observation += "\n\nDECISION FORMAT: Reply with the option number only (1, 2, ...)."
-        
-        return observation
+            parts = []
+            parts.append(f"Task: Choose ONE macro route option for vehicle V{v_id}. Reply with the option number only (1..K).")
+            parts.append(f"OD: R{s_reg} -> R{d_reg}. Time: {time_s:.0f}s.")
+
+            # Optional batch/jam context (raw facts only)
+            recent_first_hops = []
+            jam_edges = []
+            if macro_context:
+                recent_first_hops = list(macro_context.get('recent_first_hops', []))
+                jam_edges = list(macro_context.get('jam_edges', []))
+
+            if recent_first_hops:
+                # show top-3 counts as raw facts
+                from collections import Counter
+                hop_counts = Counter(recent_first_hops)
+                common = ", ".join([f"{k}:{v}" for k, v in hop_counts.most_common(3)])
+                parts.append(f"Batch first-hop usage (top-3): {common}.")
+            if jam_edges:
+                parts.append(f"Jammed/closed edges (avoid): {jam_edges}.")
+
+            # Regional congestion raw facts (only relevant regions)
+            reg_cong = decision_input.get('regional_congestion', {})
+            relevant_regions = set([s_reg, d_reg])
+            for route in decision_input['route_candidates']:
+                relevant_regions.update(route)
+            cong_str = " ".join([f"R{r}:{reg_cong.get(r, 0.0):.2f}" for r in sorted(relevant_regions)])
+            if cong_str:
+                parts.append(f"Regional congestion (raw): {cong_str}.")
+
+            # Candidates: show route and first hop only (no scores)
+            parts.append("Candidates:")
+            for i, route in enumerate(decision_input['route_candidates']):
+                first_hop = route[1] if isinstance(route, list) and len(route) > 1 else d_reg
+                parts.append(f"  {i+1}) route={route}, first_hop=R{first_hop}")
+
+            # Global raw state
+            glb = decision_input.get('global_state', {})
+            total_v = glb.get('total_vehicles', 0)
+            att = glb.get('current_avg_travel_time', 0.0)
+            parts.append(f"Global (raw): vehicles={total_v}, ATT={att:.0f}s.")
+
+            # Simple rules (text only, LLM decides trade-offs)
+            parts.append("Rules: Prefer options that diversify the first hop vs. current batch; avoid jammed/closed edges if any.")
+            parts.append("Answer: provide the option number only (e.g., 2). No extra text.")
+
+            return "\n".join(parts)
+        except Exception:
+            # Fallback to previous minimal prompt if anything fails
+            v_id = str(decision_input['vehicle_id'])[-4:]
+            s_reg = decision_input['start_region']
+            d_reg = decision_input['dest_region']
+            time_s = decision_input['current_time']
+            observation = f"V{v_id} R{s_reg}->R{d_reg} T{time_s:.0f}s\n\nOPTS:"
+            for i, route in enumerate(decision_input['route_candidates']):
+                observation += f" {i+1}:{route}"
+            observation += "\n\nDECISION FORMAT: Reply with the option number only (1, 2, ...)."
+            return observation
     
     def _generate_macro_route_candidates_original(self, start_region: int, dest_region: int, current_time: float) -> List[List[int]]:
         """Original macro route candidate generation for fallback."""
         return self._generate_macro_route_candidates(start_region, dest_region, current_time)
     
+    def _evaluate_region_transition_availability(self, from_region: int, to_region: int, current_time: float) -> Dict[str, Any]:
+        """评估区域间切边可用性：
+        - 是否存在区域有向边
+        - 是否有通过封锁/冷却检查的可用切边
+        - 拥堵是否低于阈值（soft cutoff）
+        返回：flags + 该对区域之间最小拥堵值
+        """
+        result = {
+            'has_edge': False,
+            'has_passable': False,   # 通过 blocked + cooldown 检查
+            'has_viable': False,     # 通过且拥堵低于阈值
+            'min_congestion': None,
+            'edges_evaluated': 0
+        }
+        try:
+            G = self.traffic_agent.region_graph
+            if not (G and G.has_edge(from_region, to_region)):
+                return result
+            result['has_edge'] = True
+            edge_ids = G[from_region][to_region].get('edges', [])
+            # Switch to continuous congestion_score; cutoff now in [0,1] (default 0.6)
+            cutoff = float(getattr(self, 'macro_boundary_congestion_cutoff', 0.6))
+            best_cong = None
+            for eid in edge_ids:
+                result['edges_evaluated'] += 1
+                try:
+                    # 用单边路由代理做 blocked/cooldown 检查
+                    if self.is_route_blocked([eid], current_time):
+                        continue
+                    if not self.is_route_allowed_under_cooldown([eid], current_time):
+                        continue
+                    result['has_passable'] = True
+                    cong = float(self.road_info.get(eid, {}).get('congestion_score', self.road_info.get(eid, {}).get('occupancy_rate', self.road_info.get(eid, {}).get('congestion_level', 0.0))))
+                    if best_cong is None or cong < best_cong:
+                        best_cong = cong
+                    if cong <= cutoff:
+                        result['has_viable'] = True
+                except Exception:
+                    continue
+            result['min_congestion'] = best_cong if best_cong is not None else float('inf')
+            return result
+        except Exception:
+            return result
+
+    def _filter_macro_candidates_by_boundary_availability(self, candidates: List[List[int]], current_time: float) -> List[List[int]]:
+        """按区域切边可用性与拥堵阈值过滤宏观路径：
+        策略：
+          - 优先保留每个跳跃(from->to)都“可行(viable)”的路径（过 blocked/cooldown 且拥堵<=阈值）
+          - 若没有“viable”路径，则保留“passable”（只过 blocked/cooldown，不看拥堵）的路径
+          - 都没有则返回空（上层会回退到未过滤候选或其它机制）
+        """
+        try:
+            if not candidates:
+                return []
+            good: List[List[int]] = []
+            ok: List[List[int]] = []
+            for route in candidates:
+                try:
+                    if not route or len(route) == 1:
+                        good.append(route)
+                        continue
+                    all_passable = True
+                    all_viable = True
+                    for i in range(len(route) - 1):
+                        from_r = route[i]
+                        to_r = route[i + 1]
+                        ev = self._evaluate_region_transition_availability(from_r, to_r, current_time)
+                        if not ev.get('has_edge'):
+                            all_passable = False
+                            all_viable = False
+                            break
+                        if not ev.get('has_passable'):
+                            all_passable = False
+                            all_viable = False
+                            break
+                        if not ev.get('has_viable'):
+                            all_viable = False
+                    if all_viable:
+                        good.append(route)
+                    elif all_passable:
+                        ok.append(route)
+                except Exception:
+                    # 跳过异常路径
+                    continue
+            if good:
+                return good[:5]
+            if ok:
+                return ok[:5]
+            return []
+        except Exception:
+            return []
+
     def _generate_macro_route_candidates(self, start_region: int, dest_region: int, current_time: float, state_context: Dict[str, Any] = None) -> List[List[int]]:
         """
         Enhanced macro route candidate generation for CORY framework.
@@ -2711,61 +3020,104 @@ class MultiAgentTrafficEnvironment:
             state_context: Enhanced state information from CORY state construction
         """
         try:
-            candidates = []
-            
-            # Direct route if possible
-            if self.traffic_agent.region_graph.has_edge(start_region, dest_region):
-                candidates.append([start_region, dest_region])
-            
-            # Find alternative routes using NetworkX
+            # Local imports to avoid global changes
+            from itertools import islice
+            import random
             try:
-                # Get all simple paths up to length 5
-                all_paths = list(nx.all_simple_paths(
-                    self.traffic_agent.region_graph, 
-                    start_region, 
-                    dest_region, 
-                    cutoff=5
-                ))
-                
-                # Limit to best candidates based on different criteria
-                for path in all_paths[:10]:  # Limit to 10 paths
-                    if path not in candidates:
-                        candidates.append(path)
-                        
-            except nx.NetworkXNoPath:
-                # If no path found, try to supplement region connections and retry
-                self.logger.log_warning(f"MACRO_CANDIDATES: No path found from region {start_region} to {dest_region}, attempting to supplement connections")
-                
-                # Try to supplement region connections
-                self._supplement_region_connections_emergency(start_region, dest_region)
-                
-                # Retry pathfinding
+                # Prefer diverse, structurally different simple paths (no manual scoring)
+                G = self.traffic_agent.region_graph
+                max_k = 6  # generate slightly more, we'll trim to 5 later
+
+                # Collect unique candidates using different generators
+                seen = set()  # for tuple(path)
+                cand_list = []
+
+                # 1) Direct edge (if exists)
+                if G.has_edge(start_region, dest_region):
+                    direct = [start_region, dest_region]
+                    tup = tuple(direct)
+                    if tup not in seen:
+                        seen.add(tup)
+                        cand_list.append(direct)
+
+                # 2) K shortest simple paths (unweighted)
                 try:
-                    all_paths = list(nx.all_simple_paths(
-                        self.traffic_agent.region_graph, 
-                        start_region, 
-                        dest_region, 
+                    for path in islice(nx.shortest_simple_paths(G, start_region, dest_region, weight=None), 0, max_k):
+                        tup = tuple(path)
+                        if tup not in seen:
+                            seen.add(tup)
+                            cand_list.append(path)
+                except (nx.NetworkXNoPath, nx.NetworkXException):
+                    # fallback silently
+                    pass
+
+                # 3) Edge-disjoint paths (adds routes with low overlap)
+                try:
+                    from networkx.algorithms.connectivity import disjoint_paths as nxdp
+                    disjoint_gen = nxdp.edge_disjoint_paths(G, start_region, dest_region)
+                    for idx, path in enumerate(disjoint_gen):
+                        if idx >= 2:
+                            break
+                        tup = tuple(path)
+                        if tup not in seen:
+                            seen.add(tup)
+                            cand_list.append(path)
+                except Exception:
+                    pass
+
+                # 4) Ensure first-hop diversity (keep at most one per first hop first)
+                first_hop_buckets = {}
+                diversified = []
+                for path in cand_list:
+                    first_hop = path[1] if isinstance(path, list) and len(path) > 1 else dest_region
+                    if first_hop not in first_hop_buckets:
+                        first_hop_buckets[first_hop] = path
+                        diversified.append(path)
+
+                # 5) Fill with remaining unique simple paths (fallback) up to limit
+                if len(diversified) < 6:
+                    try:
+                        extra_paths = list(nx.all_simple_paths(G, start_region, dest_region, cutoff=6))
+                        random.shuffle(extra_paths)
+                        for path in extra_paths:
+                            tup = tuple(path)
+                            if tup in seen:
+                                continue
+                            seen.add(tup)
+                            diversified.append(path)
+                            if len(diversified) >= 6:
+                                break
+                    except nx.NetworkXNoPath:
+                        pass
+
+                candidates = diversified
+            except Exception as gen_err:
+                # Emergency supplement as before
+                try:
+                    self._supplement_region_connections_emergency(start_region, dest_region)
+                except Exception:
+                    pass
+                try:
+                    candidates = list(nx.all_simple_paths(
+                        self.traffic_agent.region_graph,
+                        start_region,
+                        dest_region,
                         cutoff=5
-                    ))
-                    
-                    for path in all_paths[:10]:
-                        if path not in candidates:
-                            candidates.append(path)
-                            
-                except nx.NetworkXNoPath:
-                    self.logger.log_error(f"MACRO_CANDIDATES: Still no path found from region {start_region} to {dest_region} after supplementing")
+                    ))[:6]
+                except Exception:
+                    self.logger.log_error(f"MACRO_CANDIDATES: generation failed: {gen_err}")
                     return []
-            
-            # 仅收集候选，不做评分排序（保持最多5条）
-            evaluated_candidates = []
+
+            # Evaluate side-effects only (no sorting by score). Keep up to 5.
+            top_candidates = []
             for candidate in candidates:
-                # 调用以便生成原始特征副作用（如日志），但忽略返回分数
                 try:
                     _ = self._evaluate_macro_route_candidate(candidate, current_time)
                 except Exception:
                     pass
-                evaluated_candidates.append((candidate, 0.0))
-            top_candidates = [route for route, _ in evaluated_candidates[:5]]  # Top 5 candidates
+                top_candidates.append(candidate)
+                if len(top_candidates) >= 5:
+                    break
             
             # Enhanced logging with state context if available
             if state_context:
@@ -2774,7 +3126,17 @@ class MultiAgentTrafficEnvironment:
                 self.logger.log_info(f"CORY_MACRO_CANDIDATES: Generated {len(top_candidates)} candidates for regions {start_region}->{dest_region}: {top_candidates} "
                                    f"(Avg route congestion: {avg_congestion:.3f})")
             else:
-                self.logger.log_info(f"MACRO_CANDIDATES: Generated {len(top_candidates)} candidates for {start_region}->{dest_region}")
+                self.logger.log_info(f"MACRO_CANDIDATES: Generated {len(top_candidates)} diversified candidates for {start_region}->{dest_region}")
+            
+            # 在宏观层面先行过滤：区域切边是否可用（未被封锁/未超限流）且拥堵低于阈值
+            try:
+                filtered_candidates = self._filter_macro_candidates_by_boundary_availability(top_candidates, current_time)
+                if filtered_candidates:
+                    if len(filtered_candidates) != len(top_candidates):
+                        self.logger.log_info(f"MACRO_CANDIDATES_FILTERED: {len(filtered_candidates)}/{len(top_candidates)} pass boundary availability checks")
+                    return filtered_candidates
+            except Exception as _ferr:
+                self.logger.log_warning(f"MACRO_CANDIDATES_FILTER_ERROR: {_ferr}")
             
             return top_candidates
             
@@ -4034,6 +4396,16 @@ class MultiAgentTrafficEnvironment:
                             min_eta = effective_road_len / speed_limit if speed_limit > 0 else effective_road_len / 13.89
                             eta = min_eta * (1 + alpha * vehicle_num)
                             congestion_level = get_congestion_level(occupancy_rate)
+                            # Unified continuous congestion score in [0,1]
+                            try:
+                                speed_fraction = 0.0
+                                if speed_limit > 0:
+                                    speed_fraction = max(0.0, min(1.0, vehicle_speed / speed_limit))
+                                speed_component = 1.0 - speed_fraction  # 0 at free-flow, ->1 as speed drops
+                                occ_component = max(0.0, min(1.0, occupancy_rate))
+                                congestion_score = 0.7 * speed_component + 0.3 * occ_component
+                            except Exception:
+                                congestion_score = max(0.0, min(1.0, occupancy_rate))
                             
                             # Update road info
                             self.road_info[edge_id].update({
@@ -4041,6 +4413,7 @@ class MultiAgentTrafficEnvironment:
                                 "vehicle_speed": max(0.0, vehicle_speed),
                                 "vehicle_length": max(0.0, vehicle_length),
                                 "congestion_level": congestion_level,
+                                "congestion_score": float(congestion_score),
                                 "occupancy_rate": occupancy_rate,
                                 "min_eta": min_eta,
                                 "eta": eta,
@@ -4226,7 +4599,10 @@ class MultiAgentTrafficEnvironment:
                         if not current_edge.startswith(':'):
                             safe_route = self._create_safe_route(current_edge, route_info['route'])
                             if safe_route:
-                                traci.vehicle.setRoute(vehicle_id, safe_route)
+                                try:
+                                    self._set_route_and_register(vehicle_id, safe_route)
+                                except Exception:
+                                    traci.vehicle.setRoute(vehicle_id, safe_route)
                                 self.logger.log_info(f"PENDING_ROUTE: Applied route for {vehicle_id} to {route_info['boundary_edge']}")
                                 pending_applied += 1
                             else:
@@ -4421,12 +4797,23 @@ class MultiAgentTrafficEnvironment:
                                     occupancy_anomaly = edge_occupancy >= 0.6
                                     hamper_anomaly = hamper_rate >= 0.1
                                     if idle_duration > idle_threshold and (occupancy_anomaly or hamper_anomaly):
+                                        # Track stuck event transitions (count once per stuck episode)
+                                        if veh_id not in self.currently_stuck_vehicles:
+                                            self.vehicle_stuck_events[veh_id] = self.vehicle_stuck_events.get(veh_id, 0) + 1
+                                            self.currently_stuck_vehicles.add(veh_id)
                                         self.logger.log_warning(
                                             f"AUTONOMOUS_VEHICLE_STUCK: {veh_id} idle {idle_duration:.1f}s on {current_edge} (occ={edge_occupancy:.2f}, hamper={hamper_rate:.2f}, macro_plan={has_macro_plan})"
                                         )
-                                        # Queue for stuck vehicle replanning (with deduplication)
-                                        if veh_id not in self.pending_decisions['stuck_vehicles']:
-                                            self.pending_decisions['stuck_vehicles'].append(veh_id)
+                                        # If stuck duration >= 720s, activate stuck zone (center + 1/2-hop)
+                                        if idle_duration >= self.cooldown_window_sec:
+                                            self._activate_stuck_zone_for_vehicle(veh_id, current_edge, current_time)
+                                    else:
+                                        # Clear stuck state when condition relieved
+                                        if veh_id in self.currently_stuck_vehicles:
+                                            self.currently_stuck_vehicles.discard(veh_id)
+                                        # If had active zone, end zone and move into cooldown
+                                        if veh_id in self.vehicle_stuck_zone_edges:
+                                            self._deactivate_stuck_zone_for_vehicle(veh_id, current_time)
                                 
                             except Exception as metrics_error:
                                 self.logger.log_warning(f"AUTONOMOUS_VEHICLE_METRICS_ERROR: {veh_id} -> {metrics_error}")
@@ -4583,18 +4970,9 @@ class MultiAgentTrafficEnvironment:
                     self.logger.log_error(f"VEHICLE_DECISION_ERROR: Failed to process region change for autonomous vehicle {veh_id}: {e}")
                     decisions_failed += 1
             
-            # Process stuck vehicles - autonomous only
-            for veh_id in stuck_vehicles:
-                try:
-                    # Only process autonomous vehicles for decision making
-                    if veh_id not in self.autonomous_vehicles:
-                        continue
-                        
-                    self._handle_stuck_vehicle_replanning(veh_id, current_time)
-                    decisions_processed += 1
-                except Exception as e:
-                    self.logger.log_error(f"VEHICLE_DECISION_ERROR: Failed to process stuck autonomous vehicle {veh_id}: {e}")
-                    decisions_failed += 1
+            # Process stuck vehicles - replan disabled, zones handled inline during scanning
+            if stuck_vehicles:
+                self.logger.log_info(f"STUCK_REPLAN_DISABLED: {len(stuck_vehicles)} stuck vehicles observed; applying zone-based avoidance")
             
             # Performance summary
             decision_time = (time.time() - decision_start_time) * 1000
@@ -4641,14 +5019,7 @@ class MultiAgentTrafficEnvironment:
                         self.handle_vehicle_regional_planning(veh_id, region_change.get('new_region', self.vehicle_regions.get(veh_id, -1)), current_time)
                 except Exception as e:
                     self.logger.log_error(f"MIDSTEP_DECISION_ERROR: Region change for {veh_id}: {e}")
-            # Stuck vehicles
-            for veh_id in stuck_vehicles:
-                try:
-                    if veh_id not in self.autonomous_vehicles:
-                        continue
-                    self._handle_stuck_vehicle_replanning(veh_id, current_time)
-                except Exception as e:
-                    self.logger.log_error(f"MIDSTEP_DECISION_ERROR: Stuck vehicle {veh_id}: {e}")
+            # Stuck vehicles: no-op (zone avoidance already applied)
         except Exception as e:
             self.logger.log_error(f"MIDSTEP_DECISIONS_CRITICAL_ERROR: {e}")
 
@@ -4747,10 +5118,68 @@ class MultiAgentTrafficEnvironment:
                                f"time_saved={self.llm_call_stats['total_time_saved']:.1f}s, "
                                f"temp_decisions={len(self.temp_decisions)}")
             
-            # Log comprehensive performance data
-            self.logger.log_system_performance(
-                regional_metrics, traffic_metrics, prediction_metrics, current_time
-            )
+            # Compute additional performance metrics for logging
+            # Alat: Average latency (use current ATT)
+            # AWai: Average accumulated waiting time of active autonomous vehicles
+            # Adis: Average remaining driving distance to destination (meters)
+            # ADet: Average delay/timeLoss of active autonomous vehicles (seconds)
+            try:
+                from typing import List
+                active_ids: List[str] = [vid for vid in self.vehicle_travel_metrics.keys() if vid in self.autonomous_vehicles]
+                waiting_times = []
+                time_losses = []
+                remain_distances = []
+                for vid in active_ids:
+                    try:
+                        # Waiting time and delay/timeLoss
+                        wt = traci.vehicle.getAccumulatedWaitingTime(vid)
+                        waiting_times.append(float(wt))
+                    except Exception:
+                        pass
+                    try:
+                        tl = traci.vehicle.getTimeLoss(vid)
+                        time_losses.append(float(tl))
+                    except Exception:
+                        pass
+                    # Remaining driving distance to destination
+                    try:
+                        route = traci.vehicle.getRoute(vid)
+                        if route:
+                            dest_edge = route[-1]
+                            try:
+                                dest_len = traci.edge.getLength(dest_edge)
+                            except Exception:
+                                dest_len = 0.0
+                            # Use end position of destination edge
+                            rem = traci.vehicle.getDrivingDistance(vid, dest_edge, max(0.0, dest_len - 0.1))
+                            remain_distances.append(float(rem))
+                    except Exception:
+                        pass
+                alat = float(current_att)
+                awai = (sum(waiting_times) / len(waiting_times)) if waiting_times else 0.0
+                adis = (sum(remain_distances) / len(remain_distances)) if remain_distances else 0.0
+                adet = (sum(time_losses) / len(time_losses)) if time_losses else 0.0
+                extra_metrics = {
+                    'Alat': alat,
+                    'AWai': awai,
+                    'Adis': adis,
+                    'ADet': adet
+                }
+            except Exception:
+                extra_metrics = {
+                    'Alat': float(current_att)
+                }
+            
+            # Log comprehensive performance data (backward-compatible with older AgentLogger signatures)
+            try:
+                self.logger.log_system_performance(
+                    regional_metrics, traffic_metrics, prediction_metrics, current_time, extra_metrics
+                )
+            except TypeError:
+                # Fallback: older versions may not accept extra_metrics
+                self.logger.log_system_performance(
+                    regional_metrics, traffic_metrics, prediction_metrics, current_time
+                )
             
         except Exception as e:
             self.logger.log_error(f"Performance logging failed: {e}")
@@ -5154,8 +5583,7 @@ class MultiAgentTrafficEnvironment:
                 self.logger.display_progress(step, current_step=step)
                 
                 # Log performance periodically
-                if int(step) % 300 == 0:  # Every 5 minutes
-                    self.log_system_performance(step)
+                self.log_system_performance(step)
                 
                 # Clean up periodically
                 if int(step) % 1800 == 0:  # Every 30 minutes
@@ -5344,41 +5772,33 @@ class MultiAgentTrafficEnvironment:
         planning_start = time.time()
         
         try:
-            # Phase 1: Traffic Agent Macro Planning
+            # Phase 1: Traffic Agent Macro Planning（串行）
             vehicles_needing_macro_planning = {
                 veh_id: veh_info for veh_id, veh_info in upcoming_vehicles.items()
                 if veh_info['requires_macro_planning']
             }
-            
+
             macro_plans = {}
             if vehicles_needing_macro_planning:
                 self.logger.log_info(f"SYNC_MACRO_PLANNING: Planning for {len(vehicles_needing_macro_planning)} cross-region vehicles")
-                
-                # Serial macro planning - direct synchronous calls
-                # Ensure we use up-to-date real data for LLM macro planning context
                 try:
-                    # Refresh active road metrics and global state before planning
                     self.update_road_information(current_step)
                     self.traffic_agent.update_global_traffic_state(current_step)
-                    pre_planning_regional_report = self.traffic_agent.collect_regional_congestion_report(current_step)
-                    self.latest_regional_report = pre_planning_regional_report
+                    self.latest_regional_report = self.traffic_agent.collect_regional_congestion_report(current_step)
                 except Exception as _prep_err:
                     self.logger.log_warning(f"SYNC_MACRO_PLANNING_PREP: Failed to refresh context: {_prep_err}")
+
                 for veh_id, veh_info in vehicles_needing_macro_planning.items():
                     self.logger.log_info(f"SERIAL_MACRO: Processing {veh_id} from region {veh_info['start_region']} to {veh_info['end_region']}")
-                    
-                    # Direct synchronous call to traffic agent
                     route = self.traffic_agent.plan_single_macro_route(
                         vehicle_id=veh_id,
-                        start_region=veh_info['start_region'], 
+                        start_region=veh_info['start_region'],
                         end_region=veh_info['end_region'],
                         current_time=current_step,
                         coordination_data=getattr(self, 'latest_regional_report', None)
                     )
-                    
                     if route:
                         macro_plans[veh_id] = route
-                        # Store in cache for consistency with existing code
                         if not hasattr(self, 'upcoming_vehicle_cache'):
                             self.upcoming_vehicle_cache = {}
                         self.upcoming_vehicle_cache[veh_id] = {
@@ -5388,40 +5808,28 @@ class MultiAgentTrafficEnvironment:
                         self.logger.log_info(f"SERIAL_MACRO: Completed {veh_id} -> route {route.region_sequence}")
                     else:
                         self.logger.log_warning(f"SERIAL_MACRO: Failed to plan route for {veh_id}")
-                
                 self.logger.log_info(f"SERIAL_MACRO: Completed planning for {len(macro_plans)}/{len(vehicles_needing_macro_planning)} vehicles")
-            
-            # Phase 2: Regional Agent Single-Vehicle Planning - Serial execution
+
+            # Phase 2: Regional Agent Single-Vehicle Planning（串行）
             completed_regional_plans = {}
             if not hasattr(self, 'regional_planning_results'):
                 self.regional_planning_results = {}
-            
+
             for veh_id, veh_info in upcoming_vehicles.items():
                 start_region = veh_info['start_region']
                 target_region = veh_info['end_region']
                 start_edge = veh_info.get('start_edge')
-                
                 self.logger.log_info(f"SERIAL_REGIONAL: Processing {veh_id} start_edge={start_edge} R{start_region}->R{target_region}")
-                
-                # Direct synchronous call to regional agent
                 if start_region in self.regional_agents:
                     regional_agent = self.regional_agents[start_region]
-                    
                     try:
-                        # Use the existing regional planning methods
                         if start_edge:
-                            # Same-region: plan directly to destination edge using intra-region planner
                             if start_region == target_region:
                                 end_edge = veh_info.get('end_edge')
                                 if end_edge:
-                                    # Use offline preplanning for same-region vehicles not yet spawned (no TraCI)
-                                    result = self._offline_intra_region_plan(
-                                        regional_agent, start_edge, end_edge, current_step
-                                    )
+                                    result = self._offline_intra_region_plan(regional_agent, start_edge, end_edge, current_step)
                                     if result:
                                         self.regional_planning_results[veh_id] = result
-                                        
-                                        # Group by region for reporting
                                         if start_region not in completed_regional_plans:
                                             completed_regional_plans[start_region] = {
                                                 'status': 'completed',
@@ -5431,31 +5839,20 @@ class MultiAgentTrafficEnvironment:
                                             }
                                         completed_regional_plans[start_region]['vehicle_count'] += 1
                                         completed_regional_plans[start_region]['successful_vehicles'].append(veh_id)
-                                        
                                         self.logger.log_info(f"SERIAL_REGIONAL: Completed {veh_id} -> destination {end_edge}")
                                     else:
                                         self.logger.log_warning(f"SERIAL_REGIONAL: Failed to plan intra-region route for {veh_id}")
                                 else:
                                     self.logger.log_warning(f"SERIAL_REGIONAL: No end edge for {veh_id}")
                             else:
-                                # Cross-region: plan to boundary edge leading to target region
                                 boundary_candidates = regional_agent._get_boundary_candidates_to_region(target_region)
                                 if not boundary_candidates:
                                     boundary_candidates = regional_agent.outgoing_boundaries[:3]
-                                    
-                                route_candidates = regional_agent._generate_regional_route_candidates(
-                                    start_edge, boundary_candidates, current_step
-                                )
-                                
+                                route_candidates = regional_agent._generate_regional_route_candidates(start_edge, boundary_candidates, current_step)
                                 if route_candidates:
-                                    result = regional_agent._llm_select_regional_route(
-                                        veh_id, start_edge, route_candidates, target_region, current_step
-                                    )
-                                    
+                                    result = regional_agent._llm_select_regional_route(veh_id, start_edge, route_candidates, target_region, current_step)
                                     if result:
                                         self.regional_planning_results[veh_id] = result
-                                        
-                                        # Group by region for reporting
                                         if start_region not in completed_regional_plans:
                                             completed_regional_plans[start_region] = {
                                                 'status': 'completed',
@@ -5465,7 +5862,6 @@ class MultiAgentTrafficEnvironment:
                                             }
                                         completed_regional_plans[start_region]['vehicle_count'] += 1
                                         completed_regional_plans[start_region]['successful_vehicles'].append(veh_id)
-                                        
                                         self.logger.log_info(f"SERIAL_REGIONAL: Completed {veh_id} -> boundary {result.get('boundary_edge', 'unknown')}")
                                     else:
                                         self.logger.log_warning(f"SERIAL_REGIONAL: Failed to plan route for {veh_id}")
@@ -5473,19 +5869,17 @@ class MultiAgentTrafficEnvironment:
                                     self.logger.log_warning(f"SERIAL_REGIONAL: No route candidates for {veh_id}")
                         else:
                             self.logger.log_warning(f"SERIAL_REGIONAL: No start edge for {veh_id}")
-                            
                     except Exception as e:
                         self.logger.log_error(f"SERIAL_REGIONAL: Error planning for {veh_id}: {e}")
                 else:
                     self.logger.log_warning(f"SERIAL_REGIONAL: No regional agent for region {start_region}")
-            
-            # Store completed regional plans for application during step execution
+
             self.completed_regional_plans = completed_regional_plans
-            
+
             planning_time = (time.time() - planning_start) * 1000
             self.logger.log_info(f"SYNC_PLANNING_COMPLETE: Planned for {len(upcoming_vehicles)} vehicles in {planning_time:.1f}ms "
                                f"(macro: {len(macro_plans)}, regional: {len(completed_regional_plans)} regions)")
-            
+
         except Exception as e:
             self.logger.log_error(f"SYNC_PLANNING_ERROR: Synchronized planning failed: {e}")
     
@@ -5626,7 +6020,10 @@ class MultiAgentTrafficEnvironment:
                                     safe_route = None
                                 applied_route = None
                                 if safe_route and self._validate_route_setting(vehicle_id, safe_route):
-                                    traci.vehicle.setRoute(vehicle_id, safe_route)
+                                    try:
+                                        self._set_route_and_register(vehicle_id, safe_route)
+                                    except Exception:
+                                        traci.vehicle.setRoute(vehicle_id, safe_route)
                                     applied_route = list(safe_route)
                                 else:
                                     self._apply_regional_route_to_vehicle(vehicle_id, result, current_time)
@@ -5802,7 +6199,10 @@ class MultiAgentTrafficEnvironment:
                         candidate_route = list(route_result.edges)
                         
                         # Apply candidate route immediately
-                        traci.vehicle.setRoute(vehicle_id, candidate_route)
+                        try:
+                            self._set_route_and_register(vehicle_id, candidate_route)
+                        except Exception:
+                            traci.vehicle.setRoute(vehicle_id, candidate_route)
                         
                         self.logger.log_info(f"CANDIDATE_ROUTE_APPLIED: {vehicle_id} using candidate route to {target_boundary}")
                         
@@ -5843,6 +6243,14 @@ class MultiAgentTrafficEnvironment:
     def _async_regional_planning_for_vehicle(self, vehicle_id: str, current_region: int, target_region: int, current_time: float) -> Dict:
         """Execute asynchronous regional planning for a single vehicle."""
         try:
+            # Skip cross-region planning when current and target regions are the same
+            if current_region == target_region:
+                return {
+                    'status': 'skipped_same_region',
+                    'vehicle_id': vehicle_id,
+                    'region': current_region
+                }
+
             regional_agent = self.regional_agents.get(current_region)
             if not regional_agent:
                 return {'status': 'no_agent', 'vehicle_id': vehicle_id}
@@ -5935,11 +6343,17 @@ class MultiAgentTrafficEnvironment:
                     except Exception:
                         safe_route = None
                     if safe_route and self._validate_route_setting(vehicle_id, safe_route):
-                        traci.vehicle.setRoute(vehicle_id, safe_route)
+                        try:
+                            self._set_route_and_register(vehicle_id, safe_route)
+                        except Exception:
+                            traci.vehicle.setRoute(vehicle_id, safe_route)
                         self.logger.log_info(f"LLM_ROUTE_APPLIED_SAFE: {vehicle_id} from {current_edge} to {target_boundary_edge}")
                     else:
                         try:
-                            traci.vehicle.setRoute(vehicle_id, route)
+                            try:
+                                self._set_route_and_register(vehicle_id, route)
+                            except Exception:
+                                traci.vehicle.setRoute(vehicle_id, route)
                             self.logger.log_warning(f"LLM_ROUTE_APPLIED_RAW: {vehicle_id} (safe validation failed), applying raw route")
                         except Exception:
                             self.logger.log_warning(f"LLM_ROUTE_SET_FAIL: {vehicle_id} route application failed")
@@ -5949,7 +6363,10 @@ class MultiAgentTrafficEnvironment:
                     if original_route:
                         try:
                             if self._validate_route_setting(vehicle_id, original_route):
-                                traci.vehicle.setRoute(vehicle_id, original_route)
+                                try:
+                                    self._set_route_and_register(vehicle_id, original_route)
+                                except Exception:
+                                    traci.vehicle.setRoute(vehicle_id, original_route)
                                 self.logger.log_warning(f"LLM_ROUTE_FALLBACK_SAFE: {vehicle_id} using validated original route to {target_boundary_edge}")
                             else:
                                 self.logger.log_warning(f"LLM_ROUTE_FALLBACK_REJECT: {vehicle_id} original route invalid")
@@ -5960,7 +6377,10 @@ class MultiAgentTrafficEnvironment:
                 # Vehicle not in simulation yet, use original planned route
                 original_route = regional_result.get('route', [])
                 if original_route:
-                    traci.vehicle.setRoute(vehicle_id, original_route)
+                    try:
+                        self._set_route_and_register(vehicle_id, original_route)
+                    except Exception:
+                        traci.vehicle.setRoute(vehicle_id, original_route)
                     self.logger.log_info(f"LLM_ROUTE_PREPLANNED: {vehicle_id} using pre-planned route to {target_boundary_edge}")
                 else:
                     raise e
@@ -6389,7 +6809,10 @@ class MultiAgentTrafficEnvironment:
                                 current_edge = traci.vehicle.getRoadID(vehicle_id)
                                 safe_route = self._create_safe_route(current_edge, regional_plan['route'])
                                 if safe_route:
-                                    traci.vehicle.setRoute(vehicle_id, safe_route)
+                                    try:
+                                        self._set_route_and_register(vehicle_id, safe_route)
+                                    except Exception:
+                                        traci.vehicle.setRoute(vehicle_id, safe_route)
                                     self.logger.log_info(f"REGIONAL_PLANNING: Set safe route for {vehicle_id}")
                                 else:
                                     self.logger.log_warning(f"REGIONAL_PLANNING: Cannot create safe route for {vehicle_id}")
@@ -6439,10 +6862,16 @@ class MultiAgentTrafficEnvironment:
                             except Exception:
                                 safe_route = None
                             if safe_route and self._validate_route_setting(vehicle_id, safe_route):
-                                traci.vehicle.setRoute(vehicle_id, safe_route)
+                                try:
+                                    self._set_route_and_register(vehicle_id, safe_route)
+                                except Exception:
+                                    traci.vehicle.setRoute(vehicle_id, safe_route)
                                 self.logger.log_info(f"REGIONAL_PLANNING_INTRA_SAFE: {vehicle_id} -> {dest_edge}")
                             else:
-                                traci.vehicle.setRoute(vehicle_id, regional_plan['route'])
+                                try:
+                                    self._set_route_and_register(vehicle_id, regional_plan['route'])
+                                except Exception:
+                                    traci.vehicle.setRoute(vehicle_id, regional_plan['route'])
                                 self.logger.log_warning(f"REGIONAL_PLANNING_INTRA_RAW: {vehicle_id} route applied without safe validation")
                         except Exception as set_err:
                             self.logger.log_error(f"REGIONAL_PLANNING_INTRA_SET_FAIL: {vehicle_id}: {set_err}")
@@ -6566,6 +6995,7 @@ class MultiAgentTrafficEnvironment:
             
             # Calculate normalized rewards for RL training
             rewards = self._calculate_normalized_rewards(vehicle_id, travel_time, completion_time)
+            
             rl_training_data['rewards'] = rewards
             
             # Performance indicators for GRPO grouping
@@ -6624,95 +7054,81 @@ class MultiAgentTrafficEnvironment:
     
     def _calculate_normalized_rewards(self, vehicle_id: str, travel_time: float, completion_time: float) -> Dict[str, float]:
         """
-        Calculate normalized rewards for RL training following CLAUDE.md specifications.
+        Calculate ATT-only rewards for RL training.
         
-        Returns separate rewards for Traffic LLM and Regional LLM based on their roles:
-        - Traffic LLM: ATT improvement + cooperation quality  
-        - Regional LLM: Regional efficiency + individual protection + cooperation quality
+        Reward definition:
+          - Base (ATT-only): att_reward = E / (E + T), where E is adaptive expected time
+            derived from global congestion and route complexity; T is actual travel time.
+          - Stuck penalty: per-event deduction applied cumulatively.
+        
+        Returns the same ATT-only reward for both Traffic and Regional LLMs.
         """
         try:
-            rewards = {}
-            
-            # Get cooperation quality from CORY framework first
+            # Derive route length from macro plan if available
             macro_plan = self.vehicle_current_plans.get(vehicle_id, {})
-            
-            # Normalize to route sequence list regardless of storage form
             macro_route_seq = []
             try:
                 if hasattr(macro_plan, 'region_sequence'):
                     macro_route_seq = list(macro_plan.region_sequence or [])
-                    macro_plan = {
-                        'macro_route': macro_route_seq,
-                        'cooperation_quality': 0.5,
-                        'cory_decision_type': 'converted_from_macro_route'
-                    }
                 elif isinstance(macro_plan, dict):
                     route_val = macro_plan.get('macro_route', [])
                     if hasattr(route_val, 'region_sequence'):
                         macro_route_seq = list(route_val.region_sequence or [])
-                        macro_plan['macro_route'] = macro_route_seq
                     elif isinstance(route_val, (list, tuple)):
                         macro_route_seq = list(route_val)
-                    else:
-                        macro_route_seq = []
                 elif isinstance(macro_plan, (list, tuple)):
                     macro_route_seq = list(macro_plan)
-                    macro_plan = {'macro_route': macro_route_seq}
-                else:
-                    macro_route_seq = []
-                    macro_plan = {'macro_route': []}
             except Exception:
                 macro_route_seq = []
-                macro_plan = {'macro_route': []}
-            
-            cooperation_quality = macro_plan.get('cooperation_quality', 0.5)
-            
-            # Adaptive expected travel time based on current system state
-            expected_time = self._get_adaptive_expected_time(cooperation_quality)
-            
-            # ATT improvement calculation (for Traffic LLM)
-            att_improvement = max(0, (expected_time - travel_time) / expected_time)
-            att_reward = min(att_improvement * 2.0, 1.0)  # Cap at 1.0, multiply by 2.0 for sensitivity
-            
-            # Regional efficiency calculation (for Regional LLM)
-            regional_metrics = self._calculate_regional_efficiency(vehicle_id, travel_time)
-            efficiency_reward = min(regional_metrics * 2.0, 1.0)
-            
-            # Individual protection with adaptive fairness threshold
-            fairness_threshold = self._get_adaptive_fairness_threshold(cooperation_quality)
-            if travel_time <= fairness_threshold:
-                individual_protection = 1.0
-            else:
-                excess_ratio = (travel_time - fairness_threshold) / fairness_threshold
-                individual_protection = max(0.0, 1.0 - excess_ratio ** 1.2)  # Non-linear penalty
-            
-            # Traffic LLM rewards (Pioneer role)
-            rewards['traffic_llm'] = {
-                'att_reward': att_reward,
-                'cooperation_reward': cooperation_quality,
-                'total_reward': 0.6 * att_reward + 0.4 * cooperation_quality  # Weights from CLAUDE.md
+            route_length = len(macro_route_seq) if macro_route_seq else 1
+
+            # Adaptive expected time: fuse global congestion and route complexity (neutral cooperation)
+            expected_time = float(self._get_route_baseline_time(route_length, 0.5))
+
+            # ATT-only reward in (0, 1]: smooth, scale-free, fair across distances/conditions
+            E = max(1e-6, expected_time)
+            T = max(1e-6, float(travel_time))
+            att_reward = E / (E + T)
+
+            # Apply per-stuck-event penalty (accumulative)
+            try:
+                stuck_events = int(self.vehicle_stuck_events.get(vehicle_id, 0))
+            except Exception:
+                stuck_events = 0
+            penalty_per_event = float(getattr(self, 'stuck_penalty_per_event', 0.15))
+            total_penalty = min(0.95, penalty_per_event * max(0, stuck_events))
+            att_reward = max(0.0, att_reward - total_penalty)
+
+            rewards: Dict[str, Any] = {
+                'traffic_llm': {
+                    'att_reward': float(att_reward),
+                    'total_reward': float(att_reward)
+                },
+                'regional_llm': {
+                    'att_reward': float(att_reward),
+                    'total_reward': float(att_reward)
+                }
             }
-            
-            # Regional LLM rewards (Observer role)  
-            rewards['regional_llm'] = {
-                'efficiency_reward': efficiency_reward,
-                'individual_protection_reward': individual_protection,
-                'cooperation_reward': cooperation_quality,
-                'total_reward': 0.5 * efficiency_reward + 0.2 * individual_protection + 0.3 * cooperation_quality
-            }
-            
-            self.logger.log_info(f"RL_REWARDS: {vehicle_id} -> Traffic:{rewards['traffic_llm']['total_reward']:.3f}, "
-                               f"Regional:{rewards['regional_llm']['total_reward']:.3f}")
-            
+            if stuck_events > 0:
+                rewards['stuck_penalty'] = {
+                    'events': stuck_events,
+                    'penalty_per_event': penalty_per_event,
+                    'total_penalty': total_penalty
+                }
+
+            self.logger.log_info(
+                f"RL_REWARDS: {vehicle_id} -> Traffic:{rewards['traffic_llm']['total_reward']:.3f}, "
+                f"Regional:{rewards['regional_llm']['total_reward']:.3f}"
+            )
+
             return rewards
-            
+
         except Exception as e:
             self.logger.log_error(f"RL_REWARD_CALCULATION_ERROR: {vehicle_id} -> {e}")
-            # Return default rewards on error
+            # Return default rewards on error (ATT-only neutral)
             return {
-                'traffic_llm': {'att_reward': 0.5, 'cooperation_reward': 0.5, 'total_reward': 0.5},
-                'regional_llm': {'efficiency_reward': 0.5, 'individual_protection_reward': 0.5, 
-                               'cooperation_reward': 0.5, 'total_reward': 0.5}
+                'traffic_llm': {'att_reward': 0.5, 'total_reward': 0.5},
+                'regional_llm': {'att_reward': 0.5, 'total_reward': 0.5}
             }
     
     def _calculate_regional_efficiency(self, vehicle_id: str, travel_time: float) -> float:
@@ -6932,12 +7348,17 @@ class MultiAgentTrafficEnvironment:
                 
                 self.training_queue.put(training_batch)
                 
-                # Step 3: Release inference models
+                # Step 3: Release inference models（可选，默认跳过以避免无LoRA时空重载）
                 if hasattr(self, 'llm_manager') and self.llm_manager:
-                    self.logger.log_info("TIME_SLICED_TRAINING: Releasing inference models for training...")
-                    success = self.llm_manager.release_inference_models()
-                    if not success:
-                        self.logger.log_warning("TIME_SLICED_TRAINING: Inference model release failed, continuing with training")
+                    if getattr(self, 'release_models_during_time_sliced_training', False):
+                        self.logger.log_info("TIME_SLICED_TRAINING: Releasing inference models for training...")
+                        success = self.llm_manager.release_inference_models()
+                        self.models_released = bool(success)
+                        if not success:
+                            self.logger.log_warning("TIME_SLICED_TRAINING: Inference model release failed, continuing with training")
+                    else:
+                        self.models_released = False
+                        self.logger.log_info("TIME_SLICED_TRAINING: Skip releasing inference models (no-adapter mode)")
                 
                 # Clear the buffer for this agent type
                 self.training_data_buffer[agent_type].clear()
@@ -6969,16 +7390,21 @@ class MultiAgentTrafficEnvironment:
             try:
                 self.logger.log_info("TIME_SLICED_TRAINING: Resuming simulation after training completion")
                 
-                # Step 1: Restore inference models with new adapters
+                # Step 1: Restore inference models only if确有新LoRA，或之前确实释放过
                 if hasattr(self, 'llm_manager') and self.llm_manager:
-                    success = self.llm_manager.restore_inference_models(new_adapters)
-                    if not success:
-                        self.logger.log_error("TIME_SLICED_TRAINING: Failed to restore inference models")
-                        return False
+                    has_new_adapters = bool(new_adapters) and isinstance(new_adapters, dict) and any(new_adapters.values())
+                    if has_new_adapters or getattr(self, 'models_released', False):
+                        success = self.llm_manager.restore_inference_models(new_adapters if has_new_adapters else None)
+                        if not success:
+                            self.logger.log_error("TIME_SLICED_TRAINING: Failed to restore inference models")
+                            return False
+                    else:
+                        self.logger.log_info("TIME_SLICED_TRAINING: No new adapters and models not released, skip restore")
                 
                 # Step 2: Resume simulation
                 self.simulation_paused = False
                 self.is_training_active = False
+                self.models_released = False
                 
                 self.logger.log_info("TIME_SLICED_TRAINING: Simulation resumed successfully")
                 return True
@@ -7641,7 +8067,10 @@ class MultiAgentTrafficEnvironment:
                     else:
                         # Normal route application
                         if safe_route:
-                            traci.vehicle.setRoute(vehicle_id, safe_route)
+                            try:
+                                self._set_route_and_register(vehicle_id, safe_route)
+                            except Exception:
+                                traci.vehicle.setRoute(vehicle_id, safe_route)
                             self.logger.log_info(f"APPLY_PLAN: {vehicle_id} assigned route to "
                                                f"{regional_plan['boundary_edge']} "
                                                f"(travel_time: {regional_plan.get('travel_time', 'unknown')}s)")

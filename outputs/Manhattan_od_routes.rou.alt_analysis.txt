@@ -1,0 +1,46 @@
+Route Analysis Results for Manhattan_od_routes.rou.alt
+============================================================
+
+Source file: /home/zhouyuping/program/baseline/Adaptive-Navigation/environments/sumo/Manhattan_od_routes.rou.alt.xml
+
+Vehicle Statistics:
+  Total vehicles: 2,000
+
+Simulation Time Information:
+  Simulation duration: 366.50 minutes (6.11 hours)
+  First departure: 0.00 minutes
+  Last departure: 366.50 minutes
+
+Arrival Rate Statistics (vehicles/5min intervals):
+  Mean: 27.03
+  Standard Deviation: 2.16
+  Maximum: 28
+  Minimum: 9
+  Median: 27.00
+  95th Percentile: 28.00
+  5th Percentile: 27.00
+
+Total intervals analyzed: 74
+
+Sample Arrival Counts (first 20 intervals of 5 minutes each):
+  Interval 1 (  0-  5 min):  27 vehicles
+  Interval 2 (  5- 10 min):  27 vehicles
+  Interval 3 ( 10- 15 min):  27 vehicles
+  Interval 4 ( 15- 20 min):  28 vehicles
+  Interval 5 ( 20- 25 min):  27 vehicles
+  Interval 6 ( 25- 30 min):  27 vehicles
+  Interval 7 ( 30- 35 min):  28 vehicles
+  Interval 8 ( 35- 40 min):  27 vehicles
+  Interval 9 ( 40- 45 min):  27 vehicles
+  Interval 10 ( 45- 50 min):  27 vehicles
+  Interval 11 ( 50- 55 min):  28 vehicles
+  Interval 12 ( 55- 60 min):  27 vehicles
+  Interval 13 ( 60- 65 min):  27 vehicles
+  Interval 14 ( 65- 70 min):  27 vehicles
+  Interval 15 ( 70- 75 min):  28 vehicles
+  Interval 16 ( 75- 80 min):  27 vehicles
+  Interval 17 ( 80- 85 min):  27 vehicles
+  Interval 18 ( 85- 90 min):  28 vehicles
+  Interval 19 ( 90- 95 min):  27 vehicles
+  Interval 20 ( 95-100 min):  27 vehicles
+  ... (showing first 20 of 74 intervals)

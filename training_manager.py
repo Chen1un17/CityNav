@@ -63,14 +63,14 @@ class TrainingConfig:
     
     def __post_init__(self):
         # 从环境变量读取训练GPU配置
-        training_gpus = os.getenv("TRAINING_CUDA_VISIBLE_DEVICES", "2,3").split(",")
+        training_gpus = os.getenv("TRAINING_CUDA_VISIBLE_DEVICES", "0,1").split(",")
         if len(training_gpus) >= 2:
             self.traffic_gpu = f"cuda:{training_gpus[0]}"
             self.regional_gpu = f"cuda:{training_gpus[1]}"
         else:
             # 默认配置
-            self.traffic_gpu = "cuda:2"
-            self.regional_gpu = "cuda:3"
+            self.traffic_gpu = "cuda:0"
+            self.regional_gpu = "cuda:1"
 
         # 观测模式（关闭强化相位与放大量）
         if os.getenv("OBSERVATION_MODE", "0") in ("1", "true", "True"): 
@@ -116,8 +116,8 @@ class TrainingConfig:
             except Exception:
                 pass
     
-    traffic_gpu: str = "cuda:2"  # GPU for Traffic LLM training
-    regional_gpu: str = "cuda:3"  # GPU for Regional LLM training
+    traffic_gpu: str = "cuda:0"  # GPU for Traffic LLM training
+    regional_gpu: str = "cuda:1"  # GPU for Regional LLM training
     
     # GRPO Configuration - Further optimized for stability
     traffic_group_size: int = 4  # Group size for Traffic LLM (reduced from 8)
@@ -256,22 +256,19 @@ class ReplayBuffer:
             # Extract reward information for quality assessment
             rewards = sample.get('rewards', {})
             
-            # Calculate quality score based on rewards and cooperation
+            # Calculate quality score based on ATT-only reward
             if self.name.lower() == "traffic":
                 reward_info = rewards.get('traffic_llm', {})
                 total_reward = reward_info.get('total_reward', 0.0)
-                cooperation_reward = reward_info.get('cooperation_reward', 0.0)
             else:  # regional
                 reward_info = rewards.get('regional_llm', {})
                 total_reward = reward_info.get('total_reward', 0.0)
-                cooperation_reward = reward_info.get('cooperation_reward', 0.0)
-            
-            # Quality threshold: samples with high total reward and cooperation
+
+            # Quality threshold: based solely on total_reward (ATT-only)
             quality_threshold = 0.7
-            cooperation_threshold = 0.6
-            
-            if total_reward >= quality_threshold and cooperation_reward >= cooperation_threshold:
-                sample['quality_score'] = total_reward * 0.7 + cooperation_reward * 0.3
+
+            if total_reward >= quality_threshold:
+                sample['quality_score'] = total_reward
                 sample['sample_type'] = 'high_quality'
                 self.high_quality_samples.append(sample)
                 
@@ -1703,8 +1700,8 @@ class TrainingManager:
         
         # RL Metrics Accumulation with Historical Tracking
         self.cumulative_rewards = {
-            'traffic': {'att_reward': 0.0, 'cooperation_reward': 0.0, 'total_reward': 0.0},
-            'regional': {'efficiency_reward': 0.0, 'protection_reward': 0.0, 'cooperation_reward': 0.0, 'total_reward': 0.0}
+            'traffic': {'att_reward': 0.0, 'total_reward': 0.0},
+            'regional': {'att_reward': 0.0, 'total_reward': 0.0}
         }
         
         # Historical data for line plots (time series)
@@ -2250,23 +2247,19 @@ class TrainingManager:
                 
                 if trainer_type == 'traffic':
                     att_rewards = []
-                    coop_rewards = []
                     total_rewards = []
                     
                     for sample in training_samples:
                         rewards = sample.get('rewards', {})
                         traffic_rewards = rewards.get('traffic_llm', {})
                         att_rewards.append(traffic_rewards.get('att_reward', 0.0))
-                        coop_rewards.append(traffic_rewards.get('cooperation_reward', 0.0))
                         total_rewards.append(traffic_rewards.get('total_reward', 0.0))
                     
-                    # Use average rewards from actual training data
+                    # Use average rewards from actual training data (ATT-only)
                     avg_att_reward = sum(att_rewards) / total_samples if att_rewards else 0.0
-                    avg_coop_reward = sum(coop_rewards) / total_samples if coop_rewards else 0.0
                     avg_total_reward = sum(total_rewards) / total_samples if total_rewards else 0.0
                     
                     self.cumulative_rewards['traffic']['att_reward'] += avg_att_reward
-                    self.cumulative_rewards['traffic']['cooperation_reward'] += avg_coop_reward
                     self.cumulative_rewards['traffic']['total_reward'] += avg_total_reward
                     
                     # Update historical data for line plots
@@ -2289,35 +2282,28 @@ class TrainingManager:
                         self.att_improvement_history.append(avg_att_reward)
                     
                 elif trainer_type == 'regional':
-                    efficiency_rewards = []
-                    protection_rewards = []
-                    coop_rewards = []
+                    att_rewards = []
                     total_rewards = []
                     
                     for sample in training_samples:
                         rewards = sample.get('rewards', {})
                         regional_rewards = rewards.get('regional_llm', {})
-                        efficiency_rewards.append(regional_rewards.get('efficiency_reward', 0.0))
-                        protection_rewards.append(regional_rewards.get('individual_protection_reward', 0.0))
-                        coop_rewards.append(regional_rewards.get('cooperation_reward', 0.0))
+                        att_rewards.append(regional_rewards.get('att_reward', 0.0))
                         total_rewards.append(regional_rewards.get('total_reward', 0.0))
                     
-                    # Use average rewards from actual training data
-                    avg_efficiency_reward = sum(efficiency_rewards) / total_samples if efficiency_rewards else 0.0
-                    avg_protection_reward = sum(protection_rewards) / total_samples if protection_rewards else 0.0
-                    avg_coop_reward = sum(coop_rewards) / total_samples if coop_rewards else 0.0
+                    # Use average rewards from actual training data (ATT-only)
+                    avg_att_reward = sum(att_rewards) / total_samples if att_rewards else 0.0
                     avg_total_reward = sum(total_rewards) / total_samples if total_rewards else 0.0
                     
-                    self.cumulative_rewards['regional']['efficiency_reward'] += avg_efficiency_reward
-                    self.cumulative_rewards['regional']['protection_reward'] += avg_protection_reward
-                    self.cumulative_rewards['regional']['cooperation_reward'] += avg_coop_reward
+                    self.cumulative_rewards['regional']['att_reward'] += avg_att_reward
                     self.cumulative_rewards['regional']['total_reward'] += avg_total_reward
                     
                     # Update historical data for line plots
                     self.training_history['regional_loss'].append(metrics.get('loss', 0.0))
                     self.training_history['regional_reward'].append(avg_total_reward)
                     self.training_history['regional_lr'].append(metrics.get('learning_rate', 0.0))
-                    self.training_history['cooperation_quality'].append(avg_coop_reward)
+                    # For ATT-only reward setting, reuse att_reward trend in place of cooperation quality
+                    self.training_history['cooperation_quality'].append(avg_att_reward)
                     
                     # Token stats / normalized loss
                     if 'tokens_this_step' in metrics:
@@ -2331,19 +2317,16 @@ class TrainingManager:
                     
                     # Track cooperation quality history with real data
                     if len(self.cooperation_quality_history) == 0 or current_step % 5 == 0:
-                        # Sample every 5 steps with real cooperation data
-                        self.cooperation_quality_history.append(avg_coop_reward)
+                        # Sample every 5 steps with ATT data (ATT-only reward setting)
+                        self.cooperation_quality_history.append(avg_att_reward)
             
             else:
                 # Fallback to relative reward mean when no training samples available
                 if trainer_type == 'traffic':
                     relative_reward = metrics.get('relative_reward_mean', 0.0)
-                    # Use weights consistent with new reward system: 0.6 * att_reward + 0.4 * cooperation_quality
-                    estimated_att_reward = relative_reward * 0.6 / (0.6 + 0.4)  # Normalize by total weight
-                    estimated_coop_reward = relative_reward * 0.4 / (0.6 + 0.4)
+                    estimated_att_reward = relative_reward
                     
                     self.cumulative_rewards['traffic']['att_reward'] += estimated_att_reward
-                    self.cumulative_rewards['traffic']['cooperation_reward'] += estimated_coop_reward
                     self.cumulative_rewards['traffic']['total_reward'] += relative_reward
                     
                     self.training_history['traffic_loss'].append(metrics.get('loss', 0.0))
@@ -2353,21 +2336,16 @@ class TrainingManager:
                     
                 elif trainer_type == 'regional':
                     relative_reward = metrics.get('relative_reward_mean', 0.0)
-                    # Use weights consistent with new reward system: 0.5 * efficiency + 0.2 * protection + 0.3 * cooperation
-                    total_weight = 0.5 + 0.2 + 0.3
-                    estimated_efficiency_reward = relative_reward * 0.5 / total_weight
-                    estimated_protection_reward = relative_reward * 0.2 / total_weight
-                    estimated_coop_reward = relative_reward * 0.3 / total_weight
+                    estimated_att_reward = relative_reward
                     
-                    self.cumulative_rewards['regional']['efficiency_reward'] += estimated_efficiency_reward
-                    self.cumulative_rewards['regional']['protection_reward'] += estimated_protection_reward
-                    self.cumulative_rewards['regional']['cooperation_reward'] += estimated_coop_reward
+                    self.cumulative_rewards['regional']['att_reward'] += estimated_att_reward
                     self.cumulative_rewards['regional']['total_reward'] += relative_reward
                     
                     self.training_history['regional_loss'].append(metrics.get('loss', 0.0))
                     self.training_history['regional_reward'].append(relative_reward)
                     self.training_history['regional_lr'].append(metrics.get('learning_rate', 0.0))
-                    self.training_history['cooperation_quality'].append(estimated_coop_reward)
+                    # For ATT-only reward setting, reuse estimated_att_reward trend in place of cooperation quality
+                    self.training_history['cooperation_quality'].append(estimated_att_reward)
             
             # Track phase transitions
             current_phase = metrics.get('training_phase', 'unknown')

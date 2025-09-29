@@ -1,0 +1,17 @@
+Network Analysis Results for Manhattan.net
+==================================================
+
+Source file: /data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan.net.xml
+
+Main Statistics:
+  Intersections: 4,257
+  Roads: 12,627
+
+Detailed Breakdown:
+  Total junctions (including internal): 18,240
+  Real intersections: 4,257
+  Internal junctions: 13,983
+
+  Total edges (including internal): 74,979
+  Real roads: 12,627
+  Internal edges: 62,352

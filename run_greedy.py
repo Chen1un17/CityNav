@@ -9,6 +9,8 @@ import traci
 import wandb
 import xml.etree.ElementTree as ET
 from typing import Dict, List, Tuple, Optional
+import matplotlib.pyplot as plt
+
 os.environ["WANDB_MODE"] = "offline"
 sys.path.append("../")
 
@@ -28,7 +30,8 @@ class GreedyRoutePlanning(object):
     
     def __init__(self, location: str, sumo_config: str, route_file: str, 
                  road_info_file: str, adjacency_file: str, step_size: float, 
-                 max_steps: int, algorithm: str):
+                 max_steps: int, algorithm: str, use_wandb: bool = False,
+                 plot_filename: Optional[str] = None):
         """
         Initialize the Greedy routing system.
         
@@ -41,6 +44,8 @@ class GreedyRoutePlanning(object):
             step_size: Simulation step size in seconds
             max_steps: Maximum number of simulation steps
             algorithm: Greedy algorithm type ('minLat', 'minDis', 'minLig')
+            use_wandb: Flag to enable wandb logging
+            plot_filename: Filename for saving matplotlib plot
         """
         self.location = location
         self.sumo_config = sumo_config
@@ -50,6 +55,10 @@ class GreedyRoutePlanning(object):
         self.step_size = step_size
         self.max_steps = max_steps
         self.algorithm = algorithm
+        self.use_wandb = use_wandb
+        self.plot_filename = plot_filename
+        self.plot_data = {'completed': [], 'avg_time': []}
+        self.fig, self.ax = (None, None)
         
         # Vehicle tracking
         self.autonomous_vehicles = set()
@@ -138,6 +147,10 @@ class GreedyRoutePlanning(object):
         self.edges = traci.edge.getIDList()
         print(f"Retrieved {len(self.edges)} edges from SUMO")
         
+        if self.plot_filename:
+            self.fig, self.ax = plt.subplots(figsize=(10, 6))
+            print(f"Matplotlib plotting enabled. Saving to {self.plot_filename}")
+            
         print(f"Ready for sequential autonomous vehicle selection from PRIMARY route using {self.algorithm} algorithm")
 
     def _load_route_files_from_sumocfg(self) -> None:
@@ -325,6 +338,22 @@ class GreedyRoutePlanning(object):
         
         return best_neighbor
     
+    def _update_matplotlib_plot(self):
+        """Update and save the Matplotlib plot."""
+        if not self.plot_filename or not self.fig:
+            return
+        
+        self.ax.clear()
+        self.ax.plot(self.plot_data['completed'], self.plot_data['avg_time'], marker='o', linestyle='-')
+        
+        self.ax.set_xlabel("Completed Autonomous Vehicles")
+        self.ax.set_ylabel("Average Travel Time (s)")
+        self.ax.set_title(f"Performance for {self.algorithm.upper()} on {self.location}")
+        self.ax.grid(True)
+        
+        self.fig.tight_layout()
+        self.fig.savefig(self.plot_filename)
+    
     def run_simulation(self) -> Tuple[float, int]:
         """
         Run the complete simulation with dynamic autonomous vehicle selection 
@@ -439,12 +468,37 @@ class GreedyRoutePlanning(object):
                 
                 # Check for completed vehicles
                 arrived_vehicles = traci.simulation.getArrivedIDList()
+                newly_arrived_autonomous = False
                 for veh_id in arrived_vehicles:
                     if (veh_id in self.vehicle_start_times and 
                         veh_id not in self.vehicle_end_times):
                         self.vehicle_end_times[veh_id] = current_time
                         self.completed_vehicles += 1
+                        if veh_id in self.autonomous_vehicles:
+                            newly_arrived_autonomous = True
                 
+                if newly_arrived_autonomous and (self.use_wandb or self.plot_filename):
+                    autonomous_travel_times = []
+                    for veh_id in self.vehicle_end_times:
+                        if (veh_id in self.autonomous_vehicles and
+                            veh_id in self.vehicle_start_times):
+                            travel_time = self.vehicle_end_times[veh_id] - self.vehicle_start_times[veh_id]
+                            autonomous_travel_times.append(travel_time)
+
+                    if autonomous_travel_times:
+                        current_avg_travel_time = sum(autonomous_travel_times) / len(autonomous_travel_times)
+                        completed_autonomous_count = len(autonomous_travel_times)
+                        
+                        if self.use_wandb:
+                            wandb.log({
+                                "travel_time_vs_completed/avg_travel_time": current_avg_travel_time,
+                            }, step=completed_autonomous_count)
+
+                        if self.plot_filename:
+                            self.plot_data['completed'].append(completed_autonomous_count)
+                            self.plot_data['avg_time'].append(current_avg_travel_time)
+                            self._update_matplotlib_plot()
+
                 # Update progress
                 step += self.step_size
                 pbar.update(self.step_size)
@@ -531,6 +585,10 @@ class GreedyRoutePlanning(object):
         
         print("="*60)
         
+        # Cleanup plot
+        if self.plot_filename and self.fig:
+            plt.close(self.fig)
+
         # Cleanup SUMO
         try:
             traci.close()
@@ -540,7 +598,8 @@ class GreedyRoutePlanning(object):
 
 
 def run_single_experiment(location: str, step_size: float, max_steps: int, 
-                         algorithm: str, use_wandb: bool = True) -> Tuple[float, int]:
+                         algorithm: str, use_wandb: bool = True,
+                         use_plot: bool = False) -> Tuple[float, int]:
     """
     Run a single experiment with the specified greedy algorithm.
     
@@ -550,6 +609,7 @@ def run_single_experiment(location: str, step_size: float, max_steps: int,
         max_steps: Maximum simulation steps
         algorithm: Greedy algorithm ('minLat', 'minDis', 'minLig')
         use_wandb: Whether to log results to Weights & Biases
+        use_plot: Whether to enable matplotlib plotting
         
     Returns:
         Tuple of (average_travel_time, completed_vehicles)
@@ -594,6 +654,8 @@ def run_single_experiment(location: str, step_size: float, max_steps: int,
             }
         )
     
+    plot_filename = f"greedy_{location}_{algorithm}_plot.png" if use_plot else None
+    
     # Create and run simulation
     greedy_planner = GreedyRoutePlanning(
         location=location,
@@ -603,7 +665,9 @@ def run_single_experiment(location: str, step_size: float, max_steps: int,
         adjacency_file=adjacency_file,
         step_size=step_size,
         max_steps=max_steps,
-        algorithm=algorithm
+        algorithm=algorithm,
+        use_wandb=use_wandb,
+        plot_filename=plot_filename
     )
     
     # Initialize simulation
@@ -632,7 +696,8 @@ def run_single_experiment(location: str, step_size: float, max_steps: int,
     return average_travel_time, completed_vehicles
 
 
-def main(location: str, step_size: float, max_steps: int, algorithm: str = None, use_wandb: bool = True):
+def main(location: str, step_size: float, max_steps: int, algorithm: str = None, 
+         use_wandb: bool = True, use_plot: bool = False):
     """
     Main function to run greedy-based route planning experiments.
     
@@ -642,6 +707,7 @@ def main(location: str, step_size: float, max_steps: int, algorithm: str = None,
         max_steps: Maximum simulation steps
         algorithm: Specific algorithm to run, or None to run all
         use_wandb: Whether to log results to Weights & Biases
+        use_plot: Whether to enable matplotlib plotting
     """
     print("Greedy Route Planning System")
     print("=" * 50)
@@ -649,6 +715,7 @@ def main(location: str, step_size: float, max_steps: int, algorithm: str = None,
     print(f"Step Size: {step_size}s")
     print(f"Max Steps: {max_steps}")
     print(f"W&B Logging: {'Disabled' if not use_wandb else 'Enabled'}")
+    print(f"Plotting: {'Disabled' if not use_plot else 'Enabled'}")
     
     algorithms = ['minLat', 'minDis', 'minLig'] if algorithm is None else [algorithm]
     print(f"Algorithms: {', '.join(algorithms)}")
@@ -665,7 +732,8 @@ def main(location: str, step_size: float, max_steps: int, algorithm: str = None,
                 step_size=step_size,
                 max_steps=max_steps,
                 algorithm=alg,
-                use_wandb=use_wandb
+                use_wandb=use_wandb,
+                use_plot=use_plot
             )
             
             results[alg] = {
@@ -736,6 +804,11 @@ if __name__ == "__main__":
         action="store_true", 
         help="Disable Weights & Biases logging"
     )
+    parser.add_argument(
+        "--plot", 
+        action="store_true", 
+        help="Enable real-time plotting with Matplotlib"
+    )
     
     args = parser.parse_args()
     
@@ -744,5 +817,6 @@ if __name__ == "__main__":
         step_size=args.step_size,
         max_steps=args.max_steps,
         algorithm=args.algorithm,
-        use_wandb=not args.no_wandb
+        use_wandb=not args.no_wandb,
+        use_plot=args.plot
     )

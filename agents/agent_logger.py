@@ -54,6 +54,7 @@ class PerformanceMetrics:
     average_travel_time: float
     system_throughput: float
     regional_metrics: Dict[int, Dict[str, float]]
+    extra_metrics: Optional[Dict[str, float]] = None
     
     
 class AgentLogger:
@@ -356,7 +357,7 @@ class AgentLogger:
     
     def log_system_performance(self, regional_metrics: Dict[int, Dict], 
                              traffic_metrics: Dict, prediction_metrics: Dict, 
-                             timestamp: float):
+                             timestamp: float, extra_metrics: Optional[Dict[str, float]] = None):
         """Log comprehensive system performance metrics."""
         active_vehicles = len(self.vehicle_statuses)
         avg_travel_time = sum(self.travel_times) / len(self.travel_times) if self.travel_times else 0.0
@@ -369,7 +370,8 @@ class AgentLogger:
             completed_vehicles=self.completed_vehicles,
             average_travel_time=avg_travel_time,
             system_throughput=throughput,
-            regional_metrics=regional_metrics
+            regional_metrics=regional_metrics,
+            extra_metrics=extra_metrics
         )
         
         with self.log_lock:
@@ -393,6 +395,10 @@ class AgentLogger:
                     "success_rate": self.successful_llm_calls / self.total_llm_calls if self.total_llm_calls > 0 else 0.0
                 }
             }
+            # Attach extra metrics (e.g., Alat/Adis/AWai/ADet) as top-level fields if provided
+            if extra_metrics:
+                for k, v in extra_metrics.items():
+                    log_entry[k] = v
             
             with open(self.performance_log_file, 'a') as f:
                 f.write(json.dumps(log_entry) + '\n')

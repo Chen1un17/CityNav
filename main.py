@@ -84,7 +84,7 @@ class MultiAgent_Route_Planning(object):
         """Initialize the MAGRPO training manager in a separate process."""
         try:
             # 训练GPU隔离：在启动训练进程前显式设置训练可见GPU
-            os.environ["TRAINING_CUDA_VISIBLE_DEVICES"] = "2,3"
+            os.environ["TRAINING_CUDA_VISIBLE_DEVICES"] = "0,1"
             print(f"[INFO] 训练GPU绑定: TRAINING_CUDA_VISIBLE_DEVICES={os.environ.get('TRAINING_CUDA_VISIBLE_DEVICES')}")
             
             # Create multiprocessing queue for training data
@@ -97,8 +97,8 @@ class MultiAgent_Route_Planning(object):
             # Create training configuration
             training_config = TrainingConfig(
                 model_path=llm_path,
-                traffic_gpu="cuda:2",  # Traffic LLM training GPU
-                regional_gpu="cuda:3",  # Regional LLM training GPU
+                traffic_gpu="cuda:0",  # Traffic LLM training GPU
+                regional_gpu="cuda:1",  # Regional LLM training GPU
                 traffic_group_size=8,
                 regional_group_size=12,
                 learning_rate=1e-4,
@@ -378,8 +378,8 @@ if __name__ == "__main__":
     print(f"  - Reflection: {'Enabled' if use_reflection else 'Disabled'}")
     print(f"  - MAGRPO Training: {'ENABLED' if enable_training else 'Disabled'}")
     if enable_training:
-        print(f"    * Traffic LLM Training GPU: cuda:2")
-        print(f"    * Regional LLM Training GPU: cuda:3")
+        print(f"    * Traffic LLM Training GPU: cuda:0")
+        print(f"    * Regional LLM Training GPU: cuda:1")
         print(f"    * Training Group Sizes: Traffic=8, Regional=12")
     print(f"  - Location: {args.location}")
     print(f"  - Batch Size: {args.batch_size}")

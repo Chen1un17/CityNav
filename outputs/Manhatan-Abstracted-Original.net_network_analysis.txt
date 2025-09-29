@@ -1,0 +1,17 @@
+Network Analysis Results for Manhatan-Abstracted-Original.net
+==================================================
+
+Source file: /home/zhouyuping/program/baseline/Adaptive-Navigation/environments/sumo/networks/UES_Manhatan/Manhatan-Abstracted-Original.net.xml
+
+Main Statistics:
+  Intersections: 3,371
+  Roads: 6,584
+
+Detailed Breakdown:
+  Total junctions (including internal): 3,955
+  Real intersections: 3,371
+  Internal junctions: 584
+
+  Total edges (including internal): 11,134
+  Real roads: 6,584
+  Internal edges: 4,550

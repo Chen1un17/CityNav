@@ -1,0 +1,46 @@
+Route Analysis Results for Chicago_taxi_2015-01-01.rou
+============================================================
+
+Source file: /data/zhouyuping/LLMNavigation/Data/Chicago/Chicago_taxi_2015-01-01.rou.xml
+
+Vehicle Statistics:
+  Total vehicles: 79,342
+
+Simulation Time Information:
+  Simulation duration: 664.11 minutes (11.07 hours)
+  First departure: 0.00 minutes
+  Last departure: 664.11 minutes
+
+Arrival Rate Statistics (vehicles/5min intervals):
+  Mean: 596.56
+  Standard Deviation: 9.42
+  Maximum: 600
+  Minimum: 490
+  Median: 598.00
+  95th Percentile: 599.00
+  5th Percentile: 594.00
+
+Total intervals analyzed: 133
+
+Sample Arrival Counts (first 20 intervals of 5 minutes each):
+  Interval 1 (  0-  5 min): 598 vehicles
+  Interval 2 (  5- 10 min): 598 vehicles
+  Interval 3 ( 10- 15 min): 599 vehicles
+  Interval 4 ( 15- 20 min): 597 vehicles
+  Interval 5 ( 20- 25 min): 599 vehicles
+  Interval 6 ( 25- 30 min): 597 vehicles
+  Interval 7 ( 30- 35 min): 600 vehicles
+  Interval 8 ( 35- 40 min): 599 vehicles
+  Interval 9 ( 40- 45 min): 598 vehicles
+  Interval 10 ( 45- 50 min): 599 vehicles
+  Interval 11 ( 50- 55 min): 599 vehicles
+  Interval 12 ( 55- 60 min): 595 vehicles
+  Interval 13 ( 60- 65 min): 599 vehicles
+  Interval 14 ( 65- 70 min): 600 vehicles
+  Interval 15 ( 70- 75 min): 600 vehicles
+  Interval 16 ( 75- 80 min): 596 vehicles
+  Interval 17 ( 80- 85 min): 598 vehicles
+  Interval 18 ( 85- 90 min): 599 vehicles
+  Interval 19 ( 90- 95 min): 598 vehicles
+  Interval 20 ( 95-100 min): 598 vehicles
+  ... (showing first 20 of 133 intervals)

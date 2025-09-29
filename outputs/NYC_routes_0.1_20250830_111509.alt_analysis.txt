@@ -1,0 +1,46 @@
+Route Analysis Results for NYC_routes_0.1_20250830_111509.alt
+============================================================
+
+Source file: /data/zhouyuping/LLMNavigation/Data/NYC/NYC_routes_0.1_20250830_111509.alt.xml
+
+Vehicle Statistics:
+  Total vehicles: 680,316
+
+Simulation Time Information:
+  Simulation duration: 1439.98 minutes (24.00 hours)
+  First departure: 0.00 minutes
+  Last departure: 1439.98 minutes
+
+Arrival Rate Statistics (vehicles/5min intervals):
+  Mean: 2362.21
+  Standard Deviation: 2153.66
+  Maximum: 7990
+  Minimum: 602
+  Median: 1309.50
+  95th Percentile: 6607.95
+  5th Percentile: 643.00
+
+Total intervals analyzed: 288
+
+Sample Arrival Counts (first 20 intervals of 5 minutes each):
+  Interval 1 (  0-  5 min): 1262 vehicles
+  Interval 2 (  5- 10 min): 1322 vehicles
+  Interval 3 ( 10- 15 min): 1252 vehicles
+  Interval 4 ( 15- 20 min): 1253 vehicles
+  Interval 5 ( 20- 25 min): 1326 vehicles
+  Interval 6 ( 25- 30 min): 1289 vehicles
+  Interval 7 ( 30- 35 min): 1273 vehicles
+  Interval 8 ( 35- 40 min): 1338 vehicles
+  Interval 9 ( 40- 45 min): 1271 vehicles
+  Interval 10 ( 45- 50 min): 1285 vehicles
+  Interval 11 ( 50- 55 min): 1313 vehicles
+  Interval 12 ( 55- 60 min): 1316 vehicles
+  Interval 13 ( 60- 65 min): 1359 vehicles
+  Interval 14 ( 65- 70 min): 1332 vehicles
+  Interval 15 ( 70- 75 min): 1320 vehicles
+  Interval 16 ( 75- 80 min): 1277 vehicles
+  Interval 17 ( 80- 85 min): 1374 vehicles
+  Interval 18 ( 85- 90 min): 1295 vehicles
+  Interval 19 ( 90- 95 min): 1242 vehicles
+  Interval 20 ( 95-100 min): 1340 vehicles
+  ... (showing first 20 of 288 intervals)

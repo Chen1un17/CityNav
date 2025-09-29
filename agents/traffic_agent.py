@@ -162,7 +162,7 @@ class TrafficAgent:
                 
                 for edge_id in region_edges:
                     if edge_id in self.road_info:
-                        total_congestion += self.road_info[edge_id].get('congestion_level', 0)
+                        total_congestion += self.road_info[edge_id].get('congestion_score', self.road_info[edge_id].get('occupancy_rate', self.road_info[edge_id].get('congestion_level', 0)))
                         edge_count += 1
                 
                 avg_congestion = total_congestion / max(1, edge_count)
@@ -173,7 +173,7 @@ class TrafficAgent:
             for boundary_info in self.boundary_edges:
                 edge_id = boundary_info['edge_id']
                 if edge_id in self.road_info:
-                    boundary_congestion[edge_id] = self.road_info[edge_id].get('congestion_level', 0)
+                    boundary_congestion[edge_id] = self.road_info[edge_id].get('congestion_score', self.road_info[edge_id].get('occupancy_rate', self.road_info[edge_id].get('congestion_level', 0)))
             
             # Get vehicle counts
             total_vehicles = len(traci.vehicle.getIDList())
@@ -1505,7 +1505,7 @@ class TrafficAgent:
         observation_text = "\n".join(observation_parts)
         
         # Allow sufficient context but prevent excessive length
-        max_context_length = 2500
+        max_context_length = 6000
         if len(observation_text) > max_context_length:
             observation_text = observation_text[:max_context_length-3] + "..."
         

@@ -1,0 +1,17 @@
+Network Analysis Results for Chicago.net
+==================================================
+
+Source file: /data/zhouyuping/LLMNavigation/Data/Chicago/Chicago.net.xml
+
+Main Statistics:
+  Intersections: 82,053
+  Roads: 210,810
+
+Detailed Breakdown:
+  Total junctions (including internal): 249,511
+  Real intersections: 82,053
+  Internal junctions: 167,458
+
+  Total edges (including internal): 978,799
+  Real roads: 210,810
+  Internal edges: 767,989

@@ -711,12 +711,21 @@ class LLM(object):
                 while retry_count < 3:
                     try:
                         with self.connection_pool.get_client(self.agent_id) as client:
-                            response = client.chat.completions.create(
-                                model=llm_name,
-                                messages=message,
-                                temperature=self.generation_kwargs['temperature'],
-                                max_tokens=self.generation_kwargs['max_tokens']
-                            ).choices[0].message.content
+                            if getattr(self, 'provider_name', '') == 'dashscope':
+                                response = client.chat.completions.create(
+                                    model=llm_name,
+                                    messages=message,
+                                    temperature=self.generation_kwargs['temperature'],
+                                    max_tokens=self.generation_kwargs['max_tokens'],
+                                    extra_body={"enable_thinking": False}
+                                ).choices[0].message.content
+                            else:
+                                response = client.chat.completions.create(
+                                    model=llm_name,
+                                    messages=message,
+                                    temperature=self.generation_kwargs['temperature'],
+                                    max_tokens=self.generation_kwargs['max_tokens']
+                                ).choices[0].message.content
                         
                         # Validate response
                         if response is None or not response.strip():
@@ -734,12 +743,21 @@ class LLM(object):
                 # Original logic for non-pooled connections with enhanced error handling
                 while retry_count < 3:
                     try:
-                        response = self.model.chat.completions.create(
-                            model=llm_name,
-                            messages=message,
-                            temperature=self.generation_kwargs['temperature'],
-                            max_tokens=self.generation_kwargs['max_tokens'],
-                        ).choices[0].message.content
+                        if getattr(self, 'provider_name', '') == 'dashscope':
+                            response = self.model.chat.completions.create(
+                                model=llm_name,
+                                messages=message,
+                                temperature=self.generation_kwargs['temperature'],
+                                max_tokens=self.generation_kwargs['max_tokens'],
+                                extra_body={"enable_thinking": False}
+                            ).choices[0].message.content
+                        else:
+                            response = self.model.chat.completions.create(
+                                model=llm_name,
+                                messages=message,
+                                temperature=self.generation_kwargs['temperature'],
+                                max_tokens=self.generation_kwargs['max_tokens'],
+                            ).choices[0].message.content
                         
                         # Validate response
                         if response is None or not response.strip():
@@ -1234,6 +1252,7 @@ class LLM(object):
                     client = self.model
                 
                 try:
+                    thinking_enabled = False
                     if "openai" == self.provider_name:
                         stream = client.chat.completions.create(
                             model=llm_name,
@@ -1242,36 +1261,45 @@ class LLM(object):
                             stream=True
                         )
                     else:
-                        stream = client.chat.completions.create(
-                            model=llm_name,
-                            messages=message,
-                            max_tokens=self.generation_kwargs['max_tokens'] if "glm-z1-9b" not in llm_name.lower() else 8000,
-                            stream=True
-                        )
+                        # DashScope/OpenAI兼容流式：关闭思考模式
+                        if getattr(self, 'provider_name', '') == 'dashscope':
+                            stream = client.chat.completions.create(
+                                model=llm_name,
+                                messages=message,
+                                max_tokens=self.generation_kwargs['max_tokens'] if "glm-z1-9b" not in llm_name.lower() else 8000,
+                                stream=True,
+                                extra_body={"enable_thinking": False}
+                            )
+                        else:
+                            stream = client.chat.completions.create(
+                                model=llm_name,
+                                messages=message,
+                                max_tokens=self.generation_kwargs['max_tokens'] if "glm-z1-9b" not in llm_name.lower() else 8000,
+                                stream=True
+                            )
                 finally:
                     if self.connection_pool is not None and client is not None:
                         client_context.__exit__(None, None, None)
 
-                collected_response = "<think>\n"
+                collected_response = ""
                 reasoning_finish_flag = False
                 
                 for chunk in stream:
                     try:
                         if hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content:
-                            if not reasoning_finish_flag:
-                                collected_response += "</think>\n"
-                                reasoning_finish_flag = True
                             token = chunk.choices[0].delta.content
                             collected_response += token
                         elif hasattr(chunk.choices[0].delta, 'reasoning_content') and chunk.choices[0].delta.reasoning_content:
-                            token = chunk.choices[0].delta.reasoning_content
-                            collected_response += token
+                            # 关闭思考模式时忽略 reasoning_content
+                            if thinking_enabled:
+                                token = chunk.choices[0].delta.reasoning_content
+                                collected_response += token
                     except Exception as chunk_error:
                         print(f"Error processing chunk: {chunk_error}")
                         continue
                 
                 # Validate collected response
-                if not collected_response.strip() or collected_response == "<think>\n":
+                if not collected_response.strip():
                     raise Exception("Empty collected response")
                 
                 response_list[m_id] = collected_response
@@ -2343,9 +2371,9 @@ class LocalLLMManager:
         os.environ["CUDA_LAUNCH_BLOCKING"] = "0"  # 正常模式下设为0，调试时可设为1
         os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"  # 使用FlashAttention
         os.environ["TORCH_CUDA_ARCH_LIST"] = "8.6"  # 设置CUDA架构避免编译问题
-        # 默认将热重载暂存放在 GPU 2,3（可见性由下游再校验，不可见则回退CPU）
+        # 热重载暂存设备与训练/推理卡对齐：GPU 0,1（若不可见则回退CPU）
         os.environ.setdefault("LLM_HOT_RELOAD_STAGING", "gpu")
-        os.environ.setdefault("LLM_HOT_RELOAD_GPUS", "2,3")
+        os.environ.setdefault("LLM_HOT_RELOAD_GPUS", "0,1")
         print("[INFO] 已设置CUDA内存管理和attention backend环境变量")
         
         # Initialize global concurrency manager
