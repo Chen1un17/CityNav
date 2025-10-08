@@ -185,6 +185,11 @@ class LLM(object):
         except Exception:
             self._reload_condition = None
             self._reload_in_progress = False
+        # Token usage tracking
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+        self.total_tokens = 0
+        self.token_usage_log = []
         self.tokenizer, self.model, self.generation_kwargs, self.use_api = self.initialize_llm(llm_path, top_k, top_p, temperature, max_tokens)
         
         # Handle different model path formats
@@ -309,6 +314,14 @@ class LLM(object):
             llm_model = None  # 使用连接池而不是固定客户端
             use_api = True
             print(f"初始化增强连接池管理器: {llm_path}")
+        elif "o4-mini" in llm_path.lower() or "o4mini" in llm_path.lower():
+            # OpenAI o4-mini via OpenAI-Hub (国内镜像站)
+            llm_model = OpenAI(
+                api_key=os.getenv("OPENAI_API_KEY"),
+                base_url="https://api.openai-hub.com/v1"
+            )
+            use_api = True
+            print(f"初始化OpenAI o4-mini API (OpenAI-Hub镜像): {llm_path}")
         elif "openai" in llm_path.lower() or "siliconflow" in llm_path.lower():
             llm_model = OpenAI()
             use_api = True
@@ -319,6 +332,14 @@ class LLM(object):
                 base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
             )
             use_api = True
+        elif "deepseek" in llm_path.lower():
+            # DeepSeek API (OpenAI兼容模式)
+            llm_model = OpenAI(
+                api_key=os.getenv("DEEPSEEK_API_KEY"),
+                base_url="https://api.deepseek.com"
+            )
+            use_api = True
+            print(f"初始化DeepSeek API: {llm_path}")
         else:
             # 其他情况（模型名称等），尝试作为远程模型使用vLLM加载
             print(f"尝试使用vLLM加载模型: {llm_path}")
@@ -426,6 +447,31 @@ class LLM(object):
         memory_count = 0
 
         return memory, memory_count, memory_size
+    
+    def save_token_usage(self, output_file="token_usage.json"):
+        """保存token usage统计到JSON文件"""
+        usage_data = {
+            'total_prompt_tokens': self.total_prompt_tokens,
+            'total_completion_tokens': self.total_completion_tokens,
+            'total_tokens': self.total_tokens,
+            'agent_id': self.agent_id,
+            'model_name': self.llm_name,
+            'detailed_log': self.token_usage_log
+        }
+        
+        with open(output_file, 'w') as f:
+            json.dump(usage_data, f, indent=2)
+        
+        print(f"\n=== Token Usage Summary ===")
+        print(f"Agent ID: {self.agent_id}")
+        print(f"Model: {self.llm_name}")
+        print(f"Total Prompt Tokens: {self.total_prompt_tokens}")
+        print(f"Total Completion Tokens: {self.total_completion_tokens}")
+        print(f"Total Tokens: {self.total_tokens}")
+        print(f"Token usage saved to: {output_file}")
+        print(f"=========================\n")
+        
+        return usage_data
     
     def _compress_memory(self):
         """记忆系统优化 - 压缩和限制记忆长度"""
@@ -698,10 +744,9 @@ class LLM(object):
         ]
 
         if self.use_api:
-            if "deepseek" in self.llm_name.lower():
-                llm_name = "deepseek-ai/" + self.llm_name
-            else:
-                llm_name = self.llm_name
+            # DeepSeek API使用模型名称本身，不需要添加前缀
+            # 其他API可能需要特殊处理
+            llm_name = self.llm_name
 
             retry_count = 0
             response = None
@@ -712,20 +757,35 @@ class LLM(object):
                     try:
                         with self.connection_pool.get_client(self.agent_id) as client:
                             if getattr(self, 'provider_name', '') == 'dashscope':
-                                response = client.chat.completions.create(
+                                api_response = client.chat.completions.create(
                                     model=llm_name,
                                     messages=message,
                                     temperature=self.generation_kwargs['temperature'],
                                     max_tokens=self.generation_kwargs['max_tokens'],
                                     extra_body={"enable_thinking": False}
-                                ).choices[0].message.content
+                                )
                             else:
-                                response = client.chat.completions.create(
+                                api_response = client.chat.completions.create(
                                     model=llm_name,
                                     messages=message,
                                     temperature=self.generation_kwargs['temperature'],
                                     max_tokens=self.generation_kwargs['max_tokens']
-                                ).choices[0].message.content
+                                )
+                            
+                            response = api_response.choices[0].message.content
+                            
+                            # Record token usage if available
+                            if hasattr(api_response, 'usage') and api_response.usage:
+                                self.total_prompt_tokens += api_response.usage.prompt_tokens
+                                self.total_completion_tokens += api_response.usage.completion_tokens
+                                self.total_tokens += api_response.usage.total_tokens
+                                self.token_usage_log.append({
+                                    'timestamp': time.time(),
+                                    'agent_id': self.agent_id,
+                                    'prompt_tokens': api_response.usage.prompt_tokens,
+                                    'completion_tokens': api_response.usage.completion_tokens,
+                                    'total_tokens': api_response.usage.total_tokens
+                                })
                         
                         # Validate response
                         if response is None or not response.strip():
@@ -744,20 +804,35 @@ class LLM(object):
                 while retry_count < 3:
                     try:
                         if getattr(self, 'provider_name', '') == 'dashscope':
-                            response = self.model.chat.completions.create(
+                            api_response = self.model.chat.completions.create(
                                 model=llm_name,
                                 messages=message,
                                 temperature=self.generation_kwargs['temperature'],
                                 max_tokens=self.generation_kwargs['max_tokens'],
                                 extra_body={"enable_thinking": False}
-                            ).choices[0].message.content
+                            )
                         else:
-                            response = self.model.chat.completions.create(
+                            api_response = self.model.chat.completions.create(
                                 model=llm_name,
                                 messages=message,
                                 temperature=self.generation_kwargs['temperature'],
                                 max_tokens=self.generation_kwargs['max_tokens'],
-                            ).choices[0].message.content
+                            )
+                        
+                        response = api_response.choices[0].message.content
+                        
+                        # Record token usage if available
+                        if hasattr(api_response, 'usage') and api_response.usage:
+                            self.total_prompt_tokens += api_response.usage.prompt_tokens
+                            self.total_completion_tokens += api_response.usage.completion_tokens
+                            self.total_tokens += api_response.usage.total_tokens
+                            self.token_usage_log.append({
+                                'timestamp': time.time(),
+                                'agent_id': self.agent_id,
+                                'prompt_tokens': api_response.usage.prompt_tokens,
+                                'completion_tokens': api_response.usage.completion_tokens,
+                                'total_tokens': api_response.usage.total_tokens
+                            })
                         
                         # Validate response
                         if response is None or not response.strip():
@@ -2371,17 +2446,17 @@ class LocalLLMManager:
         os.environ["CUDA_LAUNCH_BLOCKING"] = "0"  # 正常模式下设为0，调试时可设为1
         os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"  # 使用FlashAttention
         os.environ["TORCH_CUDA_ARCH_LIST"] = "8.6"  # 设置CUDA架构避免编译问题
-        # 热重载暂存设备与训练/推理卡对齐：GPU 0,1（若不可见则回退CPU）
+        # 热重载暂存设备与训练/推理卡对齐：GPU 2,3（若不可见则回退CPU）
         os.environ.setdefault("LLM_HOT_RELOAD_STAGING", "gpu")
-        os.environ.setdefault("LLM_HOT_RELOAD_GPUS", "0,1")
+        os.environ.setdefault("LLM_HOT_RELOAD_GPUS", "2,3")
         print("[INFO] 已设置CUDA内存管理和attention backend环境变量")
         
         # Initialize global concurrency manager
         concurrency_manager = get_global_concurrency_manager()
         print(f"[INFO] 全局并发管理器已初始化 (最大并发: {concurrency_manager.max_concurrent_requests})")
         
-        # 初始化Traffic LLM (使用GPU 0)
-        print("正在初始化 Traffic LLM (GPU 0)...")
+        # 初始化Traffic LLM (使用GPU 2)
+        print("正在初始化 Traffic LLM (GPU 2)...")
         traffic_llm_raw = LLM(
             llm_path=self.model_path,
             batch_size=4,  # Reduced batch size for better control
@@ -2392,7 +2467,7 @@ class LocalLLMManager:
             memory_size=3,
             task_info=self.task_info,
             use_reflection=True,
-            gpu_ids=[0],  # 使用GPU 0
+            gpu_ids=[2],  # 使用GPU 2
             tensor_parallel_size=1,
             gpu_memory_utilization=0.85,
             agent_id="traffic_llm"  # Add agent identifier
@@ -2403,8 +2478,8 @@ class LocalLLMManager:
         self.traffic_llm = create_enhanced_llm_wrapper(traffic_llm_raw, "traffic_llm", concurrency_manager)
         print("[SUCCESS] Traffic LLM 初始化完成（已集成并发控制）")
         
-        # 初始化Regional LLM (使用GPU 1)
-        print("正在初始化 Regional LLM (GPU 1)...")
+        # 初始化Regional LLM (使用GPU 3)
+        print("正在初始化 Regional LLM (GPU 3)...")
         regional_llm_raw = LLM(
             llm_path=self.model_path,
             batch_size=4,  # Reduced batch size for better control
@@ -2415,7 +2490,7 @@ class LocalLLMManager:
             memory_size=3,
             task_info=self.task_info,
             use_reflection=True,
-            gpu_ids=[1],  # 使用GPU 1
+            gpu_ids=[3],  # 使用GPU 3
             tensor_parallel_size=1,
             gpu_memory_utilization=0.85,
             agent_id="regional_llm"  # Add agent identifier
@@ -2427,14 +2502,14 @@ class LocalLLMManager:
         print("[SUCCESS] Regional LLM 初始化完成（已集成并发控制）")
         
         print("\n=== A800双GPU LLM实例初始化完成 ===")
-        print("- Traffic LLM: A800 GPU 0 (95%内存利用率)")
-        print("- Regional LLM: A800 GPU 1 (95%内存利用率)")
+        print("- Traffic LLM: A800 GPU 2 (85%内存利用率)")
+        print("- Regional LLM: A800 GPU 3 (85%内存利用率)")
         print("- 优化特性: FlashInfer + 分块预填充 + 前缀缓存")
-        print("- 批处理大小: 8 (针对A800优化)")
+        print("- 批处理大小: 4 (针对A800优化)")
         print(f"- 并发管理器: 最大{concurrency_manager.max_concurrent_requests}并发")
         
         # 训练使用的GPU应在主进程设置，这里不再覆盖，避免与推理配置混淆
-        print(f"[INFO] 推理GPU固定: Traffic->GPU0, Regional->GPU1; 训练GPU由主进程环境变量控制")
+        print(f"[INFO] 推理GPU固定: Traffic->GPU2, Regional->GPU3; 训练GPU由主进程环境变量控制")
         
         # Print concurrency manager status
         concurrency_manager.print_status()

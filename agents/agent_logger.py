@@ -53,7 +53,9 @@ class PerformanceMetrics:
     completed_vehicles: int
     average_travel_time: float
     system_throughput: float
-    regional_metrics: Dict[int, Dict[str, float]]
+    average_delay_time: float = 0.0  # Average delay/time loss of vehicles
+    average_waiting_time: float = 0.0  # Average accumulated waiting time of vehicles
+    regional_metrics: Dict[int, Dict[str, float]] = None
     extra_metrics: Optional[Dict[str, float]] = None
     
     
@@ -363,6 +365,13 @@ class AgentLogger:
         avg_travel_time = sum(self.travel_times) / len(self.travel_times) if self.travel_times else 0.0
         throughput = self.completed_vehicles / (timestamp - self.session_start) if timestamp > self.session_start else 0.0
         
+        # Extract delay time and waiting time from extra_metrics
+        avg_delay_time = 0.0
+        avg_waiting_time = 0.0
+        if extra_metrics:
+            avg_delay_time = extra_metrics.get('ADet', 0.0)  # Average Delay/timeLoss
+            avg_waiting_time = extra_metrics.get('AWai', 0.0)  # Average Waiting time
+        
         metrics = PerformanceMetrics(
             timestamp=timestamp,
             total_vehicles=self.total_vehicles,
@@ -370,6 +379,8 @@ class AgentLogger:
             completed_vehicles=self.completed_vehicles,
             average_travel_time=avg_travel_time,
             system_throughput=throughput,
+            average_delay_time=avg_delay_time,
+            average_waiting_time=avg_waiting_time,
             regional_metrics=regional_metrics,
             extra_metrics=extra_metrics
         )
@@ -384,6 +395,8 @@ class AgentLogger:
                 "active_vehicles": active_vehicles,
                 "completed_vehicles": self.completed_vehicles,
                 "average_travel_time": avg_travel_time,
+                "average_delay_time": avg_delay_time,
+                "average_waiting_time": avg_waiting_time,
                 "system_throughput": throughput,
                 "regional_metrics": regional_metrics,
                 "traffic_metrics": traffic_metrics,

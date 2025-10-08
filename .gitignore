@@ -7,6 +7,11 @@ wandb/
 __pycache__/
 Qwen/
 *.md
+!README.md
 .cursor/
 Baselines/
 .claude/
+outputs/
+node_modules/
+*.lock
+other/

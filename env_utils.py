@@ -71,46 +71,69 @@ def clear_edge_info_cache():
     _edge_info_cache.clear()
 
 
-def load_static_road_data(data_dir: str = "Data/Region_1"):
+def reset_static_data():
+    """重置静态数据加载状态，允许重新加载"""
+    global _static_data_loaded, _static_road_data, _adjacency_data, _region_mapping, _valid_edges_cache
+    _static_data_loaded = False
+    _static_road_data = {}
+    _adjacency_data = {}
+    _region_mapping = {}
+    _valid_edges_cache = set()
+    print("STATIC_DATA_LOADER: Static data reset, ready for reload")
+
+
+def load_static_road_data(data_dir: str = "Data/Region_1", road_info_file: str = None, adjacency_file: str = None):
     """
     预加载静态道路数据，大幅提升性能
-    
+
     Args:
         data_dir: 数据目录路径
+        road_info_file: 道路信息文件路径（可选，如果提供则使用，否则使用默认路径）
+        adjacency_file: 邻接信息文件路径（可选，如果提供则使用，否则使用默认路径）
     """
     global _static_road_data, _adjacency_data, _region_mapping, _valid_edges_cache, _static_data_loaded
-    
+
     if _static_data_loaded:
         return
-    
+
     try:
         # 加载道路信息
-        road_info_path = "/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_road_info.json"
+        if road_info_file and os.path.exists(road_info_file):
+            road_info_path = road_info_file
+        else:
+            road_info_path = "/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_road_info.json"
+
         if os.path.exists(road_info_path):
             with open(road_info_path, 'r') as f:
                 _static_road_data = json.load(f)
             # 缓存有效边缘ID集合，用于快速验证
             _valid_edges_cache = set(_static_road_data.keys())
-            print(f"STATIC_DATA_LOADER: Loaded {len(_static_road_data)} roads static information")
+            print(f"STATIC_DATA_LOADER: Loaded {len(_static_road_data)} roads from {road_info_path}")
             print(f"STATIC_DATA_LOADER: Valid edges cache initialized with {len(_valid_edges_cache)} entries")
-        
+        else:
+            print(f"STATIC_DATA_LOADER: WARNING - Road info file not found: {road_info_path}")
+
         # 加载邻接信息
-        adj_info_path = "/data/zhouyuping/LLMNavigation/Data/NYC/Region_1/edge_adjacency_alpha_1.json"
+        if adjacency_file and os.path.exists(adjacency_file):
+            adj_info_path = adjacency_file
+        else:
+            adj_info_path = "/data/zhouyuping/LLMNavigation/Data/NYC/Region_1/edge_adjacency_alpha_1.json"
+
         if os.path.exists(adj_info_path):
             with open(adj_info_path, 'r') as f:
                 _adjacency_data = json.load(f)
-            print(f"STATIC_DATA_LOADER: Loaded {len(_adjacency_data)} adjacency relationships")
-        
+            print(f"STATIC_DATA_LOADER: Loaded {len(_adjacency_data)} adjacency relationships from {adj_info_path}")
+
         # 加载区域映射
         region_mapping_path = os.path.join(data_dir, "edge_to_region_alpha_1.json")
         if os.path.exists(region_mapping_path):
             with open(region_mapping_path, 'r') as f:
                 _region_mapping = json.load(f)
             print(f"STATIC_DATA_LOADER: Loaded {len(_region_mapping)} region mappings")
-        
+
         _static_data_loaded = True
         print("STATIC_DATA_LOADER: Pre-loading completed successfully")
-        
+
     except Exception as e:
         print(f"STATIC_DATA_LOADER: ERROR - Failed to load static data: {e}")
         _static_data_loaded = False
@@ -622,83 +645,174 @@ def get_congestion_level(congestion_rate):
 def parse_rou_file(file_path):
     """
     解析路由文件(.rou.xml 或 .rou.alt.xml)，提取车辆的起终点信息
-    支持两种格式：
-    1. 标准路由文件(.rou.xml): 包含vehicle标签，其中有routeDistribution
-    2. 替代路由文件(.rou.alt.xml): 包含vehicle标签，其中有routeDistribution
+    兼容特性：
+    - 忽略 XML 命名空间（默认 xmlns）
+    - 支持 vehicle 内联 <route> / <routeDistribution>
+    - 支持 vehicle 的 route="id" / routeDistribution="id" 属性引用顶层定义
     """
     trips = []
     tree = ET.parse(file_path)
     root = tree.getroot()
-    
+
+    # 去除命名空间，便于通过本地名匹配
+    for elem in root.iter():
+        if isinstance(elem.tag, str) and '}' in elem.tag:
+            elem.tag = elem.tag.rsplit('}', 1)[1]
+
     # 调试信息：输出根元素和车辆数量
     print(f"DEBUG: 解析文件 {file_path}")
     print(f"DEBUG: 根元素标签: {root.tag}")
-    vehicles = root.findall('vehicle')
+
+    # 构建顶层 route(id->edges) 与 routeDistribution(id->list[(edges,prob)]) 映射
+    route_id_to_edges = {}
+
+    def _parse_route_distribution(rd_elem):
+        entries = []  # (edges_seq, prob)
+        probs = []
+        for ch in list(rd_elem):
+            if ch.tag != 'route':
+                continue
+            prob = ch.get('probability') or ch.get('prob') or ch.get('weight') or ch.get('p')
+            try:
+                prob = float(prob) if prob is not None else None
+            except Exception:
+                prob = None
+            edges_attr = ch.get('edges')
+            if edges_attr:
+                edges_seq = edges_attr.strip().split()
+            else:
+                ref_id = ch.get('refId') or ch.get('id') or ch.get('route')
+                edges_seq = route_id_to_edges.get(ref_id, [])
+            if edges_seq:
+                entries.append((edges_seq, prob))
+                probs.append(prob)
+        # 概率补全/归一化
+        if entries:
+            if any(p is None for _, p in entries):
+                n = len(entries)
+                entries = [(seq, 1.0 / n) for seq, _ in entries]
+            else:
+                s = sum(p for _, p in entries)
+                if s > 0:
+                    entries = [(seq, p / s) for seq, p in entries]
+                else:
+                    n = len(entries)
+                    entries = [(seq, 1.0 / n) for seq, _ in entries]
+        return entries
+
+    route_dist_map = {}
+    for elem in root.iter():
+        if elem.tag == 'route':
+            rid = elem.get('id')
+            edges_attr = elem.get('edges')
+            if rid and edges_attr:
+                route_id_to_edges[rid] = edges_attr.strip().split()
+        elif elem.tag == 'routeDistribution':
+            rdid = elem.get('id')
+            if rdid:
+                route_dist_map[rdid] = _parse_route_distribution(elem)
+
+    vehicles = root.findall('.//vehicle')
     print(f"DEBUG: 找到 {len(vehicles)} 个vehicle标签")
 
     vehicle_count = 0
     debug_limit = 5  # 只对前5个车辆输出详细调试信息
-    
+
     for vehicle in vehicles:
         vehicle_count += 1
-        vehicle_id = vehicle.get('id')  # 获取 vehicle 的 ID
-        
-        # 只对前几个车辆输出详细调试信息
+        vehicle_id = vehicle.get('id')
         debug_output = vehicle_count <= debug_limit
-        
+
         if debug_output:
             print(f"DEBUG: 处理车辆 {vehicle_count}: {vehicle_id}")
-        
-        # 查找路由信息，支持routeDistribution结构
-        route_distribution = vehicle.find('routeDistribution')
-        if route_distribution is not None:
+
+        def _append_trip_from_edges(edges_str: str) -> bool:
+            if not edges_str:
+                return False
+            edge_list = edges_str.strip().split()
+            if not edge_list:
+                return False
+            start_edge = edge_list[0]
+            end_edge = edge_list[-1]
+            try:
+                depart_time = float(vehicle.get('depart', 0.0))
+            except Exception:
+                depart_time = 0.0
+            trips.append((vehicle_id, start_edge, end_edge, depart_time))
             if debug_output:
-                print(f"DEBUG: 找到routeDistribution")
-            route = route_distribution.find('route')
-            if route is not None:
-                edges = route.get('edges')  # 获取 edges 属性
-                if edges:
-                    edge_list = edges.split()
-                    start_edge = edge_list[0]  # 起点 edge_id
-                    end_edge = edge_list[-1]  # 终点 edge_id
-                    depart_time = float(vehicle.get('depart', 0.0))
-                    trips.append((vehicle_id, start_edge, end_edge, depart_time))
-                    if debug_output:
-                        print(f"DEBUG: 成功解析车辆 {vehicle_id}: {start_edge} -> {end_edge}")
+                print(f"DEBUG: 成功解析车辆 {vehicle_id}: {start_edge} -> {end_edge}")
+            return True
+
+        parsed = False
+
+        # 1) 处理属性引用：route / routeDistribution
+        if not parsed:
+            ref_route_id = vehicle.get('route')
+            if ref_route_id and ref_route_id in route_id_to_edges:
+                parsed = _append_trip_from_edges(' '.join(route_id_to_edges[ref_route_id]))
+                if debug_output and parsed:
+                    print(f"DEBUG: 通过属性 route=\"{ref_route_id}\" 解析")
+
+        if not parsed:
+            ref_rd_id = vehicle.get('routeDistribution') or vehicle.get('routeDist')
+            if ref_rd_id and ref_rd_id in route_dist_map and route_dist_map[ref_rd_id]:
+                # 选择概率最大的，若相等取第一个
+                entries = route_dist_map[ref_rd_id]
+                best = max(entries, key=lambda x: x[1] if x[1] is not None else 0.0)
+                parsed = _append_trip_from_edges(' '.join(best[0]))
+                if debug_output and parsed:
+                    print(f"DEBUG: 通过属性 routeDistribution=\"{ref_rd_id}\" 解析")
+
+        # 2) 处理子元素 routeDistribution
+        if not parsed:
+            route_distribution = vehicle.find('routeDistribution')
+            if route_distribution is not None:
+                if debug_output:
+                    print(f"DEBUG: 找到routeDistribution")
+                # 优先取首个有效 route 子元素
+                chosen_edges = None
+                for ch in list(route_distribution):
+                    if ch.tag != 'route':
+                        continue
+                    if ch.get('edges'):
+                        chosen_edges = ch.get('edges')
+                        break
+                    # route 引用 id 的情况
+                    ref_id = ch.get('refId') or ch.get('id') or ch.get('route')
+                    if ref_id and ref_id in route_id_to_edges:
+                        chosen_edges = ' '.join(route_id_to_edges[ref_id])
+                        break
+                if chosen_edges:
+                    parsed = _append_trip_from_edges(chosen_edges)
                 else:
                     if debug_output:
-                        print(f"DEBUG: routeDistribution中的route没有edges属性")
-            else:
-                if debug_output:
-                    print(f"DEBUG: routeDistribution中没有找到route")
-        else:
-            # 如果没有routeDistribution，尝试直接查找route标签
-            if debug_output:
-                print(f"DEBUG: 没有找到routeDistribution，查找直接route")
+                        print(f"DEBUG: routeDistribution 中没有有效的 route 条目")
+
+        # 3) 处理子元素 route
+        if not parsed:
             route = vehicle.find('route')
             if route is not None:
                 if debug_output:
                     print(f"DEBUG: 找到直接route标签")
-                edges = route.get('edges')  # 获取 edges 属性
+                edges = route.get('edges')
+                if not edges:
+                    # 可能是引用形式 <route id="r1"/>
+                    ref = route.get('id') or route.get('refId') or route.get('route')
+                    if ref and ref in route_id_to_edges:
+                        edges = ' '.join(route_id_to_edges[ref])
                 if edges:
-                    edge_list = edges.split()
-                    start_edge = edge_list[0]  # 起点 edge_id
-                    end_edge = edge_list[-1]  # 终点 edge_id
-                    depart_time = float(vehicle.get('depart', 0.0))
-                    trips.append((vehicle_id, start_edge, end_edge, depart_time))
-                    if debug_output:
-                        print(f"DEBUG: 成功解析车辆 {vehicle_id}: {start_edge} -> {end_edge}")
+                    parsed = _append_trip_from_edges(edges)
                 else:
                     if debug_output:
-                        print(f"DEBUG: 直接route没有edges属性")
+                        print(f"DEBUG: 直接route没有edges属性也没有有效引用")
             else:
                 if debug_output:
                     print(f"DEBUG: 没有找到直接route标签")
-        
+
         # 在调试限制处输出提示
         if vehicle_count == debug_limit and len(vehicles) > debug_limit:
             print(f"DEBUG: 继续处理剩余 {len(vehicles) - debug_limit} 个车辆（不输出详细信息）...")
-    
+
     print(f"从路由文件 {file_path} 解析到 {len(trips)} 个车辆路径")
     return trips
 

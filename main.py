@@ -12,12 +12,17 @@ import wandb
 class MultiAgent_Route_Planning(object):
     def __init__(self, batch_size, location, sumo_config, route_file, road_info_file, 
                  adjacency_file, task_info_file, llm_path_or_name, step_size, max_steps, 
-                 use_reflection, region_data_dir, use_local_llm=True, enable_training=False):
+                 use_reflection, region_data_dir, use_local_llm=True, enable_training=False,
+                 start_time=0, av_ratio=0.02, traffic_lora_path=None, regional_lora_path=None):
         llm_name = llm_path_or_name.split("/")[-1]
         self.llm_name = llm_name
         self.location = location
         self.use_local_llm = use_local_llm
         self.enable_training = enable_training
+        self.start_time = start_time
+        self.av_ratio = av_ratio
+        self.traffic_lora_path = traffic_lora_path
+        self.regional_lora_path = regional_lora_path
         
         # Initialize training components
         self.training_queue = None
@@ -33,6 +38,8 @@ class MultiAgent_Route_Planning(object):
         if use_local_llm:
             print(f"\n=== 初始化本地共享LLM架构 ===")
             print(f"模型路径: {llm_path_or_name}")
+            print(f"起始时间: {start_time}s")
+            print(f"自动驾驶车辆比例: {av_ratio * 100}% (仅从第一个路由文件)")
             
             # Initialize multi-agent environment with local LLM
             self.sim = MultiAgentTrafficEnvironment(
@@ -48,11 +55,17 @@ class MultiAgent_Route_Planning(object):
                 log_dir=f"logs/{location}_{llm_name}_local{'_rl' if enable_training else ''}",
                 task_info=task_info,
                 use_local_llm=True,
-                training_queue=self.training_queue,  # Pass training queue for RL data collection
-                use_time_sliced_training=False  # 关闭时间分片，单条立即入队
+                training_queue=self.training_queue,  # None for non-local LLM mode
+                use_time_sliced_training=False,  # 显式关闭，保持行为一致
+                start_time=start_time,
+                av_ratio=av_ratio,
+                traffic_lora_path=traffic_lora_path,
+                regional_lora_path=regional_lora_path
             )
         else:
             print(f"\n=== 初始化传统单一LLM模式 ===")
+            print(f"起始时间: {start_time}s")
+            print(f"自动驾驶车辆比例: {av_ratio * 100}% (仅从第一个路由文件)")
             # Initialize traditional single LLM
             self.llm_agent = LLM(llm_path_or_name, batch_size=batch_size, task_info=task_info, 
                                use_reflection=use_reflection)
@@ -71,7 +84,9 @@ class MultiAgent_Route_Planning(object):
                 log_dir=f"logs/{location}_{llm_name}",
                 use_local_llm=False,
                 training_queue=self.training_queue,  # None for non-local LLM mode
-                use_time_sliced_training=False  # 显式关闭，保持行为一致
+                use_time_sliced_training=False,  # 显式关闭，保持行为一致
+                start_time=start_time,
+                av_ratio=av_ratio
             )
 
         wandb.init(
@@ -83,10 +98,6 @@ class MultiAgent_Route_Planning(object):
     def _initialize_training_manager(self, llm_path):
         """Initialize the MAGRPO training manager in a separate process."""
         try:
-            # 训练GPU隔离：在启动训练进程前显式设置训练可见GPU
-            os.environ["TRAINING_CUDA_VISIBLE_DEVICES"] = "0,1"
-            print(f"[INFO] 训练GPU绑定: TRAINING_CUDA_VISIBLE_DEVICES={os.environ.get('TRAINING_CUDA_VISIBLE_DEVICES')}")
-            
             # Create multiprocessing queue for training data
             self.training_queue = mp.Queue(maxsize=1000)
             print(f"创建训练数据队列 (max_size=1000)")
@@ -102,14 +113,14 @@ class MultiAgent_Route_Planning(object):
                 traffic_group_size=8,
                 regional_group_size=12,
                 learning_rate=1e-4,
-                warmup_steps=100,
+                warmup_steps=20,
                 max_grad_norm=1.0,
                 weight_decay=0.01,
                 gradient_accumulation_steps=4,
-                save_steps=100,
+                save_steps=20,
                 max_checkpoints=5,
                 log_steps=10,
-                log_dir=f"logs/training_{self.location}",
+                log_dir=f"logs/training_Manhattan",
                 vllm_inference_urls=vllm_urls,  # Pass vLLM server URLs
                 adapter_sync_dir="lora_adapters",
                 enable_hot_reload=True,
@@ -282,32 +293,65 @@ class Route_Planning(object):
         wandb.finish()
 
 def main(llm_path_or_name, batch_size, location, use_reflection=True, step_size=180.0, 
-         max_steps=43200, multi_agent=True, use_local_llm=True, enable_training=False):
+         max_steps=43200, multi_agent=True, use_local_llm=True, enable_training=False, 
+         start_time=0, av_ratio=0.02, traffic_lora_path=None, regional_lora_path=None):
     """
     Main function to run traffic simulation.
     
     Args:
         llm_path_or_name: Path to or name of the language model
         batch_size: Batch size for LLM processing
-        location: Location for simulation (e.g., /data/zhouyuping/LLMNavigation/Data/NYC/ttan)
+        location: Location for simulation (e.g., /hpc2hdd/home/slai125/projects/data/NYC_Navigation/NYC/ttan)
         use_reflection: Whether to use reflection in LLM
         step_size: Simulation step size in seconds
         max_steps: Maximum simulation steps
         multi_agent: Whether to use multi-agent architecture (default: True)
         use_local_llm: Whether to use local shared LLM architecture (default: True)
         enable_training: Whether to enable MAGRPO online training (default: False)
+        start_time: Simulation start time in seconds (default: 0)
+        av_ratio: Ratio of autonomous vehicles from first route file (default: 0.02)
+        traffic_lora_path: Path to Traffic LLM LoRA adapter (default: None)
+        regional_lora_path: Path to Regional LLM LoRA adapter (default: None)
     """
-    # File paths - updated to use Region_1 data structure
-    sumo_config = f"/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_sumo_config.sumocfg"
-    route_file = f"/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_od_0.01.rou.alt.xml"
-    road_info_file = f"/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_road_info.json"
-    adjacency_file = f"/data/zhouyuping/LLMNavigation/Data/Region_1/Manhattan_adjacency_info.json"
-    task_info_file = "/data/zhouyuping/LLMNavigation/Data/task_info.json"
+    # Determine file paths based on location
+    if location == "Chicago":
+        sumo_config = "/home/apulis-dev/userdata/Chicago/Chicago_sumo_config.sumocfg"
+        route_file = "/home/apulis-dev/userdata/Chicago/Chicago_od_0.1.rou.alt.xml"
+        road_info_file = "/home/apulis-dev/userdata/Chicago/Chicago_road_info.json"
+        adjacency_file = "/home/apulis-dev/userdata/Chicago/Region/edge_adjacency_alpha_2.json"
+        task_info_file = "/home/apulis-dev/userdata/Chicago/task_info.json"
+        if multi_agent:
+            region_data_dir = "/home/apulis-dev/userdata/Chicago/Region"
+    elif location == "Manhattan_Region1":
+        # Manhattan with Region_1 configuration
+        sumo_config = "/home/apulis-dev/userdata/Region_1/Manhattan_sumo_config.sumocfg"
+        # Extract route file from sumocfg or use default pattern
+        route_file = "/home/apulis-dev/userdata/Region_1/Manhattan_od_0.1.rou.alt.xml"
+        road_info_file = "/home/apulis-dev/userdata/Region_1/Manhattan_road_info.json"
+        adjacency_file = "/home/apulis-dev/userdata/Region_1/regions/edge_adjacency_alpha_2.json"
+        task_info_file = "/home/apulis-dev/userdata/Region_1/task_info.json"
+        if multi_agent:
+            region_data_dir = "/home/apulis-dev/userdata/Region_1/regions"
+    elif location == "USE":
+        # USE network configuration
+        sumo_config = "/home/apulis-dev/userdata/USE/USE.sumocfg"
+        route_file = "/home/apulis-dev/userdata/USE/USE_od_0.1.rou.alt.xml"
+        road_info_file = "/home/apulis-dev/userdata/USE/USE_road_info.json"
+        adjacency_file = "/home/apulis-dev/userdata/USE/NewData/edge_adjacency_alpha_0.5.json"
+        task_info_file = "/home/apulis-dev/userdata/USE/task_info.json"
+        if multi_agent:
+            region_data_dir = "/home/apulis-dev/userdata/USE/NewData"
+    else:
+        # Default to NYC/NewYork
+        sumo_config = "/home/apulis-dev/userdata/NYC/NewYork_sumo_config.sumocfg"
+        route_file = "/home/apulis-dev/userdata/NYC/NewYork_od_0.1.rou.alt.xml"
+        road_info_file = "/home/apulis-dev/userdata/NYC/NewYork_road_info.json"
+        adjacency_file = "/home/apulis-dev/userdata/NYC/New2/edge_adjacency_alpha_2.json"
+        task_info_file = "/home/apulis-dev/userdata/NYC/task_info.json"
+        if multi_agent:
+            region_data_dir = "/home/apulis-dev/userdata/NYC/New2"
     
     if multi_agent:
-        # Use multi-agent architecture
-        region_data_dir = f"/data/zhouyuping/LLMNavigation/Data/NYC/Region_1"  # Region partition data directory
-        
         # Check if region data exists
         if not os.path.exists(region_data_dir):
             print(f"Warning: Region data directory {region_data_dir} not found. "
@@ -319,7 +363,8 @@ def main(llm_path_or_name, batch_size, location, use_reflection=True, step_size=
         algo = MultiAgent_Route_Planning(
             batch_size, location, sumo_config, route_file, road_info_file, 
             adjacency_file, task_info_file, llm_path_or_name, step_size, 
-            max_steps, use_reflection, region_data_dir, use_local_llm, enable_training
+            max_steps, use_reflection, region_data_dir, use_local_llm, enable_training,
+            start_time, av_ratio, traffic_lora_path, regional_lora_path
         )
     else:
         print("Running Traditional Single-Agent Route Planning")
@@ -335,7 +380,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run a SUMO simulation with autonomous vehicles.")
     parser.add_argument("--llm-path-or-name", type=str, default="meta-llama/Meta-Llama-3.1-8B-Instruct", 
                        help="Path to the language model or its name.")
-    parser.add_argument("--batch-size", type=int, default=16, 
+    parser.add_argument("--batch-size", type=int, default=8, 
                        help="Batch size for the language model.")
     parser.add_argument("--location", type=str, default="NewYork", 
                        help="Location of the simulation.")
@@ -378,8 +423,8 @@ if __name__ == "__main__":
     print(f"  - Reflection: {'Enabled' if use_reflection else 'Disabled'}")
     print(f"  - MAGRPO Training: {'ENABLED' if enable_training else 'Disabled'}")
     if enable_training:
-        print(f"    * Traffic LLM Training GPU: cuda:0")
-        print(f"    * Regional LLM Training GPU: cuda:1")
+        print(f"    * Traffic LLM Training GPU: cuda:2")
+        print(f"    * Regional LLM Training GPU: cuda:3")
         print(f"    * Training Group Sizes: Traffic=8, Regional=12")
     print(f"  - Location: {args.location}")
     print(f"  - Batch Size: {args.batch_size}")

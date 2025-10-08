@@ -53,7 +53,8 @@ class MultiAgentTrafficEnvironment:
                  road_info_file: str, adjacency_file: str, region_data_dir: str,
                  model_path: str = None, llm_agent=None, step_size: float = 1.0, max_steps: int = 1000,
                  log_dir: str = "logs", task_info=None, use_local_llm: bool = True, training_queue=None,
-                 use_time_sliced_training: bool = True):
+                 use_time_sliced_training: bool = True, start_time: float = 0, av_ratio: float = 0.02,
+                 traffic_lora_path: str = None, regional_lora_path: str = None):
         """
         Initialize multi-agent traffic environment.
         
@@ -72,6 +73,11 @@ class MultiAgentTrafficEnvironment:
             task_info: Task information for LLM initialization
             use_local_llm: Whether to use local shared LLM architecture
             training_queue: Multiprocessing queue for RL training data (optional)
+            use_time_sliced_training: Whether to use time-sliced training
+            start_time: Simulation start time in seconds (default: 0)
+            av_ratio: Ratio of autonomous vehicles from first route file (default: 0.02)
+            traffic_lora_path: Path to Traffic LLM LoRA adapter (default: None)
+            regional_lora_path: Path to Regional LLM LoRA adapter (default: None)
         """
         self.location = location
         self.sumo_config_file = sumo_config_file
@@ -85,6 +91,10 @@ class MultiAgentTrafficEnvironment:
         self.max_steps = max_steps
         self.task_info = task_info
         self.use_local_llm = use_local_llm
+        self.start_time = start_time
+        self.av_ratio = av_ratio
+        self.traffic_lora_path = traffic_lora_path
+        self.regional_lora_path = regional_lora_path
         
         # 本地LLM管理器
         self.llm_manager = None
@@ -147,7 +157,11 @@ class MultiAgentTrafficEnvironment:
         # Load static road data for performance optimization
         print(f"MULTI_AGENT_ENV: Loading static road data from {self.region_data_dir}")
         from env_utils import load_static_road_data
-        load_static_road_data(data_dir=self.region_data_dir)
+        load_static_road_data(
+            data_dir=self.region_data_dir,
+            road_info_file=self.road_info_file,
+            adjacency_file=self.adjacency_file
+        )
         print("MULTI_AGENT_ENV: Static road data loading completed")
         
         # Event-driven coordination parameters - only LLM makes decisions
@@ -180,6 +194,12 @@ class MultiAgentTrafficEnvironment:
         self.vehicle_destinations = {}  # Track final destinations
         self.total_vehicles = 0
         self.completed_vehicles = 0
+        
+        # Vehicle metrics tracking for completed vehicles
+        self.vehicle_waiting_times_last = {}  # Last waiting time snapshot for active vehicles
+        self.vehicle_delay_times_last = {}    # Last delay/time loss snapshot for active vehicles
+        self.vehicle_waiting_times_final = {} # Final waiting time for completed vehicles
+        self.vehicle_delay_times_final = {}   # Final delay/time loss for completed vehicles
         
         # Communication and broadcasting system - enhanced for LLM coordination
         self.boundary_vehicle_plans = {}  # Track vehicles planning to reach each boundary
@@ -924,11 +944,11 @@ class MultiAgentTrafficEnvironment:
     def _load_region_data(self):
         """Load region partition data."""
         # Load boundary edges
-        boundary_file = os.path.join(self.region_data_dir, "boundary_edges_alpha_2.json")
+        boundary_file = os.path.join(self.region_data_dir, "boundary_edges_alpha_1.json")
         self.boundary_edges = load_json(boundary_file)
         
         # Load edge to region mapping
-        edge_region_file = os.path.join(self.region_data_dir, "edge_to_region_alpha_2.json")
+        edge_region_file = os.path.join(self.region_data_dir, "edge_to_region_alpha_1.json")
         self.edge_to_region = load_json(edge_region_file)
         
         # Determine number of regions
@@ -1205,6 +1225,32 @@ class MultiAgentTrafficEnvironment:
                 if hasattr(self.llm_manager, 'initialize_lora_management'):
                     self.llm_manager.initialize_lora_management()
                 
+                # Load pre-trained LoRA adapters if provided
+                if self.traffic_lora_path or self.regional_lora_path:
+                    print("\n=== 加载预训练LoRA适配器 ===")
+                    if self.traffic_lora_path:
+                        print(f"正在加载Traffic LoRA: {self.traffic_lora_path}")
+                        if os.path.exists(self.traffic_lora_path):
+                            success = self.llm_manager.load_lora_adapter_direct('traffic', self.traffic_lora_path)
+                            if success:
+                                print(f"[成功] Traffic LoRA已加载")
+                            else:
+                                print(f"[警告] Traffic LoRA加载失败")
+                        else:
+                            print(f"[错误] Traffic LoRA路径不存在: {self.traffic_lora_path}")
+                    
+                    if self.regional_lora_path:
+                        print(f"正在加载Regional LoRA: {self.regional_lora_path}")
+                        if os.path.exists(self.regional_lora_path):
+                            success = self.llm_manager.load_lora_adapter_direct('regional', self.regional_lora_path)
+                            if success:
+                                print(f"[成功] Regional LoRA已加载")
+                            else:
+                                print(f"[警告] Regional LoRA加载失败")
+                        else:
+                            print(f"[错误] Regional LoRA路径不存在: {self.regional_lora_path}")
+                    print()
+                
                 # Register LLM manager globally for training manager access
                 self._register_llm_manager_globally()
 
@@ -1381,16 +1427,33 @@ class MultiAgentTrafficEnvironment:
     def initialize_simulation(self):
         """Initialize SUMO simulation."""
         try:
-            # Start SUMO with teleport timeout
+            # Start SUMO with teleport timeout and optional start time
             sumo_cmd = ["sumo", "-c", self.sumo_config_file, "--no-warnings", 
                        "--ignore-route-errors", "--time-to-teleport", "600"]
+            
+            # Add start time if specified
+            if self.start_time > 0:
+                sumo_cmd.extend(["--begin", str(self.start_time)])
+                self.logger.log_info(f"Starting simulation at time {self.start_time}s")
+            
             traci.start(sumo_cmd)
             
             # Parse only the first route file for autonomous vehicle selection
             # This ensures only taxi vehicles from NewYork_od_0.1.rou.alt.xml can be autonomous
             # The second file NYC_routes_0.1_20250830_111509.alt.xml is loaded as environment traffic only
             first_route_vehicles = parse_rou_file(self.route_file)
-            first_route_vehicle_ids = [veh_id for veh_id, _, _, _ in first_route_vehicles]
+            
+            # Filter vehicles by start_time - only select from vehicles that will actually depart
+            if self.start_time > 0:
+                # Only consider vehicles with depart time >= start_time
+                valid_vehicles = [(veh_id, start_edge, end_edge, depart_time) 
+                                  for veh_id, start_edge, end_edge, depart_time in first_route_vehicles 
+                                  if depart_time >= self.start_time]
+                self.logger.log_info(f"Filtered vehicles by start_time {self.start_time}s: "
+                                   f"{len(first_route_vehicles)} total -> {len(valid_vehicles)} valid")
+                first_route_vehicle_ids = [veh_id for veh_id, _, _, _ in valid_vehicles]
+            else:
+                first_route_vehicle_ids = [veh_id for veh_id, _, _, _ in first_route_vehicles]
             
             # Get total vehicles from SUMO simulation (includes both route files)
             # We need to wait a bit for SUMO to load all vehicles
@@ -1445,10 +1508,11 @@ class MultiAgentTrafficEnvironment:
                 # Fall back to just the first route file count
                 self.total_vehicles = len(first_route_vehicles)
             
-            # Select 2% of vehicles as autonomous - ONLY from the first route file
+            # Select autonomous vehicles based on av_ratio - ONLY from the first route file
             import random
-            self.autonomous_vehicles = set(random.sample(first_route_vehicle_ids, 
-                                                       int(0.02 * len(first_route_vehicle_ids))))
+            num_autonomous = int(self.av_ratio * len(first_route_vehicle_ids))
+            self.autonomous_vehicles = set(random.sample(first_route_vehicle_ids, num_autonomous))
+            self.logger.log_info(f"Selected {num_autonomous} vehicles ({self.av_ratio*100:.1f}%) from first route file as autonomous")
             
             # Initialize edge information
             print("MULTI_AGENT_ENV: Initializing edge list from SUMO")
@@ -4822,6 +4886,19 @@ class MultiAgentTrafficEnvironment:
                         
                     else:
                         self.logger.log_warning(f"VEHICLE_EDGE_UNKNOWN: {veh_id} on edge {current_edge} not in region mapping")
+                    
+                    # Update waiting time and delay time for autonomous vehicles
+                    if veh_id in self.autonomous_vehicles:
+                        try:
+                            waiting_time = traci.vehicle.getAccumulatedWaitingTime(veh_id)
+                            self.vehicle_waiting_times_last[veh_id] = float(waiting_time)
+                        except Exception:
+                            pass
+                        try:
+                            delay_time = traci.vehicle.getTimeLoss(veh_id)
+                            self.vehicle_delay_times_last[veh_id] = float(delay_time)
+                        except Exception:
+                            pass
                         
                 except Exception as vehicle_error:
                     vehicles_failed += 1
@@ -4841,6 +4918,12 @@ class MultiAgentTrafficEnvironment:
                         self.vehicle_end_times[veh_id] = current_time
                         self.completed_vehicles += 1
                         completed_this_step += 1
+                        
+                        # Save final waiting time and delay time for completed vehicles
+                        if veh_id in self.vehicle_waiting_times_last:
+                            self.vehicle_waiting_times_final[veh_id] = self.vehicle_waiting_times_last[veh_id]
+                        if veh_id in self.vehicle_delay_times_last:
+                            self.vehicle_delay_times_final[veh_id] = self.vehicle_delay_times_last[veh_id]
                         
                         # Log completion with detailed metrics and cleanup
                         travel_time = current_time - self.vehicle_start_times[veh_id]
@@ -4865,8 +4948,13 @@ class MultiAgentTrafficEnvironment:
                         self._cleanup_completed_vehicle_plans(veh_id, current_time)
                         
                         # Real-time console output for completion
+                        final_waiting = self.vehicle_waiting_times_final.get(veh_id, 0.0)
+                        final_delay = self.vehicle_delay_times_final.get(veh_id, 0.0)
+                        
                         print(f"[{current_time:.1f}s] AUTONOMOUS_VEHICLE_COMPLETED: {veh_id}")
                         print(f"  Total Travel Time: {travel_time:.1f}s")
+                        print(f"  Waiting Time: {final_waiting:.1f}s")
+                        print(f"  Delay/Time Loss: {final_delay:.1f}s")
                         print(f"  System ATT: {self._calculate_current_att():.1f}s")
                         print(f"  Completed: {self.completed_vehicles}/{len(self.autonomous_vehicles)}")
                         print("---")
@@ -5120,27 +5208,20 @@ class MultiAgentTrafficEnvironment:
             
             # Compute additional performance metrics for logging
             # Alat: Average latency (use current ATT)
-            # AWai: Average accumulated waiting time of active autonomous vehicles
+            # AWai: Average accumulated waiting time (use completed vehicles)
             # Adis: Average remaining driving distance to destination (meters)
-            # ADet: Average delay/timeLoss of active autonomous vehicles (seconds)
+            # ADet: Average delay/timeLoss (use completed vehicles)
             try:
                 from typing import List
+                
+                # Calculate AWai and ADet from COMPLETED vehicles (not active ones)
+                completed_waiting_times = list(self.vehicle_waiting_times_final.values())
+                completed_delay_times = list(self.vehicle_delay_times_final.values())
+                
+                # For active vehicles, still calculate remaining distance
                 active_ids: List[str] = [vid for vid in self.vehicle_travel_metrics.keys() if vid in self.autonomous_vehicles]
-                waiting_times = []
-                time_losses = []
                 remain_distances = []
                 for vid in active_ids:
-                    try:
-                        # Waiting time and delay/timeLoss
-                        wt = traci.vehicle.getAccumulatedWaitingTime(vid)
-                        waiting_times.append(float(wt))
-                    except Exception:
-                        pass
-                    try:
-                        tl = traci.vehicle.getTimeLoss(vid)
-                        time_losses.append(float(tl))
-                    except Exception:
-                        pass
                     # Remaining driving distance to destination
                     try:
                         route = traci.vehicle.getRoute(vid)
@@ -5155,19 +5236,28 @@ class MultiAgentTrafficEnvironment:
                             remain_distances.append(float(rem))
                     except Exception:
                         pass
+                
                 alat = float(current_att)
-                awai = (sum(waiting_times) / len(waiting_times)) if waiting_times else 0.0
+                # Use completed vehicles' final values for AWai and ADet
+                awai = (sum(completed_waiting_times) / len(completed_waiting_times)) if completed_waiting_times else 0.0
                 adis = (sum(remain_distances) / len(remain_distances)) if remain_distances else 0.0
-                adet = (sum(time_losses) / len(time_losses)) if time_losses else 0.0
+                adet = (sum(completed_delay_times) / len(completed_delay_times)) if completed_delay_times else 0.0
+                
                 extra_metrics = {
                     'Alat': alat,
                     'AWai': awai,
                     'Adis': adis,
-                    'ADet': adet
+                    'ADet': adet,
+                    'completed_vehicles_count': len(completed_waiting_times),
+                    'active_vehicles_count': len(active_ids)
                 }
-            except Exception:
+            except Exception as e:
+                self.logger.log_error(f"Metrics calculation error: {e}")
                 extra_metrics = {
-                    'Alat': float(current_att)
+                    'Alat': float(current_att),
+                    'AWai': 0.0,
+                    'Adis': 0.0,
+                    'ADet': 0.0
                 }
             
             # Log comprehensive performance data (backward-compatible with older AgentLogger signatures)
@@ -5395,7 +5485,13 @@ class MultiAgentTrafficEnvironment:
             self.logger.log_info("SIMULATION_VALIDATED: System ready for multi-agent simulation")
             
             # Initialize synchronized decision tracking
-            step = 0.0
+            # Get actual SUMO simulation time (respects --begin parameter)
+            step = float(traci.simulation.getTime())
+            initial_step = step
+            # Calculate end time: start_time + max_steps (duration)
+            end_time = initial_step + self.max_steps
+            self.logger.log_info(f"SIMULATION_STEP_INIT: Starting from step {step:.1f}s (SUMO time)")
+            self.logger.log_info(f"SIMULATION_DURATION: Will run for {self.max_steps}s (until {end_time:.1f}s)")
             self._init_synchronized_decision_tracking()
             # Initialize monitoring counters
             try:
@@ -5404,9 +5500,9 @@ class MultiAgentTrafficEnvironment:
                 self._monitor_counters = {}
             
             self.logger.log_info(f"Starting multi-agent simulation")
-            self.logger.log_info(f"SIMULATION_START: Beginning simulation with {self.max_steps} steps (step_size: {self.step_size})")
+            self.logger.log_info(f"SIMULATION_START: Beginning simulation with {self.max_steps}s duration (step_size: {self.step_size})")
             
-            while step < self.max_steps:
+            while step < end_time:
                 simulation_cycle_start = time.time()
                 next_step_time = step + self.step_size
                 
@@ -5579,8 +5675,9 @@ class MultiAgentTrafficEnvironment:
                 except Exception:
                     pass
                 
-                # Display progress
-                self.logger.display_progress(step, current_step=step)
+                # Display progress (use relative step for progress calculation)
+                relative_step = step - initial_step
+                self.logger.display_progress(step, current_step=relative_step)
                 
                 # Log performance periodically
                 self.log_system_performance(step)
