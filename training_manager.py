@@ -59,7 +59,7 @@ class TrainingConfig:
     """Configuration for MAGRPO training with Progressive Mixed Training support."""
     
     # Model Configuration
-    model_path: str = "/data/zhouyuping/Qwen/"
+    model_path: str = "/data/XXXXX/Qwen/"
     
     def __post_init__(self):
         # 从环境变量读取训练GPU配置

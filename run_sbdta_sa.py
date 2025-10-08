@@ -16,10 +16,10 @@ Functionality:
 - Metrics recorded periodically to CSV: completed AV count (cumulative), mean travel time, mean waiting time, mean time loss (delay), and mean edge occupancy (road utilization proxy).
 
 CLI defaults:
-- net: /data/zhouyuping/LLMNavigation/Data/NYC/NewYork.net.xml
-- route1: /data/zhouyuping/LLMNavigation/Data/NYC/NewYork_od_0.1.rou.alt.xml
-- route2: /data/zhouyuping/LLMNavigation/Data/NYC/NYC_routes_0.1_20250830_111509.alt.xml
-- sumocfg: /data/zhouyuping/LLMNavigation/Data/NYC/NewYork_sumo_config.sumocfg
+- net: /data/XXXXX/LLMNavigation/Data/NYC/NewYork.net.xml
+- route1: /data/XXXXX/LLMNavigation/Data/NYC/NewYork_od_0.1.rou.alt.xml
+- route2: /data/XXXXX/LLMNavigation/Data/NYC/NYC_routes_0.1_20250830_111509.alt.xml
+- sumocfg: /data/XXXXX/LLMNavigation/Data/NYC/NewYork_sumo_config.sumocfg
 - step_size: 180; max_steps: 43200; av_ratio: 0.02
 """
 
@@ -493,19 +493,19 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sumo-cfg",
         type=str,
-        default="/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_sumo_config.sumocfg",
+        default="/data/XXXXX/LLMNavigation/Data/NYC/NewYork_sumo_config.sumocfg",
         help="SUMO 配置文件 (.sumocfg)",
     )
     parser.add_argument(
         "--route1",
         type=str,
-        default="/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_od_0.1.rou.alt.xml",
+        default="/data/XXXXX/LLMNavigation/Data/NYC/NewYork_od_0.1.rou.alt.xml",
         help="路由1：仅在此源中抽样2% AV",
     )
     parser.add_argument(
         "--route2",
         type=str,
-        default="/data/zhouyuping/LLMNavigation/Data/NYC/NYC_routes_0.1_20250830_111509.alt.xml",
+        default="/data/XXXXX/LLMNavigation/Data/NYC/NYC_routes_0.1_20250830_111509.alt.xml",
         help="路由2：仅作为环境车辆源",
     )
     parser.add_argument(

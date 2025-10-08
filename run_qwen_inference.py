@@ -64,7 +64,7 @@ def run_qwen_inference(
         sys.exit(1)
 
     if sumo_config is None:
-        sumo_config = "/data/zhouyuping/LLMNavigation/Data/Chicago/Chicago_sumo_config.sumocfg"
+        sumo_config = "/data/XXXXX/LLMNavigation/Data/Chicago/Chicago_sumo_config.sumocfg"
 
     # 从sumo_config推断其他文件路径
     base_dir = os.path.dirname(sumo_config)
@@ -74,14 +74,14 @@ def run_qwen_inference(
     # 如果路由和道路信息文件不存在，尝试使用默认路径
     if not os.path.exists(route_file):
         # 使用Chicago的默认路由文件
-        route_file = "/data/zhouyuping/LLMNavigation/Data/Chicago/Chicago_taxi_2015-01-01.rou.alt.xml"
+        route_file = "/data/XXXXX/LLMNavigation/Data/Chicago/Chicago_taxi_2015-01-01.rou.alt.xml"
     if not os.path.exists(road_info_file):
         # 使用NYC的road_info作为备份（如果Chicago没有）
-        road_info_file = "/data/zhouyuping/LLMNavigation/Data/Chicago/Chicago_road_info.json"
+        road_info_file = "/data/XXXXX/LLMNavigation/Data/Chicago/Chicago_road_info.json"
 
-    adjacency_file = "/data/zhouyuping/LLMNavigation/Data/Chicago/Region/edge_adjacency_alpha_1.json"
-    task_info_file = "/data/zhouyuping/LLMNavigation/Data/NYC/task_info.json"
-    region_data_dir = "/data/zhouyuping/LLMNavigation/Data/Chicago/Region"
+    adjacency_file = "/data/XXXXX/LLMNavigation/Data/Chicago/Region/edge_adjacency_alpha_1.json"
+    task_info_file = "/data/XXXXX/LLMNavigation/Data/NYC/task_info.json"
+    region_data_dir = "/data/XXXXX/LLMNavigation/Data/Chicago/Region"
     
     # 检查必要文件是否存在
     required_files = [sumo_config, route_file, road_info_file, adjacency_file, task_info_file]
@@ -323,7 +323,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--sumo-config",
         type=str,
-        default="/data/zhouyuping/LLMNavigation/Data/Chicago/Chicago_sumo_config.sumocfg",
+        default="/data/XXXXX/LLMNavigation/Data/Chicago/Chicago_sumo_config.sumocfg",
         help="SUMO配置文件路径"
     )
     

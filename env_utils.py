@@ -101,7 +101,7 @@ def load_static_road_data(data_dir: str = "Data/Region_1", road_info_file: str =
         if road_info_file and os.path.exists(road_info_file):
             road_info_path = road_info_file
         else:
-            road_info_path = "/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_road_info.json"
+            road_info_path = "/data/XXXXX/LLMNavigation/Data/NYC/NewYork_road_info.json"
 
         if os.path.exists(road_info_path):
             with open(road_info_path, 'r') as f:
@@ -117,7 +117,7 @@ def load_static_road_data(data_dir: str = "Data/Region_1", road_info_file: str =
         if adjacency_file and os.path.exists(adjacency_file):
             adj_info_path = adjacency_file
         else:
-            adj_info_path = "/data/zhouyuping/LLMNavigation/Data/NYC/Region_1/edge_adjacency_alpha_1.json"
+            adj_info_path = "/data/XXXXX/LLMNavigation/Data/NYC/Region_1/edge_adjacency_alpha_1.json"
 
         if os.path.exists(adj_info_path):
             with open(adj_info_path, 'r') as f:

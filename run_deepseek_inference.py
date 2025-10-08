@@ -81,7 +81,7 @@ def run_deepseek_inference(
 
     # 设置文件路径 - 默认使用NYC路网
     if sumo_config is None:
-        sumo_config = "/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_sumo_config.sumocfg"
+        sumo_config = "/data/XXXXX/LLMNavigation/Data/NYC/NewYork_sumo_config.sumocfg"
 
     # 从sumo_config推断其他文件路径
     base_dir = os.path.dirname(sumo_config)
@@ -95,15 +95,15 @@ def run_deepseek_inference(
 
     # 如果文件不存在，尝试使用备用路径
     if not os.path.exists(route_file):
-        route_file = "/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_od_0.1.rou.alt.xml"
+        route_file = "/data/XXXXX/LLMNavigation/Data/NYC/NewYork_od_0.1.rou.alt.xml"
     if not os.path.exists(road_info_file):
-        road_info_file = "/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_road_info.json"
+        road_info_file = "/data/XXXXX/LLMNavigation/Data/NYC/NewYork_road_info.json"
     if not os.path.exists(adjacency_file):
-        adjacency_file = "/data/zhouyuping/LLMNavigation/Data/NYC/Region_1/edge_adjacency_alpha_1.json"
+        adjacency_file = "/data/XXXXX/LLMNavigation/Data/NYC/Region_1/edge_adjacency_alpha_1.json"
     if not os.path.exists(task_info_file):
-        task_info_file = "/data/zhouyuping/LLMNavigation/Data/NYC/task_info.json"
+        task_info_file = "/data/XXXXX/LLMNavigation/Data/NYC/task_info.json"
     if not os.path.exists(region_data_dir):
-        region_data_dir = "/data/zhouyuping/LLMNavigation/Data/NYC/Region_1"
+        region_data_dir = "/data/XXXXX/LLMNavigation/Data/NYC/Region_1"
     
     # 检查必要文件是否存在
     required_files = [sumo_config, route_file, road_info_file, adjacency_file, task_info_file]

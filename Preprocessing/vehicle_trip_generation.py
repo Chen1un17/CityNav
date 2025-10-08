@@ -1,6 +1,6 @@
 import sys
 sys.path.append("../")
-sys.path.append("/home/zhouyuping/program/LLMNavigation_basline/LLMNavigation")
+sys.path.append("/home/XXXXX/program/LLMNavigation_basline/LLMNavigation")
 
 import os.path
 import random
@@ -467,9 +467,9 @@ def main():
     主函数：高效生成大规模轨迹数据
     """
     # 配置文件路径
-    roadnet_file = "/data/zhouyuping/LLMNavigation/Data/NYC/NewYork.net.xml"
-    area_file = "/data/zhouyuping/LLMNavigation/Data/NYC_shp/NYC_areas.shp"
-    od_matrix_file = "/data/zhouyuping/LLMNavigation/Data/NYC_shp/NYC_od_matrix.npy"
+    roadnet_file = "/data/XXXXX/LLMNavigation/Data/NYC/NewYork.net.xml"
+    area_file = "/data/XXXXX/LLMNavigation/Data/NYC_shp/NYC_areas.shp"
+    od_matrix_file = "/data/XXXXX/LLMNavigation/Data/NYC_shp/NYC_od_matrix.npy"
     
     # 根据您的需求设置scaling，生成2,399,701条轨迹
     # 原始OD矩阵总和约为23,997,010，所以scaling约为0.1
@@ -485,7 +485,7 @@ def main():
     areas = gpd.read_file(area_file)
 
     # 解析道路网络并分配边到区域（使用并行优化）
-    edges_file = "/data/zhouyuping/LLMNavigation/Data/NYC/NYC_area2edge.json"
+    edges_file = "/data/XXXXX/LLMNavigation/Data/NYC/NYC_area2edge.json"
     if not os.path.exists(edges_file):
         print("Parsing network edges and assigning to regions...")
         edges = parse_edges(roadnet)
@@ -536,8 +536,8 @@ def main():
 
     # 输出文件路径
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    trip_file = f"/data/zhouyuping/LLMNavigation/Data/NYC/NYC_trips_{scaling}_{timestamp}.xml"
-    route_file = f"/data/zhouyuping/LLMNavigation/Data/NYC/NYC_routes_{scaling}_{timestamp}.xml"
+    trip_file = f"/data/XXXXX/LLMNavigation/Data/NYC/NYC_trips_{scaling}_{timestamp}.xml"
+    route_file = f"/data/XXXXX/LLMNavigation/Data/NYC/NYC_routes_{scaling}_{timestamp}.xml"
 
     # 检查预计内存使用量，选择最佳生成方法
     estimated_memory_gb = od_matrix.sum() * 200 / (1024**3)  # 每个trip约200字节

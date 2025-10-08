@@ -607,8 +607,8 @@ def main_runner():
     
     # Custom command
     custom_parser = subparsers.add_parser('custom', help='Run with custom parameters')
-    custom_parser.add_argument('--llm', type=str, default="/data/zhouyuping/Qwen/",
-                              help='LLM model path or name (default: /data/zhouyuping/Qwen/)')
+    custom_parser.add_argument('--llm', type=str, default="/data/XXXXX/Qwen/",
+                              help='LLM model path or name (default: /data/XXXXX/Qwen/)')
     custom_parser.add_argument('--batch-size', type=int, default=16,
                               help='Batch size for LLM (default: 16)')
     custom_parser.add_argument('--location', type=str, default="Manhattan",

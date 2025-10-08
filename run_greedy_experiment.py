@@ -640,7 +640,7 @@ def run_both_experiments(sumo_config: str, step_size: float, max_steps: int, av_
 def main():
     parser = argparse.ArgumentParser(description="贪心算法路径规划实验")
     parser.add_argument("--config", type=str,
-                       default="/data/zhouyuping/LLMNavigation/Data/Chicago/Chicago_sumo_config.sumocfg",
+                       default="/data/XXXXX/LLMNavigation/Data/Chicago/Chicago_sumo_config.sumocfg",
                        help="SUMO配置文件路径")
     parser.add_argument("--location", type=str, default="Chicago", help="仿真位置（用于输出文件命名）")
     parser.add_argument("--strategy", type=str, choices=["distance", "latency", "both"],

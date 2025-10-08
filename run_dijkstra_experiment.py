@@ -594,7 +594,7 @@ class DijkstraExperiment:
 def main():
     parser = argparse.ArgumentParser(description="Dijkstra路径规划实验（支持A*优化）")
     parser.add_argument("--config", type=str,
-                       default="/data/zhouyuping/LLMNavigation/Data/Chicago/Chicago_sumo_config.sumocfg",
+                       default="/data/XXXXX/LLMNavigation/Data/Chicago/Chicago_sumo_config.sumocfg",
                        help="SUMO配置文件路径")
     parser.add_argument("--location", type=str, default="Chicago", help="仿真位置（用于输出文件命名）")
     parser.add_argument("--step-size", type=float, default=1.0, help="仿真步长(秒)")

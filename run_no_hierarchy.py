@@ -906,7 +906,7 @@ def main():
     parser.add_argument("--use-local", action="store_true",
                        help="Use local model instead of API")
     parser.add_argument("--model-path", type=str,
-                       default="/data/zhouyuping/Qwen/",
+                       default="/data/XXXXX/Qwen/",
                        help="Path to local LLM model (only if --use-local)")
     parser.add_argument("--location", type=str, default="NewYork",
                        help="Location (default: NewYork)")
@@ -930,11 +930,11 @@ def main():
             sys.exit(1)
 
     # File paths for NewYork
-    sumo_config = "/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_sumo_config.sumocfg"
-    route_file = "/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_od_0.1.rou.alt.xml"
-    road_info_file = "/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_road_info.json"
-    region_data_dir = "/data/zhouyuping/LLMNavigation/Data/New"
-    task_info_file = "/data/zhouyuping/LLMNavigation/Data/NYC/task_info.json"
+    sumo_config = "/data/XXXXX/LLMNavigation/Data/NYC/NewYork_sumo_config.sumocfg"
+    route_file = "/data/XXXXX/LLMNavigation/Data/NYC/NewYork_od_0.1.rou.alt.xml"
+    road_info_file = "/data/XXXXX/LLMNavigation/Data/NYC/NewYork_road_info.json"
+    region_data_dir = "/data/XXXXX/LLMNavigation/Data/New"
+    task_info_file = "/data/XXXXX/LLMNavigation/Data/NYC/task_info.json"
 
     # Determine model name
     if args.use_local:

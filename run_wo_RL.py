@@ -94,7 +94,7 @@ def run_api_multi_agent(llm_model: str,
     """
 
     # 使用用户指定的数据与分区
-    sumo_config = "/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_sumo_config.sumocfg"
+    sumo_config = "/data/XXXXX/LLMNavigation/Data/NYC/NewYork_sumo_config.sumocfg"
     # 从 sumocfg 中解析 route-files，第一项作为 autonomous 候选来源
     primary_route_file = None
     background_route_file = None
@@ -115,15 +115,15 @@ def run_api_multi_agent(llm_model: str,
 
     # 主路由文件（仅用于抽取 autonomous vehicles）
     route_file = primary_route_file if primary_route_file else \
-        "/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_od_0.1.rou.alt.xml"
+        "/data/XXXXX/LLMNavigation/Data/NYC/NewYork_od_0.1.rou.alt.xml"
 
     # NYC 路网信息与全局边邻接（保持与现有脚本一致的文件结构）
-    road_info_file = "/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_road_info.json"
-    adjacency_file = "/data/zhouyuping/LLMNavigation/Data/New/edge_adjacency_alpha_2.json"
-    task_info_file = "/data/zhouyuping/LLMNavigation/Data/task_info.json"
+    road_info_file = "/data/XXXXX/LLMNavigation/Data/NYC/NewYork_road_info.json"
+    adjacency_file = "/data/XXXXX/LLMNavigation/Data/New/edge_adjacency_alpha_2.json"
+    task_info_file = "/data/XXXXX/LLMNavigation/Data/task_info.json"
 
     # 多智能体分区数据目录（用户指定的新分区目录）
-    region_data_dir = "/data/zhouyuping/LLMNavigation/Data/New"
+    region_data_dir = "/data/XXXXX/LLMNavigation/Data/New"
 
     # 全局宏观指导开关（与 run_multi_agent 自定义命令保持一致）
     try:

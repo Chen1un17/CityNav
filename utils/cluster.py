@@ -2082,8 +2082,8 @@ def enforce_region_connectivity(graph, membership, log_progress=True):
 
 # --- 主函数 ---
 if __name__ == '__main__':
-    SUMO_NET_FILE = '/data/zhouyuping/LLMNavigation/Data/NYC/NewYork.net.xml'
-    SUMO_ROU_FILE = '/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_od_0.1.rou.alt.xml'
+    SUMO_NET_FILE = '/data/XXXXX/LLMNavigation/Data/NYC/NewYork.net.xml'
+    SUMO_ROU_FILE = '/data/XXXXX/LLMNavigation/Data/NYC/NewYork_od_0.1.rou.alt.xml'
     ALPHA_VALUE = 1
     BETA_VALUE = 2
     RESOLUTION_VALUE = 1.0

@@ -174,7 +174,7 @@ def save_results(results, output_dir):
 def main():
     """Main function to analyze route file."""
     # Default file path
-    default_path = "/data/zhouyuping/LLMNavigation/Data/Chicago/Chicago_taxi_2015-01-01.rou.xml"
+    default_path = "/data/XXXXX/LLMNavigation/Data/Chicago/Chicago_taxi_2015-01-01.rou.xml"
     output_dir = "outputs"
     interval_minutes = 5  # 5-minute intervals as requested
     

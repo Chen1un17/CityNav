@@ -105,7 +105,7 @@ def save_results(results, output_dir):
 def main():
     """Main function to analyze network file."""
     # Default file path
-    default_path = "/home/zhouyuping/program/baseline/Adaptive-Navigation/environments/sumo/networks/UES_Manhatan/Manhatan-Abstracted-Original.net.xml"
+    default_path = "/home/XXXXX/program/baseline/Adaptive-Navigation/environments/sumo/networks/UES_Manhatan/Manhatan-Abstracted-Original.net.xml"
     output_dir = "outputs"
     
     # Allow command line argument for different files

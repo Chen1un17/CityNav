@@ -1,5 +1,5 @@
 <configuration>
     <input>
-        <net-file value="/data/zhouyuping/LLMNavigation/Data/NYC/NewYork.net.xml"/>
+        <net-file value="/data/XXXXX/LLMNavigation/Data/NYC/NewYork.net.xml"/>
     </input>
 </configuration>

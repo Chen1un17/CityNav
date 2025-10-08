@@ -33,17 +33,17 @@ class Route_Planning(object):
         wandb.finish()
 
 def main(location, step_size, max_steps):
-    sumo_config = f"/data/zhouyuping/LLMNavigation/Data/NYC/{location}_sumo_config.sumocfg"
-    route_file = f"/data/zhouyuping/LLMNavigation/Data/NYC/{location}_od_0.1.rou.alt.xml"
-    road_info_file = f"/data/zhouyuping/LLMNavigation/Data/NYC/{location}_road_info.json"
-    adjacency_file = f"/data/zhouyuping/LLMNavigation/Data/NYC/Region_1/edge_adjacency_alpha_1.json"
+    sumo_config = f"/data/XXXXX/LLMNavigation/Data/NYC/{location}_sumo_config.sumocfg"
+    route_file = f"/data/XXXXX/LLMNavigation/Data/NYC/{location}_od_0.1.rou.alt.xml"
+    road_info_file = f"/data/XXXXX/LLMNavigation/Data/NYC/{location}_road_info.json"
+    adjacency_file = f"/data/XXXXX/LLMNavigation/Data/NYC/Region_1/edge_adjacency_alpha_1.json"
 
     algo = Route_Planning(location, sumo_config, route_file, road_info_file, adjacency_file, step_size, max_steps)
     algo.run()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run a SUMO simulation with autonomous vehicles.")
-    parser.add_argument("--location", type=str, default="/data/zhouyuping/LLMNavigation/Data/NYC/ttan", help="Location of the simulation.")
+    parser.add_argument("--location", type=str, default="/data/XXXXX/LLMNavigation/Data/NYC/ttan", help="Location of the simulation.")
     parser.add_argument("--step-size", type=float, default=120.0, help="Simulation step size in seconds.")
     parser.add_argument("--max-steps", type=int, default=86400, help="Maximum number of simulation steps.")
     args = parser.parse_args()

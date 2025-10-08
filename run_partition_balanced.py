@@ -365,12 +365,12 @@ def verify_required_files(files: List[str]) -> None:
 
 def main(location: str, step_size: float, max_steps: int, use_wandb: bool = False) -> Tuple[float, int]:
     # 用户给定 NYC 数据路径
-    sumo_config = "/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_sumo_config.sumocfg"
-    route1 = "/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_od_0.1.rou.alt.xml"
-    route2 = "/data/zhouyuping/LLMNavigation/Data/NYC/NYC_routes_0.1_20250830_111509.alt.xml"
-    road_info = "/data/zhouyuping/LLMNavigation/Data/NYC/NewYork_road_info.json"
-    adjacency = "/data/zhouyuping/LLMNavigation/Data/New/edge_adjacency_alpha_2.json"
-    partition_dir = "/data/zhouyuping/LLMNavigation/Data/New/"
+    sumo_config = "/data/XXXXX/LLMNavigation/Data/NYC/NewYork_sumo_config.sumocfg"
+    route1 = "/data/XXXXX/LLMNavigation/Data/NYC/NewYork_od_0.1.rou.alt.xml"
+    route2 = "/data/XXXXX/LLMNavigation/Data/NYC/NYC_routes_0.1_20250830_111509.alt.xml"
+    road_info = "/data/XXXXX/LLMNavigation/Data/NYC/NewYork_road_info.json"
+    adjacency = "/data/XXXXX/LLMNavigation/Data/New/edge_adjacency_alpha_2.json"
+    partition_dir = "/data/XXXXX/LLMNavigation/Data/New/"
 
     verify_required_files([sumo_config, route1, road_info, adjacency, partition_dir])
     if route2 and not os.path.exists(route2):
